@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------------------
+# Secrets and local state — never commit these.
+# ---------------------------------------------------------------------------
+# OpenCode account keys. Copy accounts.example.json and fill it in locally, or
+# use LINGLING_OPENCODE_KEYS instead so no secret ever touches the disk.
+backend/accounts.json
+# Egress proxy list may embed proxy credentials (scheme://user:pass@host).
+backend/proxies.json
+# Issued user API keys (plaintext ll_ tokens), usage database, WARP identities
+# (each wgcf-account.toml holds a private WireGuard key), downloaded binaries.
+backend/data/
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ---------------------------------------------------------------------------
+# Local agent tooling (not part of Lingling)
+# ---------------------------------------------------------------------------
+.agents/
+.claude/
+.hallmark/
+skills-lock.json
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# Build + test scratch
+# ---------------------------------------------------------------------------
+node_modules/
+dist/
+build/
+# Windows shell mishaps: `> nul` and `2>/dev/null` create these as real files.
+nul
+sa/
+# Scratch artifacts from local debugging sessions: redirected command output,
+# one-off migration scripts, extracted copies of frontend JS for `node --check`.
+# Anchored to the repo root with a leading slash -- an unanchored `_*.py` would
+# also match `backend/providers/__init__.py` and untrack the package itself.
+/_*.txt
+/_*.png
+/_*.html
+/_*.py
+/_*.js
+/_*.json
