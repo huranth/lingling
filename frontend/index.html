@@ -2914,7 +2914,13 @@ function gaugeSVG(avail, total){
 }
 
 function slotRow(s){
-  const idx = s.index ?? s.id ?? '?';
+  // #-prefixed label for every slot, whether it arrived as a pool proxy
+  // (`id: "warp-1"`) or as a bare warp instance (`index: 1`). Before, the
+  // pool-backed slots rendered "#1" while instance-only slots rendered "1",
+  // so the rack read inconsistently in the window after a dump.
+  const rawIdx = (s.index != null) ? String(s.index)
+    : (typeof s.id === 'string' ? s.id.replace(/^warp-/, '') : '?');
+  const idx = '#' + (rawIdx || '?');
   const port = s.port ?? ((String(s.url || '').match(/:(\d+)$/) || [])[1] || '—');
   // /api/warp reports `running`; /api/warp/health reports `alive`; the proxy
   // pool reports neither and exposes cooldown/failure counters instead.
@@ -2932,7 +2938,7 @@ function slotRow(s){
     : (up ? '<span class="chip ok"><span class="dot"></span>up</span>'
           : '<span class="chip bad"><span class="dot"></span>down</span>');
   return '<div class="slot">' +
-    '<span class="ix">' + esc(String(idx).replace(/^warp-/, '#')) + '</span>' +
+    '<span class="ix">' + esc(idx) + '</span>' +
     '<span class="pt">:' + esc(port) + '</span>' +
     '<span class="ld"><span class="t"><i class="' + (cooling ? 'cool' : '') +
       '" style="width:' + loadPct + '%"></i></span><span class="n">' + load.toFixed(1) + '</span></span>' +
