@@ -245,9 +245,11 @@ THREADPOOL_MAX = int(os.getenv("LINGLING_THREADPOOL_MAX", "128"))
 # holds a live SOCKS5 + TLS connection to the upstream, so reusing it skips
 # the handshakes that dominate first-token latency. A coding agent firing
 # many turns at one proxy benefits from several warm clients in parallel.
-CONNECTION_POOL_MAX_PER_PROXY = int(os.getenv("LINGLING_CONNECTION_POOL_MAX", "8"))
-# Seconds an idle pooled connection is kept before it is discarded.
-CONNECTION_POOL_IDLE_S = float(os.getenv("LINGLING_CONNECTION_POOL_IDLE_S", "90"))
+CONNECTION_POOL_MAX_PER_PROXY = int(os.getenv("LINGLING_CONNECTION_POOL_MAX", "10"))
+# Seconds an idle pooled connection is kept before it is discarded. 180s keeps
+# warm tunnels alive across short gaps between turns, so a repeat request to
+# the same egress reuses the handshake instead of paying it again.
+CONNECTION_POOL_IDLE_S = float(os.getenv("LINGLING_CONNECTION_POOL_IDLE_S", "180"))
 
 
 def ensure_data_dir() -> Path:

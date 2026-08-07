@@ -77,7 +77,10 @@ class ConnectionPool:
             "limits": httpx.Limits(
                 max_connections=10,
                 max_keepalive_connections=5,
-                keepalive_expiry=30.0,
+                # Keep the client's own idle keepalive in step with the pool's
+                # prune window so a warm tunnel is actually reusable for the
+                # whole time the pool says it is.
+                keepalive_expiry=config.CONNECTION_POOL_IDLE_S,
             ),
         }
         # HTTP/2 is a speed win but needs the optional h2 package. Enable it only

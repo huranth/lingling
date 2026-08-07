@@ -1536,6 +1536,64 @@ def test_unit_catalog_serves_last_good_list_through_a_fetch_failure():
     assert cat.free() == [], "an honest empty list must not be masked by the cache"
 
 
+def test_unit_explicit_model_resolves_from_cache_without_a_refetch():
+    """A cached model must resolve without re-fetching the upstream list.
+
+    `by_id`/`providers_for` run on every routed request. When the catalog TTL
+    expired, the old code re-fetched OpenCode /models on that request path --
+    one slow request every refresh window. Serving the cached view first keeps
+    request latency flat; only an unknown model triggers a refresh.
+    """
+    from models.catalog import UnifiedCatalog
+    from providers.base import Provider, ProviderModel
+    from providers.key_pool import KeyPool
+
+    class CountingProvider(Provider):
+        id = "opencode"
+        display_name = "Count"
+        priority = 10
+
+        def __init__(self):
+            super().__init__(KeyPool([]))
+            self._ids = []
+            self.fetches = 0
+
+        def requires_key(self):
+            return False
+
+        def fetch_model_ids(self):
+            self.fetches += 1
+            return self._ids
+
+        def is_model_free(self, mid, meta):
+            return mid.endswith("-free")
+
+        def build_model(self, mid):
+            return ProviderModel(
+                id=mid, provider_id=self.id, name=mid, free=True,
+                vision=False, reasoning=True, context_length=1000, max_output=100,
+            )
+
+    prov = CountingProvider()
+    cat = UnifiedCatalog({"opencode": prov})
+    prov._ids = ["alpha-free"]
+    cat.refresh(force=True)
+    assert prov.fetches == 1
+
+    # Age the view past its TTL: the explicit-model path must still resolve
+    # straight from the cache without an upstream round-trip.
+    cat._generated_at = 0.0
+    assert cat.by_id("alpha-free") is not None
+    assert cat.providers_for("alpha-free"), "providers_for must resolve from cache"
+    assert prov.fetches == 1, f"by_id re-fetched the upstream list ({prov.fetches}x)"
+
+    # A model the cached view does not know still triggers a refresh, so a
+    # brand-new upstream model resolves by name.
+    prov._ids = ["alpha-free", "brand-new-free"]
+    assert cat.by_id("brand-new-free") is not None
+    assert prov.fetches == 2, "an unknown model must trigger a refresh"
+
+
 def test_unit_hot_models_route_through_the_proxy_pool():
     """The dispatcher and the fast chat model must rotate egress, not bypass it.
 
