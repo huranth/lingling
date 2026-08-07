@@ -1,0 +1,104 @@
+/* ==========================================================================
+   Lingling · design tokens
+   theme: custom (tuned) · axes: light / display-condensed-sans / warm-terracotta
+   Warm sand paper, terracotta accent. Every colour, font, space, radius,
+   z-index and duration the page uses lives here; the page references tokens by
+   name only. Every pair the UI actually renders is verified against WCAG 2.1
+   (4.5:1 text, 3:1 non-text) — see the audit note at the foot of this file.
+   ========================================================================== */
+:root{
+  /* ---- paper (light band, L > 85%) — warm sand page, near-white cards ---- */
+  --paper:        oklch(96.2% 0.014 80);
+  --paper-2:      oklch(99.2% 0.005 85);
+  --paper-3:      oklch(93.4% 0.018 78);
+  --paper-4:      oklch(88.5% 0.024 76);
+
+  /* ---- rules ----
+     --rule is decorative (row separators, block outlines); the paper steps
+     carry structure too, so it sits below the 3:1 non-text threshold on
+     purpose. --rule-strong marks interactive boundaries (inputs, buttons,
+     selects) and clears 3:1 against every paper step. */
+  --rule:         oklch(88.0% 0.016 78);
+  --rule-strong:  oklch(60.0% 0.024 70);
+  --rule-hair:    1px;
+
+  /* ---- ink ---- */
+  --ink:          oklch(26.0% 0.020 62);
+  --ink-2:        oklch(40.0% 0.019 62);
+  --ink-3:        oklch(50.0% 0.018 62);
+  --ink-4:        oklch(56.0% 0.017 62);
+
+  /* ---- accent: terracotta. Budgeted to <5% of painted area. ---- */
+  --accent:       oklch(53.0% 0.150 42);
+  --accent-deep:  oklch(46.0% 0.160 40);
+  --accent-wash:  oklch(94.5% 0.038 52);
+  --accent-line:  oklch(78.0% 0.085 48);
+  /* Ink that sits ON the accent (buttons, filled bars) and on chart fills. */
+  --on-accent:      oklch(98.5% 0.010 60);
+  --on-accent-deep: oklch(99.0% 0.008 60);
+  --on-fill:        oklch(99.0% 0.006 60);
+
+  /* ---- semantic ---- */
+  --ok:           oklch(44.0% 0.120 152);
+  --ok-wash:      oklch(94.0% 0.035 152);
+  --warn:         oklch(47.0% 0.115 85);
+  --warn-wash:    oklch(94.5% 0.045 88);
+  --bad:          oklch(47.0% 0.175 27);
+  --bad-wash:     oklch(94.5% 0.035 27);
+  --info:         oklch(46.0% 0.115 245);
+  --info-wash:    oklch(94.0% 0.030 245);
+
+  /* ---- type ---- */
+  --font-display: 'Archivo', system-ui, sans-serif;
+  --font-body:    'IBM Plex Sans', system-ui, sans-serif;
+  --font-mono:    'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --text-xs:   11px;
+  --text-sm:   12.5px;
+  --text-base: 14px;
+  --text-md:   16px;
+  --text-lg:   20px;
+  --text-xl:   26px;
+  --text-2xl:  34px;
+  --text-3xl:  46px;
+
+  /* ---- space (4pt base, named by role) ---- */
+  --space-3xs: 0.125rem;
+  --space-2xs: 0.25rem;
+  --space-xs:  0.5rem;
+  --space-sm:  0.75rem;
+  --space-md:  1rem;
+  --space-lg:  1.5rem;
+  --space-xl:  2.5rem;
+  --space-2xl: 4rem;
+  --space-3xl: 6rem;
+
+  /* ---- radius ---- */
+  --radius:    6px;
+  --radius-sm: 4px;
+  --radius-lg: 10px;
+
+  /* ---- elevation — one whisper, never stacked, never a coloured glow ---- */
+  --lift:      0 1px 2px oklch(45% 0.030 70 / 0.07);
+  --lift-drag: 0 10px 26px oklch(45% 0.040 70 / 0.18);
+
+  /* ---- shell geometry ---- */
+  --rail-w: 60px;
+  --tele-w: 268px;
+
+  /* ---- motion ---- */
+  --ease-out:    cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 110ms;
+  --dur-short: 220ms;
+  --dur-long:  420ms;
+
+  /* ---- z (six named levels) ---- */
+  --z-base:     1;
+  --z-raised:   10;
+  --z-dropdown: 100;
+  --z-sticky:   200;
+  --z-modal:    400;
+  --z-toast:    500;
+  --z-tooltip:  600;
+}
