@@ -240,10 +240,15 @@ def _live_free_ids() -> set:
     from providers.opencode import OpenCodeProvider
 
     prov = OpenCodeProvider(KeyPool([]))
-    return {
+    live = {
         mid for mid in prov.fetch_model_ids()
         if prov.is_model_free(mid, {})
     }
+    # Models seeded as retired are deliberately hidden from the catalog before
+    # any runtime 400, so the live-sync expectation must subtract them too --
+    # otherwise a model Lingling now pre-retires (ling-3.0-flash-free) would
+    # read as "missing from the catalog" and fail the test.
+    return live - set(config.retired_seed_ids())
 
 
 def test_live_models():
@@ -1918,10 +1923,10 @@ def test_unit_an_auto_routed_stream_reroutes_to_another_model_mid_flight():
 def test_unit_an_explicit_model_is_never_swapped_mid_stream():
     """Only `lingling-auto` delegates the choice; a named model is a contract.
 
-    A client that asked for `ling-3.0-flash-free` gets that model on the retry
-    too -- silently answering from a different one would make the response
+    A client that asked for `deepseek-v4-flash-free` gets that model on the
+    retry too -- silently answering from a different one would make the response
     disagree with the request, and callers key cost and behaviour off the model
-    they named.
+    they named. (deepseek is a stable live free model; ling-3.0 is retired.)
     """
     import app as app_mod
 
@@ -1945,13 +1950,13 @@ def test_unit_an_explicit_model_is_never_swapped_mid_stream():
     app_mod.executor.execute_stream = fake_execute_stream
     try:
         r = client.post("/v1/chat/completions", json={
-            "model": "ling-3.0-flash-free",
+            "model": "deepseek-v4-flash-free",
             "messages": [{"role": "user", "content": "Refactor this component"}],
             "stream": True,
         })
         b"".join(r.iter_bytes())
 
-        assert seen_models == ["ling-3.0-flash-free"] * 2, seen_models
+        assert seen_models == ["deepseek-v4-flash-free"] * 2, seen_models
     finally:
         app_mod.executor.execute_stream = original
 
@@ -2327,6 +2332,29 @@ def test_unit_responses_bridge_answers_when_a_model_only_reasons():
     assert '"type":"reasoning"' in body and '"type":"message"' in body
 
 
+def test_unit_responses_bridge_promotes_reasoning_when_the_turn_completes():
+    """A reasoning-only model that reports finish_reason must not go blank.
+
+    Regression for the gate that read ``and not finished``: nemotron streams its
+    whole answer as reasoning *and* ends with an explicit ``finish_reason``, so
+    the promotion above was skipped exactly when the turn was complete. The
+    client then got only a ``reasoning`` item and an empty answer.
+    """
+    from routing import responses_bridge
+
+    chat = iter([
+        b'data: {"choices":[{"delta":{"role":"assistant","content":"","reasoning":"The answer is 42. "}}]}',
+        b'data: {"choices":[{"delta":{"content":"","reasoning":" Plain english follows. "}}]}',
+        b'data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}',
+    ])
+    body = b"".join(responses_bridge.stream_events(chat, "m")).decode()
+    # The completed, reasoning-only answer is surfaced as text...
+    assert "response.output_text.delta" in body
+    assert "The answer is 42." in body and "Plain english follows." in body
+    # ...and lands in a real message item alongside the reasoning item.
+    assert '"type":"reasoning"' in body and '"type":"message"' in body
+
+
 def test_unit_responses_usage_keeps_the_reasoning_count():
     """`reasoning_tokens` must survive the hop, where the Responses spec puts it.
 
@@ -2524,19 +2552,21 @@ def test_unit_effort_is_reresolved_when_failover_changes_the_model():
 
     The chat path clamped effort for the primary model and then handed the *same*
     params dict to the fallback: `max` resolved to deepseek's `max`, then travelled
-    unchanged onto ling, which implements only low/medium/high. OpenCode answers
+    unchanged onto laguna, which implements only low/medium/high. OpenCode answers
     200 for a value it ignores, so it looked like it worked while changing nothing.
     `_resolve_effort(previous=...)` re-resolves from the client's original label.
+    (laguna-s-2.1-free is a stable live model with the same effort set the
+    retired ling-3.0 used to advertise.)
     """
     import app as app_mod
     from routing import effort
 
     deepseek = ["high", "max"]
-    ling = ["low", "medium", "high"]
+    laguna = ["low", "medium", "high"]
 
     # What the two models actually honour, so the expectations below are grounded.
     assert effort.resolve("max", deepseek) == "max"
-    assert effort.resolve("max", ling) == "high"
+    assert effort.resolve("max", laguna) == "high"
 
     params = {"reasoning_effort": "max", "temperature": 0.2}
     original = params["reasoning_effort"]
@@ -2547,17 +2577,17 @@ def test_unit_effort_is_reresolved_when_failover_changes_the_model():
 
     # The failover path copies params and re-resolves from the original label.
     retry = dict(params)
-    again = app_mod._resolve_effort(retry, "ling-3.0-flash-free", previous=original)
-    assert again == "high", f"ling does not implement {again!r}"
+    again = app_mod._resolve_effort(retry, "laguna-s-2.1-free", previous=original)
+    assert again == "high", f"laguna does not implement {again!r}"
     assert retry["reasoning_effort"] == "high"
     assert retry["temperature"] == 0.2, "other params must survive the retry"
 
     # Without `previous` the already-clamped value would be re-clamped as if the
     # client had asked for it -- which is how the bug produced an illegal value.
     naive = dict(params)
-    app_mod._resolve_effort(naive, "ling-3.0-flash-free")
+    app_mod._resolve_effort(naive, "laguna-s-2.1-free")
     assert naive.get("reasoning_effort") == "high", \
-        "re-clamping max against ling must still land on high"
+        "re-clamping max against laguna must still land on high"
 
 
 def test_unit_pool_url_updates_go_through_the_lock():
