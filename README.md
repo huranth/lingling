@@ -105,14 +105,14 @@ dropped `ling-3.0-flash-free` while these docs were being written) fail over to
 another free model with no action on your part. The dashboard **Catalog** view is
 the live list.
 
-No model id, capability, or effort level is hardcoded; everything comes from the
-live feed at request time. For context these are the free models as of mid-2026:
+No capability or effort level is hardcoded; model ids come from the live feed,
+except that models already known to have been dropped are seeded as retired so
+they never re-list. For context these are the free models as of mid-2026:
 
 | Model | Good at | Context |
 |-------|---------|---------|
 | `longcat-2.0-free` | very long documents, in-depth coding (Meituan) | 1M |
 | `nemotron-3-ultra-free` | maths, planning, multi-step reasoning | 1M |
-| `ling-3.0-flash-free` | fast general chat and light coding | 256K |
 | `north-mini-code-free` | code generation and refactoring | 250K |
 | `laguna-s-2.1-free` | everyday questions and writing | 250K |
 | `mimo-v2.5-free` | images — the only free model that sees | 200K |
@@ -129,8 +129,8 @@ Lingling reads each model's real capability set from models.dev (the same data
 OpenCode's CLI shows under `/variants`), so whatever word your editor sends gets
 translated onto that model's actual levels:
 
-You ask for | On `deepseek` you get | On `ling` you get | On `mimo` you get
------------ | --------------------- | ----------------- | ----------------
+You ask for | On `deepseek` you get | On `laguna` you get | On `mimo` you get
+----------- | --------------------- | ------------------- | ----------------
 `minimal`    | `low`                 | `low`             | *nothing sent*
 `medium`     | `low`                 | `medium`          | *nothing sent*
 `max`        | `max`                 | `high`            | *nothing sent*
@@ -177,6 +177,7 @@ single-user gateway. The important ones:
 | `LINGLING_CATALOG_TTL` | `600` | How often the model list refreshes (s) |
 | `LINGLING_EGRESS_WAIT_BUDGET` | `120` | Max seconds to wait for a cooled egress pool |
 | `LINGLING_STREAM_IDLE_TIMEOUT` | `90` | Treat a silent stream as broken after this (s) |
+| `LINGLING_RETIRED_MODELS` | `ling-3.0-flash-free` | Models hidden from the catalog from startup (comma-separated; e.g. dropped free models OpenCode still advertises) |
 | `LINGLING_ALLOWED_ORIGINS` | *(empty)* | Extra CORS origins, comma-separated |
 
 The full list is in `backend/core/config.py`. All settings are read from the
@@ -205,6 +206,28 @@ turns), and the client is told with an explicit `lingling_reset` marker so it
 doesn't append the new answer onto the half-gone one. An auto-routed request can
 change model mid-turn that way; one that named a model explicitly never does.
 A stream that goes silent without dying is cut off after `LINGLING_STREAM_IDLE_TIMEOUT`.
+
+## Current status
+
+Everything in this README is implemented and exercised end-to-end:
+
+- The full test suite — hermetic unit tests plus live integration against the
+  real OpenCode free tier — passes (143 tests, no failures).
+- Free models come from OpenCode's live list on a refresh timer. Models that are
+  advertised but no longer served are retired the first time a request hits the
+  400 and stay hidden across restarts; models already known to be dropped are
+  pre-seeded so they never list at all (`LINGLING_RETIRED_MODELS`). Retirement is
+  temporary by default (7 days) because OpenCode has restored free tiers before —
+  a restored model is re-offered automatically, and one that is still dead is
+  re-retired on the next 400.
+- Streaming answers survive a tunnel drop with one automatic retry behind an
+  explicit `lingling_reset` marker, and a stream that goes silent is cut off
+  instead of hanging the session.
+- WARP egress identities auto-register, get health-checked on a timer, and are
+  recycled when rate-limited, so the pool stays warm without manual intervention.
+- The WARP bootstrap and the Codex/Claude one-click setups download their tools
+  over verified TLS only; a failed download never disables certificate checking
+  process-wide.
 
 ---
 
