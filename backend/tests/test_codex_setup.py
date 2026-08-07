@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 os.environ["LINGLING_REQUIRE_KEY"] = "0"
