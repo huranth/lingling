@@ -1,22 +1,17 @@
 """Vision bridge: detect images in a conversation and pick vision models.
 
 When a request contains an image, a text-only model cannot answer it. This
-module provides the two primitives the dispatcher relies on:
+module provides the two primitives callers rely on:
 
 * ``messages_have_images`` -- scan an OpenAI-format message list for image
   content (``image_url`` / ``image`` parts, or base64 data URLs).
-* ``select_vision_model`` -- choose the best free vision-capable model from the
-  unified catalog, used both as a hard constraint (image present -> vision
-  candidates only) and as a deterministic fallback.
-
-It is duck-typed over the catalog: any object exposing ``vision_free()`` whose
-items have ``id``/``modalities``/``context_length``/``max_output`` works
-(the unified catalog's ``LogicalModel``).
+* ``strip_images_for_text_model`` -- replace image parts with short placeholders
+  so a text-only model can still read a conversation with attachments.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 def _iter_content_parts(content: Any) -> List[Any]:
@@ -102,24 +97,3 @@ def strip_images_for_text_model(messages: List[Dict[str, Any]]) -> List[Dict[str
             new["content"] = joined
         cleaned.append(new)
     return cleaned
-
-
-def _vision_score(model: Any) -> tuple:
-    """Rank vision models: richer input modalities, then bigger context/output."""
-    modality_bonus = len(set(model.modalities) & {"image", "audio", "video"})
-    return (
-        modality_bonus,
-        len(getattr(model, "provider_ids", [])),  # prefer multi-provider (resilient)
-        model.context_length or 0,
-        model.max_output or 0,
-    )
-
-
-def select_vision_model(catalog: Any, exclude: Optional[set] = None) -> Optional[str]:
-    """Pick the best free vision-capable model id, or None if there is none."""
-    exclude = exclude or set()
-    candidates = [m for m in catalog.vision_free() if m.id not in exclude]
-    if not candidates:
-        return None
-    candidates.sort(key=_vision_score, reverse=True)
-    return candidates[0].id

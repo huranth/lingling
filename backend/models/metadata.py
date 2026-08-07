@@ -186,7 +186,3 @@ def enrich(model_id: str, prefer_provider: Optional[str] = None) -> Dict[str, An
         "reasoning_toggle": reasoning_toggle(meta),
         "_meta": meta,
     }
-
-
-def refresh() -> None:
-    _load(force=True)
