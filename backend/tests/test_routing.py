@@ -1,0 +1,3322 @@
+"""Real routing tests for the Lingling routing proxy.
+
+Two layers, neither of which mocks the upstream APIs:
+
+1. HERMETIC unit tests -- exercise the executor's failover CONTROL FLOW with
+   tiny in-process fake providers (no network). These verify the keyless
+   attempt path, cross-provider failover, and that retryable codes
+   (428/426/409/410) are treated as failover triggers.
+
+2. LIVE integration tests -- run the real FastAPI app in-process via
+   ``TestClient`` and talk to the REAL OpenCode Zen free tier, which is
+   keyless (verified): ``GET /v1/models`` and the free models on
+   ``POST /v1/chat/completions`` need no credential. These hit the live
+   network (OpenCode Zen + models.dev) and the real dispatcher model.
+
+3. USER API KEY tests -- exercise the new key-creation / auth-gate flow
+   against the real app (hermetic, no network).
+
+Run directly (``python tests/test_routing.py``) or with pytest.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import time
+import importlib
+
+# Isolated data dir so tests never touch the real usage database. NO accounts
+# file -> OpenCode runs keyless, exactly like a fresh install.
+os.environ["LINGLING_DATA_DIR"] = tempfile.mkdtemp(prefix="lingling-test-")
+os.environ["LINGLING_ACCOUNTS_FILE"] = os.path.join(
+    os.environ["LINGLING_DATA_DIR"], "accounts.json"
+)
+os.environ["LINGLING_API_KEYS_FILE"] = os.path.join(
+    os.environ["LINGLING_DATA_DIR"], "api_keys.json"
+)
+# Live chat tests run keyless against the real free tier; auth is exercised
+# separately by test_unit_apikey_gate, so we disable the gate here.
+os.environ["LINGLING_REQUIRE_KEY"] = "0"
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core import config  # noqa: E402
+from core import api_keys  # noqa: E402
+from routing import executor  # noqa: E402
+from providers.base import Provider, UpstreamError  # noqa: E402
+from providers.key_pool import KeyPool  # noqa: E402
+from providers.proxy_pool import ProxyPool  # noqa: E402
+
+from app import app, providers, catalog  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+client = TestClient(app)
+
+
+class SkipTest(Exception):
+    """Raised by a test to mark itself skipped (e.g. missing credential)."""
+
+
+class _QuietLog:
+    """Logger stand-in: stream_guard logs recovery decisions, and the test
+    output should stay readable.
+    """
+
+    def info(self, *a, **k):
+        pass
+
+    def warning(self, *a, **k):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Fakes for the HERMETIC executor unit tests (control flow only, no network).
+# ---------------------------------------------------------------------------
+class FakeProvider(Provider):
+    """A no-network provider whose chat_completions behavior is injected."""
+
+    display_name = "Fake"
+    base_url = "http://fake.invalid"
+
+    def __init__(self, pid, behavior, keyed=False, nkeys=1, use_proxy=False, direct=False):
+        keys = KeyPool.from_list([{"secret": f"k{i}"} for i in range(nkeys)]) if keyed else KeyPool([])
+        super().__init__(keys)
+        self.id = pid
+        self.display_name = pid
+        self._behavior = behavior
+        self._keyed = keyed
+        self._use_proxy = use_proxy
+        self._direct = direct
+        self.calls = []
+
+    def requires_key(self):
+        return self._keyed
+
+    def needs_proxy(self):
+        return self._use_proxy
+
+    def prefer_direct(self, model_id):
+        return self._direct
+
+    def fetch_model_ids(self):
+        return []
+
+    def is_model_free(self, model_id, meta):
+        return True
+
+    def chat_completions(self, messages, model, secret, timeout=None, **params):
+        self.calls.append({"model": model, "secret": secret})
+        b = self._behavior
+        if isinstance(b, UpstreamError):
+            raise b
+        if callable(b):
+            return b(self, messages, model, secret)
+        return b
+
+    def stream_chat(self, messages, model, secret, timeout=None, **params):
+        self.calls.append({"model": model, "secret": secret, "stream": True})
+        b = self._behavior
+        if isinstance(b, UpstreamError):
+            raise b
+        if callable(b):
+            b = b(self, messages, model, secret)
+        yield from b
+
+
+CANNED = {
+    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+    "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+}
+
+
+# ---------------------------------------------------------------------------
+# 1. HERMETIC executor unit tests
+# ---------------------------------------------------------------------------
+def test_unit_keyless_single_attempt():
+    """A keyless provider succeeds in one attempt with an empty secret."""
+    fk = FakeProvider("keyless", CANNED, keyed=False)
+    resp, prov, key, attempts = executor.execute_nonstream(
+        [{"role": "user", "content": "hi"}], "m", [fk]
+    )
+    assert resp is CANNED and prov is fk and key is None and attempts == []
+    assert fk.calls[0]["secret"] == ""  # no credential sent
+
+
+def test_unit_keyless_failover_to_keyed():
+    """Keyless 429 falls over to a keyed provider; the attempt is recorded."""
+    bad = FakeProvider("keyless", UpstreamError(429, "rate limited", "keyless"))
+    good = FakeProvider("keyed", CANNED, keyed=True)
+    resp, prov, key, attempts = executor.execute_nonstream(
+        [{"role": "user", "content": "hi"}], "m", [bad, good]
+    )
+    assert resp is CANNED and prov is good and key is not None
+    assert attempts and attempts[0]["provider"] == "keyless" and attempts[0]["status"] == 429
+
+
+def test_unit_retry_codes_failover():
+    """Retryable codes (428/426/409/410/429) trigger failover, not a hard fail."""
+    for code in (428, 426, 409, 410, 429):
+        bad = FakeProvider("fb", UpstreamError(code, "x", "fb"))
+        good = FakeProvider("keyed", CANNED, keyed=True)
+        resp, prov, _, attempts = executor.execute_nonstream(
+            [{"role": "user", "content": "hi"}], "m", [bad, good]
+        )
+        assert resp is CANNED and prov is good, f"code {code} did not fail over"
+        assert attempts[0]["status"] == code
+
+
+def test_unit_non_retryable_stops():
+    """A non-retryable status (400) raises AllFailedError immediately."""
+    bad = FakeProvider("keyless", UpstreamError(400, "bad request", "keyless"))
+    good = FakeProvider("keyed", CANNED, keyed=True)
+    try:
+        executor.execute_nonstream([{"role": "user", "content": "hi"}], "m", [bad, good])
+    except executor.AllFailedError as exc:
+        assert exc.attempts and exc.attempts[0]["status"] == 400
+        assert good.calls == []  # never reached the second provider
+    else:
+        raise AssertionError("expected AllFailedError for non-retryable 400")
+
+
+def test_unit_all_fail():
+    """Every provider failing raises AllFailedError with the full attempt log."""
+    a = FakeProvider("a", UpstreamError(429, "x", "a"))
+    b = FakeProvider("b", UpstreamError(503, "y", "b"))
+    try:
+        executor.execute_nonstream([{"role": "user", "content": "hi"}], "m", [a, b])
+    except executor.AllFailedError as exc:
+        assert [x["provider"] for x in exc.attempts] == ["a", "b"]
+    else:
+        raise AssertionError("expected AllFailedError when all providers fail")
+
+
+def test_unit_stream_first_chunk_failover():
+    """A pre-first-token proxy/provider failure retries before HTTP 200 is sent."""
+    bad = FakeProvider("bad", UpstreamError(504, "proxy unreachable", "bad"))
+    good = FakeProvider("good", iter([b'data: {"choices":[]}', b"data: [DONE]"]))
+    stream, prov, key, attempts = executor.execute_stream(
+        [{"role": "user", "content": "hi"}], "m", [bad, good]
+    )
+    assert prov is good and key is None
+    assert attempts[0]["provider"] == "bad" and attempts[0]["status"] == 504
+    assert list(stream)[-1] == b"data: [DONE]"
+
+
+def test_unit_fast_model_bypasses_proxy_pool():
+    """The fast route must not touch a dead WARP/SOCKS endpoint."""
+    fast = FakeProvider("fast", CANNED, direct=True)
+    pool = ProxyPool.from_list([{"id": "dead-warp", "url": "socks5://127.0.0.1:1"}])
+    resp, prov, _, attempts = executor.execute_nonstream(
+        [{"role": "user", "content": "hi"}], "ling-3.0-flash-free", [fast], proxy_pool=pool
+    )
+    assert resp is CANNED and prov is fast and attempts == []
+    assert pool.proxies[0].total_requests == 0
+
+
+# ---------------------------------------------------------------------------
+# 2. LIVE integration tests (real OpenCode Zen free tier, keyless, no mocks)
+# ---------------------------------------------------------------------------
+def test_live_health():
+    r = client.get("/api/health")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "ok" and body["name"] == "Lingling"
+    # OpenCode is keyless -> always configured.
+    assert body["providers"]["opencode"]["configured"] is True
+
+
+def _live_free_ids() -> set:
+    """The free model ids OpenCode advertises *right now*.
+
+    Fetched live and filtered with the exact rule Lingling's catalog applies
+    (``-free`` suffix or a curated keyless entry), so these tests can never go
+    stale against the catalog: when OpenCode ships a new free model, this picks
+    it up automatically and asserts the catalog serves it. A hardcoded list
+    here is what let the tests and the catalog disagree (the catalog showed 8
+    free models while the tests only knew about 6).
+    """
+    from providers.opencode import OpenCodeProvider
+
+    prov = OpenCodeProvider(KeyPool([]))
+    return {
+        mid for mid in prov.fetch_model_ids()
+        if prov.is_model_free(mid, {})
+    }
+
+
+def test_live_models():
+    r = client.get("/api/models")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    mm = body["multimodel"]
+    assert mm["multi_model"] is True and mm["id"] == config.MULTIMODEL_ID
+    models = body["models"]
+    assert models, "expected a non-empty free model list"
+    ids = {m["id"] for m in models}
+    # Every surfaced model is free and carries its provider list.
+    for m in models:
+        assert m["free"] is True
+        assert isinstance(m["providers"], list) and m["providers"], m["id"]
+        assert m["provider_count"] == len(m["providers"])
+    # Live sync check: every free model OpenCode advertises today must be in
+    # the catalog -- no hardcoded list to maintain when new models appear.
+    missing = _live_free_ids() - ids
+    assert not missing, f"expected free models missing from catalog: {missing}"
+
+
+def test_live_v1_models_openai_compatible():
+    """Jan/Cline/OpenAI-compatible clients load models from GET /v1/models."""
+    r = client.get("/v1/models")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["object"] == "list"
+    assert isinstance(body["data"], list) and body["data"], body
+    ids = {m["id"] for m in body["data"]}
+    assert config.MULTIMODEL_ID in ids
+    # Same live sync as /api/models: whatever OpenCode marks free today must be
+    # advertised through the OpenAI-compatible list too.
+    assert _live_free_ids() <= ids
+    for m in body["data"]:
+        assert m["object"] == "model"
+        assert m["id"]
+        assert "owned_by" in m
+
+
+def test_live_responses_nonstream_keyless():
+    """Codex uses /v1/responses; the bridge returns a Responses object."""
+    # Pick the model from the live catalog, never a hardcoded id: OpenCode
+    # retires free models without notice (ling-3.0-flash-free was dropped while
+    # these tests were in service), and a stale id makes the suite fail on a
+    # model nobody serves anymore.
+    ids = _live_free_ids()
+    assert ids, "expected at least one live free model"
+    mid = config.DISPATCHER_MODEL if config.DISPATCHER_MODEL in ids else sorted(ids)[0]
+    r = client.post(
+        "/v1/responses",
+        json={
+            "model": mid,
+            "input": "Reply with exactly one word: pong",
+            "stream": False,
+            "max_output_tokens": 16,
+        },
+        timeout=90,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["object"] == "response"
+    assert body["status"] == "completed"
+    assert body["output"] and body["output"][0]["type"] == "message", body
+    assert body["usage"]["total_tokens"] >= 0
+    l = body["lingling"]
+    assert l["routed_model"] in _live_free_ids(), l
+    # When the named model is served, it must stay on it. A live 429/400 can
+    # legitimately fall back to another free model (routed_by="fallback").
+    if l["routed_by"] != "fallback":
+        assert l["routed_model"] == mid, l
+
+
+def test_live_free_chat_direct():
+    """Direct selection of a free model runs keyless on OpenCode Zen."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "deepseek-v4-flash-free",
+            "messages": [{"role": "user", "content": "Reply with exactly one word: pong"}],
+            "max_tokens": 16,
+        },
+        timeout=90,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["choices"], body
+    ll = body["lingling"]
+    assert ll["provider"] == "opencode"
+    assert ll["routed_by"] == "user"
+    assert ll["routed_model"] == "deepseek-v4-flash-free"
+
+
+def test_live_multimodel_routing():
+    """lingling-auto runs the real dispatcher and routes to a free model."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": config.MULTIMODEL_ID,
+            "messages": [
+                {"role": "user", "content": "Write a Python function that reverses a string."}
+            ],
+            "max_tokens": 200,
+        },
+        timeout=120,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["choices"], body
+    ll = body["lingling"]
+    assert ll["routed_by"] in ("dispatcher", "fallback"), ll
+    assert ll["routed_model"] and ll["routed_model"] != config.MULTIMODEL_ID
+    # Whatever it picked must be a free model the catalog knows about.
+    assert catalog.is_free(ll["routed_model"]) is not False
+
+
+def test_live_streaming_keyless():
+    """Streaming binds to the keyless OpenCode path and yields SSE chunks."""
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "deepseek-v4-flash-free",
+            "messages": [{"role": "user", "content": "Count from 1 to 3."}],
+            "max_tokens": 40,
+            "stream": True,
+        },
+        timeout=120,
+    ) as r:
+        assert r.status_code == 200
+        chunks = [line for line in r.iter_lines() if line.startswith("data:")]
+    assert chunks, "expected at least one SSE data chunk"
+    assert any("[DONE]" in c for c in chunks), "stream did not terminate with [DONE]"
+
+
+def test_live_premium_rejected():
+    """A known premium model is rejected (Lingling is free-tier only)."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]},
+        timeout=60,
+    )
+    # The model is unknown to all providers ├óΓÇáΓÇÖ 400 with an explanatory message.
+    assert r.status_code == 400, r.text
+    assert "unknown" in r.json()["detail"].lower()
+
+
+def test_live_usage_recorded():
+    """The calls above were logged, with a per-provider breakdown."""
+    r = client.get("/api/usage")
+    assert r.status_code == 200, r.text
+    summary = r.json()["summary"]
+    assert summary["totals"]["requests"] >= 3, summary["totals"]
+    # per_provider is a list of {provider, requests, ...} rows; the empty-
+    # provider row is the premium rejection (logged before any routing).
+    per_provider = {row["provider"]: row for row in summary["per_provider"]}
+    assert "opencode" in per_provider, summary["per_provider"]
+    assert per_provider["opencode"]["requests"] >= 1
+
+
+def test_live_apikey_gate():
+    """User API keys gate /v1/chat/completions: rejected without a key,
+    accepted with a freshly-created key. (Uses a short isolated app.)"""
+    import importlib
+    # Re-import config + app with auth re-enabled so the gate is live here.
+    os.environ["LINGLING_REQUIRE_KEY"] = "1"
+    importlib.reload(config)
+    importlib.reload(api_keys)
+    # Fresh app instance wired to the current config.
+    import app as app_module
+    importlib.reload(app_module)
+    gated_client = TestClient(app_module.app)
+    try:
+        # No key -> 401.
+        assert gated_client.get("/v1/models").status_code == 200
+        r = gated_client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4-flash-free",
+                  "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r.status_code == 401, r.text
+        # Create a key. Key management is itself gated now, so the client
+        # first loads / to obtain a dashboard session cookie -- the same
+        # sequence a browser performs.
+        assert gated_client.post("/api/keys", json={"label": "x"}).status_code == 401
+        assert gated_client.get("/").status_code == 200
+        created = gated_client.post("/api/keys", json={"label": "test"}).json()["created"]
+        token = created["token"]
+        # With key -> not 401 (may be 200/4xx/5xx from upstream; we only assert
+        # the gate passed).
+        r = gated_client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4-flash-free",
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "max_tokens": 8},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=90,
+        )
+        assert r.status_code != 401, r.text
+        # Wrong key -> 401. The dashboard session cookie the client picked up
+        # above would legitimately authorise it, so drop the cookie first and
+        # test the key path in isolation.
+        gated_client.cookies.clear()
+        r = gated_client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-v4-flash-free",
+                  "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Authorization": "Bearer ll_wrong"},
+        )
+        assert r.status_code == 401, r.text
+        # Revoke -> gone. Needs a credential again; reuse the real key.
+        r = gated_client.delete(
+            f"/api/keys/{created['id']}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200, r.text
+    finally:
+        # Restore the keyless mode for any later tests.
+        os.environ["LINGLING_REQUIRE_KEY"] = "0"
+        importlib.reload(config)
+        importlib.reload(api_keys)
+        importlib.reload(app_module)
+
+
+def test_unit_session_token_signing():
+    """Session tokens are HMAC-signed, expiring, and per-process.
+
+    The old gate trusted the ``sec-fetch-site`` header, which any non-browser
+    client can set -- auth was bypassable with one extra curl flag. These
+    assertions pin the replacement's properties.
+    """
+    import importlib
+
+    from core import auth
+
+    token = auth.mint_session()
+    assert auth.verify_session(token), "a freshly minted token must verify"
+
+    expires, _, sig = token.partition(".")
+    assert not auth.verify_session(f"{expires}.{'0' * len(sig)}"), "forged signature accepted"
+    assert not auth.verify_session(f"{int(expires) + 3600}.{sig}"), "extended expiry accepted"
+    assert not auth.verify_session("nonsense"), "malformed token accepted"
+    assert not auth.verify_session(""), "empty token accepted"
+    assert not auth.verify_session(None), "None accepted"
+
+    assert not auth.verify_session(auth.mint_session(ttl_s=-10)), "expired token accepted"
+
+    # The signing secret is per-process: a restart invalidates old sessions.
+    importlib.reload(auth)
+    assert not auth.verify_session(token), "token survived a secret rotation"
+
+
+def test_unit_secfetch_header_no_longer_grants_access():
+    """Regression guard: the historical sec-fetch-site bypass stays closed."""
+    import importlib
+
+    os.environ["LINGLING_REQUIRE_KEY"] = "1"
+    importlib.reload(config)
+    importlib.reload(api_keys)
+    import app as app_module
+    importlib.reload(app_module)
+    gated = TestClient(app_module.app)
+    try:
+        body = {"model": "deepseek-v4-flash-free",
+                "messages": [{"role": "user", "content": "hi"}]}
+        for value in ("same-origin", "same-site", "none"):
+            r = gated.post("/v1/chat/completions", json=body,
+                           headers={"sec-fetch-site": value})
+            assert r.status_code == 401, f"sec-fetch-site={value} bypassed the gate"
+
+        # The destructive /api routes are gated too, not just chat.
+        for method, path in (("GET", "/api/keys"),
+                            ("GET", "/api/proxies"),
+                            ("DELETE", "/api/usage"),
+                            ("POST", "/api/warp/refresh")):
+            r = gated.request(method, path, headers={"sec-fetch-site": "same-origin"})
+            assert r.status_code == 401, f"{method} {path} was open ({r.status_code})"
+
+        # Key creation is itself gated; these two stay deliberately keyless.
+        r = gated.post("/api/keys", json={"label": "gate"},
+                       headers={"sec-fetch-site": "same-origin"})
+        assert r.status_code == 401, "key creation must be gated"
+        assert gated.get("/api/health").status_code == 200
+        assert gated.get("/v1/models").status_code == 200
+    finally:
+        os.environ["LINGLING_REQUIRE_KEY"] = "0"
+        importlib.reload(config)
+        importlib.reload(api_keys)
+        importlib.reload(app_module)
+
+
+def test_unit_session_cookie_authenticates():
+    """A cookie minted by GET / authorises the guarded routes."""
+    import importlib
+
+    os.environ["LINGLING_REQUIRE_KEY"] = "1"
+    importlib.reload(config)
+    importlib.reload(api_keys)
+    import app as app_module
+    importlib.reload(app_module)
+    gated = TestClient(app_module.app)
+    try:
+        assert gated.get("/api/keys").status_code == 401
+        # TestClient keeps cookies across requests, exactly like a browser.
+        root = gated.get("/")
+        assert root.status_code == 200
+        assert app_module.auth.COOKIE_NAME in root.cookies, root.cookies
+        assert gated.get("/api/keys").status_code == 200, "session cookie was not accepted"
+        assert gated.get("/api/proxies").status_code == 200
+    finally:
+        os.environ["LINGLING_REQUIRE_KEY"] = "0"
+        importlib.reload(config)
+        importlib.reload(api_keys)
+        importlib.reload(app_module)
+
+
+def test_unit_usage_finalize_and_prune():
+    """Streamed rows finalize their tokens; retention pruning drops old rows."""
+    from usage.store import UsageStore
+
+    store = UsageStore(os.path.join(tempfile.mkdtemp(prefix="lingling-prune-"), "u.db"))
+    try:
+        # A streamed request logs at first chunk with zero tokens, then finalizes.
+        rid = store.log("m", "m", "user", status="ok_stream", streamed=True, latency_ms=12.0)
+        assert isinstance(rid, int) and rid > 0
+        assert store.recent(5)[0]["tokens_out"] == 0
+
+        store.finalize(rid, tokens_in=11, tokens_out=22, reasoning_tokens=5, latency_ms=99.0)
+        row = store.recent(5)[0]
+        assert (row["tokens_in"], row["tokens_out"], row["reasoning_tokens"]) == (11, 22, 5), row
+        assert round(row["latency_ms"]) == 99, row
+        assert row["status"] == "ok_stream", "finalize must not clobber a good status"
+        assert store.summary()["totals"]["tokens_total"] == 33
+
+        # since() drives the dashboard's incremental poll.
+        assert store.since(rid) == []
+        rid2 = store.log("m", "m", "user", status="ok")
+        assert [r["id"] for r in store.since(rid)] == [rid2]
+
+        # buckets() is the live series: fixed width, zero-filled.
+        buckets = store.buckets(minutes=5, bucket_s=60)
+        assert len(buckets) == 5
+        assert sum(b["requests"] for b in buckets) == 2, buckets
+
+        # Backdate one row past the window, then prune.
+        store._conn.execute(  # noqa: SLF001 - the test reaches in deliberately
+            "UPDATE request_log SET ts = ts - ? WHERE id = ?", (100 * 86400, rid))
+        store._conn.commit()  # noqa: SLF001
+        assert store.prune(90) == 1
+        assert store.summary()["totals"]["requests"] == 1
+        assert store.prune(0) == 0, "0 must disable pruning"
+    finally:
+        store.close()
+
+
+def test_unit_stream_guard_recovers_broken_stream():
+    """A stream that dies before completing is retried once on a fresh stream.
+
+    The client sees a `lingling_reset` frame telling it to discard the partial
+    answer, then the replacement answer. This is the mid-flight case HTTP cannot
+    fail over: the 200 is already sent.
+    """
+    from routing import stream_guard
+
+    def dying():
+        yield b'data: {"choices":[{"delta":{"content":"half an ans"}}]}'
+        raise UpstreamError(504, "tunnel dropped", "opencode")
+
+    def healthy():
+        yield b'data: {"choices":[{"delta":{"content":"a full answer"}}]}'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+        yield b"data: [DONE]"
+
+    outcome = stream_guard.StreamOutcome()
+    frames = list(stream_guard.guarded_stream(
+        open_stream=healthy, first=dying(), outcome=outcome,
+        on_chunk=lambda raw: None, log=_QuietLog(),
+    ))
+    body = b"".join(frames).decode()
+    assert "lingling_reset" in body, body
+    assert "a full answer" in body, body
+    assert outcome.recovered is True
+    assert outcome.attempts == 2
+    assert outcome.completed is True
+    assert outcome.error is None
+    # The reset frame must arrive before the replacement text, or a client would
+    # discard the new answer instead of the old one.
+    assert body.index("lingling_reset") < body.index("a full answer")
+
+
+def test_unit_stream_guard_no_retry_after_completion():
+    """A disconnect after finish_reason is harmless and must not burn a retry."""
+    from routing import stream_guard
+
+    calls = []
+
+    def after_done():
+        yield b'data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}'
+        raise UpstreamError(504, "connection reset", "opencode")
+
+    def should_not_run():
+        calls.append(1)
+        yield b"data: [DONE]"
+
+    outcome = stream_guard.StreamOutcome()
+    list(stream_guard.guarded_stream(
+        open_stream=should_not_run, first=after_done(), outcome=outcome,
+        on_chunk=lambda raw: None, log=_QuietLog(),
+    ))
+    assert calls == [], "retried a stream that had already completed"
+    assert outcome.completed is True
+    assert outcome.recovered is False
+    assert outcome.error is None
+
+
+def test_unit_stream_guard_gives_up_after_one_retry():
+    """Two failures in a row end the stream; no infinite retry loop."""
+    from routing import stream_guard
+
+    def dying():
+        yield b'data: {"choices":[{"delta":{"content":"x"}}]}'
+        raise UpstreamError(504, "dropped", "opencode")
+
+    outcome = stream_guard.StreamOutcome()
+    frames = list(stream_guard.guarded_stream(
+        open_stream=dying, first=dying(), outcome=outcome,
+        on_chunk=lambda raw: None, log=_QuietLog(),
+    ))
+    assert outcome.attempts == 2, outcome.attempts
+    assert outcome.completed is False
+    assert outcome.error, "a doubly-failed stream must record why"
+    assert sum(1 for f in frames if b"lingling_reset" in f) == 1
+
+
+def test_unit_stream_guard_respects_opt_out():
+    """enabled=False keeps the old truncate-and-stop behaviour."""
+    from routing import stream_guard
+
+    calls = []
+
+    def dying():
+        yield b'data: {"choices":[{"delta":{"content":"x"}}]}'
+        raise UpstreamError(504, "dropped", "opencode")
+
+    def should_not_run():
+        calls.append(1)
+        yield b"data: [DONE]"
+
+    outcome = stream_guard.StreamOutcome()
+    frames = list(stream_guard.guarded_stream(
+        open_stream=should_not_run, first=dying(), outcome=outcome,
+        on_chunk=lambda raw: None, log=_QuietLog(), enabled=False,
+    ))
+    assert calls == []
+    assert outcome.recovered is False
+    assert outcome.error
+    assert not any(b"lingling_reset" in f for f in frames)
+
+
+def test_unit_stream_guard_forwards_every_chunk_verbatim():
+    """on_chunk sees the raw bytes, and yielded frames are unmodified."""
+    from routing import stream_guard
+
+    seen = []
+    payload = [
+        b'data: {"choices":[{"delta":{"content":"one "}}]}',
+        b'data: {"choices":[{"delta":{"content":"two"},"finish_reason":"stop"}]}',
+        b"data: [DONE]",
+    ]
+    outcome = stream_guard.StreamOutcome()
+    frames = list(stream_guard.guarded_stream(
+        open_stream=lambda: iter(()), first=iter(payload), outcome=outcome,
+        on_chunk=seen.append, log=_QuietLog(),
+    ))
+    assert seen == payload, "usage harvesting must see every raw frame"
+    assert frames == [f + b"\n\n" for f in payload], "frames must pass through verbatim"
+    assert outcome.text_chars == len("one ") + len("two")
+
+
+def test_unit_stream_guard_client_disconnect_does_not_retry():
+    """A client hanging up must not trigger a recovery attempt.
+
+    When the browser aborts, Starlette closes the generator, raising
+    GeneratorExit at the yield. That inherits BaseException rather than
+    Exception, so the recovery handler must not see it -- otherwise every
+    cancelled request would burn a second upstream call for an answer nobody is
+    listening to.
+    """
+    from routing import stream_guard
+
+    calls = []
+
+    def slow():
+        yield b'data: {"choices":[{"delta":{"content":"one"}}]}'
+        yield b'data: {"choices":[{"delta":{"content":"two"}}]}'
+
+    def should_not_run():
+        calls.append(1)
+        yield b"data: [DONE]"
+
+    outcome = stream_guard.StreamOutcome()
+    gen = stream_guard.guarded_stream(
+        open_stream=should_not_run, first=slow(), outcome=outcome,
+        on_chunk=lambda raw: None, log=_QuietLog(),
+    )
+    next(gen)          # consume one frame, as a client would
+    gen.close()        # then hang up
+    assert calls == [], "a client disconnect must not trigger a retry"
+    assert outcome.recovered is False
+
+
+def test_unit_responses_bridge_request_maps_codex_shape_to_chat():
+    """Codex's Responses request becomes one chat history plus chat tools."""
+    from routing import responses_bridge
+
+    body = {
+        "model": "lingling-auto",
+        "instructions": "system rules",
+        "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "dev"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "shell_command", "arguments": "{\"command\":\"pwd\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "C:/repo"},
+        ],
+        "tools": [{
+            "type": "function", "name": "shell_command", "description": "run",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+        }],
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+        "max_output_tokens": 123,
+    }
+    model, messages, params = responses_bridge.request_to_chat(body)
+    assert model == "lingling-auto"
+    assert messages[0] == {"role": "system", "content": "system rules"}
+    assert messages[1] == {"role": "system", "content": "dev"}
+    assert messages[2] == {"role": "user", "content": "hi"}
+    assert messages[3]["tool_calls"][0]["function"]["name"] == "shell_command"
+    assert messages[4] == {"role": "tool", "tool_call_id": "call_1", "content": "C:/repo"}
+    assert params["tools"][0]["function"]["name"] == "shell_command"
+    assert params["max_tokens"] == 123
+    assert params["tool_choice"] == "auto"
+
+
+def test_unit_responses_bridge_stream_events_for_text_and_tool_calls():
+    """Chat SSE chunks become the Responses events Codex 0.144 accepts."""
+    from routing import responses_bridge
+
+    chat = iter([
+        b'data: {"choices":[{"delta":{"content":"he"}}]}',
+        b'data: {"choices":[{"delta":{"content":"llo"}}]}',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_x","function":{"name":"shell_command","arguments":"{\\\"command\\\":"}}]}}]}',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\\\"pwd\\\"}"}}]}}]}',
+        b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}',
+        b"data: [DONE]",
+    ])
+    body = b"".join(responses_bridge.stream_events(chat, "m")).decode()
+    assert "event: response.created" in body
+    assert "event: response.output_text.delta" in body
+    assert '"delta":"he"' in body and '"text":"hello"' in body
+    assert "event: response.function_call_arguments.done" in body
+    assert '"call_id":"call_x"' in body
+    assert '"input_tokens":7' in body and '"output_tokens":3' in body
+
+def test_unit_responses_bridge_keeps_images_and_indexes_items():
+    """Two regressions the first bridge draft had, both silent.
+
+    1. An `input_image` part was dropped, so a screenshot turn reached the
+       provider as text and `vision_bridge` routed it to a text-only model.
+    2. A narrated tool call put the message and the function_call both at
+       `output_index` 0, so the two items collided in the client's table.
+    """
+    from routing import responses_bridge
+    from models.vision_bridge import messages_have_images
+
+    _, messages, _ = responses_bridge.request_to_chat({
+        "model": "m",
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "what is in this shot"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        ]}],
+    })
+    assert messages_have_images(messages), messages
+    parts = messages[0]["content"]
+    assert parts[1] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+
+    chat = iter([
+        b'data: {"choices":[{"delta":{"content":"let me look"}}]}',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"shell","arguments":"{}"}}]}}]}',
+        b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+    ])
+    frames = [f.decode() for f in responses_bridge.stream_events(chat, "m")]
+    added = [f for f in frames if "response.output_item.added" in f]
+    assert len(added) == 2, added
+    assert '"output_index":0' in added[0] and '"type":"message"' in added[0]
+    assert '"output_index":1' in added[1] and '"type":"function_call"' in added[1]
+
+
+def test_unit_responses_bridge_reports_a_truncated_stream():
+    """A stream that stops without finish_reason must not be filed as success.
+
+    `/v1/responses` has no mid-flight retry (the Responses protocol has no
+    equivalent of the `lingling_reset` frame), so the only honest thing to do is
+    record the turn as broken. `outcome.completed` is what the endpoint reads.
+    """
+    from routing import responses_bridge
+    from routing.stream_guard import StreamOutcome
+
+    outcome = StreamOutcome()
+    truncated = iter([b'data: {"choices":[{"delta":{"content":"half"}}]}'])
+    body = b"".join(responses_bridge.stream_events(truncated, "m", outcome)).decode()
+    assert outcome.completed is False
+    assert '"status":"completed"' in body, "the client still needs a terminal event"
+
+    outcome2 = StreamOutcome()
+    whole = iter([
+        b'data: {"choices":[{"delta":{"content":"all of it"},"finish_reason":"stop"}]}',
+        b"data: [DONE]",
+    ])
+    b"".join(responses_bridge.stream_events(whole, "m", outcome2))
+    assert outcome2.completed is True
+
+
+def test_unit_effort_maps_harness_labels_by_rank():
+    """Harness vocabularies only line up through a shared rank scale.
+
+        Codex        none  minimal  low  medium  high  xhigh  max  ultra
+        Claude Code                 low  medium  high  xhigh  max  ultracode
+
+    A name means nothing on its own -- `ultra` is Codex's ceiling, `ultracode` is
+    Claude Code's, and neither exists in OpenCode's vocabulary. normalize() maps
+    a label to a canonical word; rank is what lets it cross the boundary.
+    """
+    from routing import effort
+
+    for label in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
+        assert effort.normalize(label) == label
+    assert effort.normalize("ultra") == "ultra"
+    assert effort.normalize("ultracode") == "ultracode"
+    assert effort.normalize("  XHigh ") == "xhigh", "case and padding must not matter"
+
+    # Unrecognised or non-string -> None, meaning "send no parameter at all".
+    assert effort.normalize("turbo-mega") is None
+    assert effort.normalize("") is None
+    assert effort.normalize(None) is None
+    # Anthropic's deprecated numeric thinking budget is not an effort label.
+    assert effort.normalize(31999) is None
+
+    # ultra pins to the ceiling; ultracode is xhigh-level depth because the
+    # sub-agent orchestration half cannot cross a provider boundary.
+    assert effort.clamp("ultra", ["low", "high", "max"]) == "max"
+    assert effort.clamp("ultracode", ["low", "medium", "xhigh"]) == "xhigh"
+
+
+def test_unit_effort_clamps_to_each_models_published_values():
+    """Effort values come from models.dev, and every model publishes a different set.
+
+    OpenCode answers 200 for a value a model does not implement, silently
+    ignoring it -- so a value must be translated to something the model really
+    honours, and dropped entirely when it honours nothing. The sets below are the
+    live ones (`reasoning_options`), the same data OpenCode's CLI shows under
+    `/variants`.
+    """
+    from routing import effort
+
+    deepseek = ["low", "high", "max"]       # + an on/off toggle
+    ling = ["low", "medium", "high"]        # no max
+    north = ["none", "high"]                # sparse, non-contiguous
+    mimo = []                               # no effort control at all
+
+    # An exact match always passes through untouched.
+    assert effort.resolve("high", deepseek) == "high"
+    assert effort.resolve("medium", ling) == "medium"
+
+    # Below a model's floor clamps up to its weakest rung: `low` on deepseek.
+    assert effort.resolve("none", deepseek) == "low"
+    assert effort.resolve("low", deepseek) == "low"
+    assert effort.resolve("minimal", deepseek) == "low"
+    assert effort.resolve("none", ling) == "low"
+
+    # Above a model's ceiling clamps down: ling has no `max`.
+    assert effort.resolve("max", ling) == "high"
+    assert effort.resolve("ultra", ling) == "high"
+
+    # A sparse set resolves by rank, not by list position.
+    assert effort.resolve("medium", north) == "high", "0.50 is nearer 0.70 than 0.0"
+    assert effort.resolve("low", north) == "none", "0.30 is nearer 0.0 than 0.70"
+
+    # Equidistant resolves to the weaker value, so a translation never spends
+    # more thinking than was asked for. `medium` is exactly midway between
+    # `low` (0.30) and `high` (0.70); raw float arithmetic makes `high` look
+    # closer (0.7-0.5 == 0.19999999999999996 < 0.2) and must not win.
+    assert effort.resolve("ultracode", deepseek) == "high", "0.85 sits midway; take the floor"
+    assert effort.resolve("medium", deepseek) == "low", "midpoint tie must take the weaker rung"
+
+    # A model with no effort control must never be sent the parameter -- sending
+    # one would be accepted and ignored, which looks like success.
+    for label in ("none", "low", "high", "max", "ultra", "ultracode"):
+        assert effort.resolve(label, mimo) is None, label
+    assert effort.resolve("high", None) is None, "unknown model data is not a licence to guess"
+
+
+def test_unit_effort_sets_come_from_models_dev_not_a_hardcoded_table():
+    """The per-model sets must be read live, so new free models arrive correct.
+
+    An earlier version of this module probed the endpoint to build its own table
+    and was wrong for six of seven free models, because OpenCode's 200 response
+    cannot distinguish "honoured" from "silently ignored".
+    """
+    from models import metadata
+    from providers.opencode import FREE_MODEL_CAPS
+
+    for caps in FREE_MODEL_CAPS.values():
+        assert "effort" not in caps, "effort must not be hardcoded per model"
+
+    meta = {"reasoning_options": [
+        {"type": "toggle"},
+        {"type": "effort", "values": ["high", "max"]},
+    ]}
+    assert metadata.reasoning_effort_values(meta) == ["high", "max"]
+    assert metadata.reasoning_toggle(meta) is True
+
+    # A model with no reasoning_options exposes no effort control.
+    assert metadata.reasoning_effort_values({}) == []
+    assert metadata.reasoning_toggle({}) is False
+    # A toggle alone is not an effort level -- it is a separate on/off control.
+    assert metadata.reasoning_effort_values({"reasoning_options": [{"type": "toggle"}]}) == []
+
+
+def test_unit_codex_reasoning_block_becomes_chat_reasoning_effort():
+    """Codex nests effort under `reasoning`; chat wants it flat.
+
+    The bridge passes the label through unresolved on purpose -- the legal set
+    depends on which model routing picks, which is not known this early.
+    """
+    from routing import responses_bridge
+
+    _, _, params = responses_bridge.request_to_chat({
+        "model": "lingling-auto",
+        "input": "hi",
+        "reasoning": {"effort": "xhigh", "summary": "auto"},
+    })
+    assert params["reasoning_effort"] == "xhigh"
+
+    # No reasoning block, or a block without effort: nothing is invented.
+    _, _, bare = responses_bridge.request_to_chat({"model": "m", "input": "hi"})
+    assert "reasoning_effort" not in bare
+    _, _, summary_only = responses_bridge.request_to_chat({
+        "model": "m", "input": "hi", "reasoning": {"summary": "auto"},
+    })
+    assert "reasoning_effort" not in summary_only
+
+
+def _codex_template():
+    """A stand-in for one model out of `codex debug models`.
+
+    Same 35-field shape, with the fields the generator reads or must preserve.
+    Not the real 20 KB prompt -- the point is that whatever the template holds
+    survives into every entry, which a short marker string proves just as well.
+    """
+    return {
+        "slug": "gpt-5.5",
+        "display_name": "GPT-5.5",
+        "description": "Latest frontier agentic coding model.",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Fast responses with lighter reasoning"},
+            {"effort": "medium", "description": "Balances speed and reasoning depth"},
+            {"effort": "high", "description": "Greater reasoning depth"},
+            {"effort": "xhigh", "description": "Extra high reasoning depth"},
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 7,
+        "additional_speed_tiers": ["fast"],
+        "service_tiers": [{"id": "priority", "name": "Fast", "description": "1.5x speed"}],
+        "availability_nux": {"message": "GPT-5.5 is now available in Codex."},
+        "base_instructions": "You are Codex, a coding agent based on GPT-5. <the entire harness>",
+        "model_messages": {"instructions_template": "...", "approvals": None},
+        "default_reasoning_summary": "none",
+        "support_verbosity": True,
+        "default_verbosity": "low",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "supports_parallel_tool_calls": True,
+        "supports_image_detail_original": False,
+        "context_window": 272000,
+        "max_context_window": 272000,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": True,
+        "use_responses_lite": False,
+    }
+
+
+def _lingling_model(model_id, effort_values, context=200000, vision=False):
+    """A Lingling catalog model in `LogicalModel.to_dict()` shape."""
+    return {
+        "id": model_id,
+        "name": model_id.replace("-", " ").title(),
+        "free": True,
+        "vision": vision,
+        "reasoning": True,
+        "context_length": context,
+        "max_output": 32000,
+        "modalities": ["text", "image"] if vision else ["text"],
+        "providers": ["opencode"],
+        "capabilities": {"effort": effort_values, "desc": "a free model"},
+        "description": "a free model",
+    }
+
+
+class _RoutingModel:
+    """A catalog model with just the fields the router reads."""
+
+    def __init__(self, model_id, desc, vision=False, context_length=200_000,
+                 reasoning=True, providers=("opencode",)):
+        self.id = model_id
+        self.vision = vision
+        self.reasoning = reasoning
+        self.context_length = context_length
+        self.max_output = 32000
+        self.modalities = ["text", "image"] if vision else ["text"]
+        self.provider_ids = list(providers)
+        self.capabilities = {"desc": desc, "effort": []}
+
+
+class _RoutingCatalog:
+    """Minimal catalog stand-in for `fallback_model`."""
+
+    def __init__(self, models):
+        self._models = models
+
+    def free(self):
+        return list(self._models)
+
+    def vision_free(self):
+        return [m for m in self._models if m.vision]
+
+
+def test_unit_the_fallback_routes_on_the_request_not_on_the_router_model():
+    """A dispatcher outage must still send the work to a suitable model.
+
+    `fallback_model` returned `DISPATCHER_MODEL` whenever that model was in the
+    pool, so all three no-decision paths -- dispatcher unreachable, unparseable
+    reply, hallucinated id -- ignored the request entirely. A screenshot went to a
+    text-only model that cannot see it; a refactor went to a general chat model
+    instead of the code specialist; `hi` spent a deep-reasoning model.
+    """
+    from routing import dispatcher
+
+    cat = _RoutingCatalog([
+        _RoutingModel("mimo-v2.5-free", vision=True,
+                      desc="multimodal: understands images/screenshots; the ONLY free vision model"),
+        _RoutingModel("north-mini-code-free",
+                      desc="specialized for code generation, refactoring and software engineering"),
+        _RoutingModel("nemotron-3-ultra-free", context_length=1_000_000,
+                      desc="tuned for deep multi-step reasoning, math and planning"),
+        _RoutingModel("ling-3.0-flash-free",
+                      desc="balanced general-purpose chat and light coding; fast"),
+        _RoutingModel("deepseek-v4-flash-free",
+                      desc="huge context, deep thinking mode, excellent at coding"),
+    ])
+
+    def pick(text, has_images=False):
+        msgs = [{"role": "user", "content": text}]
+        return dispatcher.fallback_model(cat, has_images, messages=msgs)
+
+    # An image can only go to the model that can see it.
+    assert pick("what is wrong here", has_images=True) == "mimo-v2.5-free"
+    # Writing code goes to the code specialist, not a general chat model.
+    assert pick("Refactor this component to use hooks") == "north-mini-code-free"
+    assert pick("Write a unit test for the parser") == "north-mini-code-free"
+    # Diagnosis and design are reasoning work even when the subject is code.
+    assert pick("Why does the deploy keep failing?") == "nemotron-3-ultra-free"
+    assert pick("Design a schema for multi-tenant billing") == "nemotron-3-ultra-free"
+    # A greeting must not spend the heaviest model available.
+    assert pick("hi") == "ling-3.0-flash-free"
+    # Frontend and backend are both code work.
+    assert pick("Build me a login page with Tailwind") == "north-mini-code-free"
+    assert pick("Add a POST /users endpoint") == "north-mini-code-free"
+    # Explanation stays general even when the subject is code -- the topic does
+    # not decide this, the kind of work does.
+    assert pick("Explain what a closure is") == "ling-3.0-flash-free"
+
+    # `exclude` is still honoured, so model-level failover moves on.
+    msgs = [{"role": "user", "content": "Refactor this component"}]
+    second = dispatcher.fallback_model(
+        cat, False, exclude={"north-mini-code-free"}, messages=msgs)
+    assert second != "north-mini-code-free", second
+
+    # And calling it with no messages at all must not raise -- the signature is
+    # public and the argument is optional.
+    assert dispatcher.fallback_model(cat, False) in {m.id for m in cat.free()}
+
+
+def test_unit_a_reason_with_camelcase_words_is_not_mangled():
+    """`_clean_reason` must not insert spaces into real words.
+
+    It split on every lowercase->uppercase boundary to repair run-together output
+    from a free model. Applied unconditionally that corrupted ordinary sentences,
+    and routing reasons are full of exactly the words it breaks: `TypeScript` ->
+    `Type Script`, `GitHub` -> `Git Hub`, `iOS` -> `i OS`. The reason is shown in
+    the dashboard and mirrored into a response header, so it is user-visible.
+    """
+    from routing.dispatcher import _clean_reason
+
+    for text in (
+        "Chose north-mini-code-free for TypeScript refactoring.",
+        "Routed here because the iOS build fails.",
+        "Picked this model for GitHub Actions work.",
+    ):
+        assert _clean_reason(text) == text, _clean_reason(text)
+
+    # Genuinely run-together text is still repaired.
+    assert " " in _clean_reason("ThisIsACodingQuestion")
+    # The empty cases stay safe.
+    assert _clean_reason("") == "no reason given"
+    assert _clean_reason("   ") == "no reason given"
+    # A closing period is added; an existing terminator is left alone.
+    assert _clean_reason("fast model chosen") == "Fast model chosen."
+    assert _clean_reason("why not?") == "Why not?"
+
+
+def test_unit_codex_catalog_declares_effort_so_codex_stops_nulling_it():
+    """Codex only sends `reasoning.effort` for a model in its own catalog.
+
+    Verified against a capture proxy: with Codex's stock catalog a request for
+    `deepseek-v4-flash-free` carries `"reasoning": null` whatever
+    `model_reasoning_effort` says. Declared with a non-empty
+    `supported_reasoning_levels`, the same request carries
+    `{"effort": "high", "summary": "auto"}`.
+
+    So the generator's contract is: every listed model carries at least one level,
+    because an empty list gets the field nulled again -- exactly the broken state
+    this module exists to fix. A model publishing no options gets the `default`
+    rung, which resolves to "send no effort parameter".
+    """
+    from models import codex_catalog
+
+    catalog_json = codex_catalog.build(
+        _codex_template(),
+        [
+            _lingling_model("deepseek-v4-flash-free", ["high", "max"], context=200000),
+            _lingling_model("north-mini-code-free", ["none", "high"], context=256000),
+            _lingling_model("mimo-v2.5-free", [], context=262144, vision=True),
+        ],
+    )
+    listed = {m["slug"]: m for m in catalog_json["models"]}
+    assert set(listed) == {"deepseek-v4-flash-free", "north-mini-code-free",
+                           "mimo-v2.5-free"}, sorted(listed)
+    for slug, entry in listed.items():
+        assert entry["supported_reasoning_levels"], slug
+        # Codex 0.146 replaced the boolean `supports_reasoning_summaries` with
+        # the string `default_reasoning_summary`; entries inherit it from the
+        # template and must not resurrect the stale key.
+        assert entry.get("default_reasoning_summary") in ("none", "auto", "hidden"), slug
+        assert "supports_reasoning_summaries" not in entry, \
+            f"{slug}: stale pre-0.146 key must not be written"
+
+    # models.dev is third-party data, so build() must survive shapes its schema
+    # does not promise: a bare number where a list belongs, a duplicate id, a
+    # blank id. None of these may raise or produce a duplicate slug.
+    hostile = codex_catalog.build(_codex_template(), [
+        {"id": "junk-effort", "name": "J", "capabilities": {"effort": 42}},
+        {"id": "junk-str", "name": "J", "capabilities": {"effort": "high"}},
+        {"id": "", "name": "blank", "capabilities": {"effort": ["high"]}},
+        _lingling_model("dupe", ["high"]),
+        _lingling_model("dupe", ["max"]),
+    ])
+    slugs = [m["slug"] for m in hostile["models"]]
+    assert "" not in slugs, "an empty model id must never become a slug"
+    assert len(slugs) == len(set(slugs)), f"duplicate slugs: {slugs}"
+    assert "dupe" in slugs and slugs.count("dupe") == 1
+
+    # Levels are the model's published set, in order, with picker copy attached.
+    assert [lv["effort"] for lv in listed["deepseek-v4-flash-free"]["supported_reasoning_levels"]] \
+        == ["high", "max"]
+    assert [lv["effort"] for lv in listed["north-mini-code-free"]["supported_reasoning_levels"]] \
+        == ["none", "high"]
+    assert all(lv["description"] for lv in listed["north-mini-code-free"]["supported_reasoning_levels"]), \
+        "Codex's parser rejects a level with no description"
+
+    # The picker starts on the weakest rung, never above what was asked for.
+    assert listed["deepseek-v4-flash-free"]["default_reasoning_level"] == "high"
+    assert listed["north-mini-code-free"]["default_reasoning_level"] == "none"
+
+
+def test_unit_codex_catalog_entries_clone_a_real_codex_model():
+    """An entry is a real Codex model with its identity swapped, not a fresh dict.
+
+    `base_instructions` is the whole Codex agent prompt (11-21 KB). A hand-built
+    entry with a short one parses fine and quietly makes Codex a much dumber
+    agent, because that string *is* the harness. Everything the generator has no
+    opinion about must therefore survive untouched -- including fields it has
+    never heard of, so the file stays valid when Codex adds some.
+    """
+    from models import codex_catalog
+
+    template = _codex_template()
+    template["some_future_codex_field"] = {"added": "by a later release"}
+    entry = codex_catalog.entry_for(
+        template, "ling-3.0-flash-free", "Ling 3.0 Flash Free",
+        ["low", "medium", "high"], context_length=262144,
+    )
+
+    assert entry["base_instructions"] == template["base_instructions"]
+    assert entry["shell_type"] == template["shell_type"]
+    assert entry["some_future_codex_field"] == {"added": "by a later release"}
+    assert entry["slug"] == "ling-3.0-flash-free"
+    assert entry["context_window"] == entry["max_context_window"] == 262144
+
+    # Never null: Codex's parser dumps null for absent optional fields but
+    # rejects it on input for some of them (web_search_tool_type reproducibly
+    # fails with "expected value"), so no override may write one.
+    for field in ("web_search_tool_type", "apply_patch_tool_type", "shell_type",
+                  "truncation_policy", "default_reasoning_level"):
+        assert entry[field] is not None, field
+
+    # A template that is not a real Codex model fails here, rather than as an
+    # opaque byte-offset parse error from Codex after the file is written.
+    try:
+        codex_catalog.entry_for({"slug": "x", "display_name": "X"}, "m", "M", ["high"])
+    except ValueError as exc:
+        assert "base_instructions" in str(exc)
+    else:
+        raise AssertionError("an incomplete template must be rejected")
+
+    # An empty slug is refused: it would be written verbatim and is useless to
+    # Codex. An empty level list is *not* an error -- it falls back to the
+    # `default` rung so the model still appears in the picker.
+    try:
+        codex_catalog.entry_for(template, "", "M", ["high"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an empty model id must be rejected")
+
+    for levels in ([], ["banana"], 42, None):
+        fallback = codex_catalog.entry_for(template, "m", "M", levels)
+        assert [lv["effort"] for lv in fallback["supported_reasoning_levels"]] == ["default"], \
+            f"{levels!r} should fall back to the default rung"
+        assert fallback["default_reasoning_level"] == "default"
+
+
+def test_unit_codex_catalog_auto_entry_spans_every_routable_model():
+    """`lingling-auto` cannot know its target, so it advertises the union.
+
+    The dispatcher picks the model *after* Codex has sent the request, so the
+    entry offers every level any routable model honours and Lingling clamps the
+    value once the target is known. Context is the floor, not the max: Codex
+    compacts against this number and the router may land on the smallest model.
+    """
+    from models import codex_catalog
+
+    catalog_json = codex_catalog.build(
+        _codex_template(),
+        [
+            _lingling_model("deepseek-v4-flash-free", ["high", "max"], context=200000),
+            _lingling_model("ling-3.0-flash-free", ["low", "medium", "high"], context=262144),
+            _lingling_model("north-mini-code-free", ["none", "high"], context=256000),
+        ],
+        auto_id="lingling-auto",
+        auto_name="Lingling Auto",
+    )
+    auto = catalog_json["models"][0]
+    assert auto["slug"] == "lingling-auto", "the router must be the first-listed model"
+    assert [lv["effort"] for lv in auto["supported_reasoning_levels"]] \
+        == ["none", "low", "medium", "high", "max"], "union, ordered weakest first"
+    assert auto["default_reasoning_level"] == "none"
+    assert auto["context_window"] == 200000, "the floor, so no routed model overflows"
+    assert "image" in auto["input_modalities"], "the router can reach a vision model"
+
+    # A pool of only dial-less models still gets a router entry: it can route to
+    # them, and its own rung is the `default` stand-in.
+    dialless = codex_catalog.build(
+        _codex_template(),
+        [_lingling_model("mimo-v2.5-free", []), _lingling_model("big-pickle", [])],
+        auto_id="lingling-auto",
+    )
+    slugs = [m["slug"] for m in dialless["models"]]
+    assert slugs[0] == "lingling-auto", slugs
+    assert [lv["effort"] for lv in dialless["models"][0]["supported_reasoning_levels"]] \
+        == ["default"]
+
+    # With no models at all there is nothing to route to, so no router entry.
+    assert codex_catalog.build(_codex_template(), [], auto_id="lingling-auto")["models"] == []
+
+
+def test_unit_api_key_store_survives_a_truncated_write():
+    """The keyring is written atomically and last_used_at is throttled.
+
+    `_save` used to truncate the live file in place, and `validate` called it on
+    every authenticated request. A crash mid-write left unparseable JSON, which
+    `_load` reports as "no keys" -- silently revoking every client's access.
+    """
+    import importlib
+    from pathlib import Path
+
+    tmp_dir = tempfile.mkdtemp(prefix="lingling-keys-")
+    os.environ["LINGLING_API_KEYS_FILE"] = os.path.join(tmp_dir, "api_keys.json")
+    importlib.reload(config)
+    keys_mod = importlib.reload(api_keys)
+    try:
+        rec = keys_mod.create_key("atomic-test")
+        path = Path(os.environ["LINGLING_API_KEYS_FILE"])
+        assert path.exists(), "create_key must persist"
+        # No temp file is left behind after a successful rename.
+        assert not list(path.parent.glob("*.tmp")), "temp file leaked"
+
+        # First validate stamps last_used_at.
+        assert keys_mod.validate(rec["token"]) is True
+        stamped = keys_mod.list_keys()[0]["last_used_at"]
+        assert stamped, "first validate should record last_used_at"
+
+        # Subsequent validates inside the resolution window must not rewrite.
+        mtime = path.stat().st_mtime_ns
+        for _ in range(20):
+            assert keys_mod.validate(rec["token"]) is True
+        assert path.stat().st_mtime_ns == mtime, (
+            "validate rewrote the keyring inside the throttle window")
+
+        # A partially-written file is what the old code could leave behind.
+        path.write_text('[{"id": "key_dead", "token": "ll_trunc', encoding="utf-8")
+        assert keys_mod.validate(rec["token"]) is False
+        assert keys_mod.list_keys() == [], "corrupt keyring reads as empty"
+
+        # And recovery is a normal create, which rewrites the file cleanly.
+        fresh = keys_mod.create_key("after-corruption")
+        assert keys_mod.validate(fresh["token"]) is True
+        assert len(keys_mod.list_keys()) == 1
+    finally:
+        os.environ["LINGLING_API_KEYS_FILE"] = os.path.join(
+            os.environ["LINGLING_DATA_DIR"], "api_keys.json")
+        importlib.reload(config)
+        importlib.reload(api_keys)
+
+
+def test_unit_usage_row_limit_is_capped():
+    """`recent` and `since` bound their limit; the value comes from a query string."""
+    from usage.store import UsageStore
+    from usage import store as usage_mod
+
+    store = UsageStore(os.path.join(tempfile.mkdtemp(prefix="lingling-cap-"), "u.db"))
+    try:
+        for _ in range(5):
+            store.log("m", "m", "user", status="ok")
+
+        # An absurd limit must not be passed through to SQLite unbounded.
+        assert len(store.recent(10**9)) == 5
+        assert len(store.since(0, 10**9)) == 5
+
+        # The cap is read at call time, so lowering it proves it is applied
+        # rather than the row count merely being small.
+        original = usage_mod.MAX_ROWS
+        usage_mod.MAX_ROWS = 3
+        try:
+            assert len(store.recent(10**9)) == 3, "recent ignored the cap"
+            assert len(store.since(0, 10**9)) == 3, "since ignored the cap"
+        finally:
+            usage_mod.MAX_ROWS = original
+
+        # Sane values are still honoured verbatim.
+        assert len(store.recent(2)) == 2
+        assert len(store.recent(0)) == 1, "limit floors at 1"
+    finally:
+        store.close()
+
+
+def test_unit_stream_headers_survive_nonlatin1_reason():
+    """A dispatcher reason with an em-dash/emoji must not 500 the stream response.
+
+    Starlette encodes header values as latin-1; the streaming path mirrors the
+    routing ``reason`` into X-Lingling-* headers. Model-generated reasons often
+    contain typographic punctuation above U+00FF, which raised UnicodeEncodeError
+    when the StreamingResponse was constructed -- a raw ASGI 500 with no ledger row.
+    """
+    import app as app_mod
+    from starlette.responses import StreamingResponse
+
+    # The sanitiser itself: transliterates common punctuation, replaces the rest.
+    assert app_mod._header_safe("Chose deepseek\u2014it is fast.") == "Chose deepseek--it is fast."
+    assert app_mod._header_safe("smart \u201cquote\u201d") == 'smart "quote"'
+    got = app_mod._header_safe("emoji \U0001f600 tail")
+    got.encode("latin-1")  # must not raise
+    assert app_mod._header_safe("") == ""
+
+    # Control characters are the sharper edge: CR, LF and NUL are all valid
+    # latin-1, so they survived the encode and Starlette then rejected the header
+    # with RuntimeError("Invalid HTTP header value") -- the response aborted and
+    # the client received nothing at all. A model emitting a line break inside
+    # its one-sentence reason is enough to trigger it.
+    for raw in ("ok\r\nX-Injected: yes", "ok\nsecond line", "ok\rcarriage", "ok\x00nul"):
+        safe = app_mod._header_safe(raw)
+        assert not any(ch in safe for ch in "\r\n\x00"), f"{raw!r} -> {safe!r}"
+        StreamingResponse(iter([b""]), headers={"X-Lingling-Reason": safe})
+
+    # And the exact header dict the handler builds must construct cleanly.
+    reason = app_mod._header_safe("Chose deepseek\u2014it is fast \U0001f600")
+
+    def gen():
+        yield b"data: hi\n\n"
+
+    resp = StreamingResponse(
+        gen(), media_type="text/event-stream",
+        headers={
+            "X-Lingling-Routed-Model": app_mod._header_safe("deepseek-v4-flash-free"),
+            "X-Lingling-Reason": reason,
+        },
+    )
+    # raw_headers is where the latin-1 encode happens; force it.
+    for _name, _value in resp.raw_headers:
+        pass
+
+
+def test_unit_catalog_serves_last_good_list_through_a_fetch_failure():
+    """A transient /models outage must not empty the catalog.
+
+    The model list is fetched live (never hard-coded), but if a refresh cannot
+    reach the upstream, the catalog keeps serving the previous good list rather
+    than blanking out -- otherwise the dashboard/CLI picker would go empty on a
+    momentary blip. A genuine empty result (fetch OK, zero models) still clears.
+    """
+    from models.catalog import UnifiedCatalog
+    from providers.base import Provider, ProviderModel
+    from providers.key_pool import KeyPool
+
+    class FetchProvider(Provider):
+        id = "opencode"
+        display_name = "Fetch"
+        priority = 10
+
+        def __init__(self):
+            super().__init__(KeyPool([]))
+            self._ids = []
+            self._raise = False
+
+        def requires_key(self):
+            return False
+
+        def fetch_model_ids(self):
+            if self._raise:
+                raise RuntimeError("/models unreachable")
+            return self._ids
+
+        def is_model_free(self, model_id, meta):
+            return model_id.endswith("-free")
+
+        def build_model(self, model_id):
+            return ProviderModel(
+                id=model_id, provider_id=self.id, name=model_id, free=True,
+                vision=False, reasoning=True, context_length=1000, max_output=100,
+            )
+
+    prov = FetchProvider()
+    cat = UnifiedCatalog({"opencode": prov})
+
+    # 1. Healthy fetch populates the catalog.
+    prov._ids = ["alpha-free", "beta-free"]
+    cat.refresh(force=True)
+    assert sorted(m.id for m in cat.free()) == ["alpha-free", "beta-free"]
+    assert cat.meta()["stale"] is False
+
+    # 2. The next refresh fails outright -> the last good list survives.
+    prov._raise = True
+    cat.refresh(force=True)
+    assert sorted(m.id for m in cat.free()) == ["alpha-free", "beta-free"], \
+        "a failed fetch must not empty the catalog"
+    assert cat.meta()["stale"] is True
+    assert cat.meta()["providers"]["opencode"]["stale"] is True
+
+    # 3. Recovery with a changed list replaces the cache (proves it is live).
+    prov._raise = False
+    prov._ids = ["gamma-free"]
+    cat.refresh(force=True)
+    assert [m.id for m in cat.free()] == ["gamma-free"]
+    assert cat.meta()["stale"] is False
+
+    # 4. A genuine empty result (fetch OK) correctly clears the catalog.
+    prov._ids = []
+    cat.refresh(force=True)
+    assert cat.free() == [], "an honest empty list must not be masked by the cache"
+
+
+def test_unit_hot_models_route_through_the_proxy_pool():
+    """The dispatcher and the fast chat model must rotate egress, not bypass it.
+
+    Both used to be `prefer_direct`, which meant the two hottest paths -- the
+    dispatcher (runs on every lingling-auto request) and ling-3.0-flash-free
+    (what the dispatcher picks for most casual chat) -- egressed from the real
+    IP. The WARP rack showed 0 requests on every slot as a result.
+    """
+    from providers.opencode import OpenCodeProvider
+    from providers.key_pool import KeyPool
+
+    prov = OpenCodeProvider(KeyPool([]))
+    assert prov.needs_proxy() is True
+    for model_id in (config.DISPATCHER_MODEL, "ling-3.0-flash-free",
+                     "mimo-v2.5-free", "north-mini-code-free"):
+        assert prov.prefer_direct(model_id) is False, \
+            f"{model_id} would bypass the egress pool"
+
+    # And a real attempt records the proxy it used, so the rack counts it.
+    fake = FakeProvider("opencode", CANNED, keyed=False, use_proxy=True)
+    pool = ProxyPool.from_list([{"id": "p1", "url": "socks5://127.0.0.1:51001"}])
+    resp, prov2, key, attempts = executor.execute_nonstream(
+        [{"role": "user", "content": "hi"}], "ling-3.0-flash-free", [fake],
+        proxy_pool=pool, session_id="",
+    )
+    assert resp is CANNED
+    assert pool.proxies[0].total_requests == 1, \
+        "a successful call must be counted against the exit it used"
+
+
+def test_unit_one_session_still_spreads_across_every_exit():
+    """A coding agent's session must not pin all its traffic to one exit IP.
+
+    Codex sends a stable `session-id` header for its whole run, and sticky
+    sessions were on by default -- so `pick_sticky` hashed that one id to one
+    proxy and every request for hours went out through a single WARP identity.
+    OpenCode meters the free tier per IP, so one identity absorbed the entire
+    session's quota while the other nine sat idle. The dashboard showed it
+    plainly: 8 requests on slot #2, 3 on #8, zero on the rest.
+
+    Rotation is the default now. This is the regression guard: flip the default
+    back, or return `pick_sticky` to hashing, and this fails.
+    """
+    from routing.executor import _pick_proxy
+
+    assert config.PROXY_STICKY_SESSIONS is False, (
+        "sticky sessions must stay off by default -- they defeat per-IP rotation, "
+        "which is the whole reason the egress pool exists"
+    )
+
+    class Prov:
+        id = "opencode"
+
+        def needs_proxy(self):
+            return True
+
+        def prefer_direct(self, model_id):
+            return False
+
+    pool = ProxyPool.from_list([
+        {"id": f"warp-{i + 1}", "url": f"socks5://127.0.0.1:{51001 + i}"}
+        for i in range(10)
+    ])
+    session = "01999b4c-8f4a-7b31-9c2e-4d5a6b7c8d9e"   # one Codex session, 40 turns
+    used: Dict[str, int] = {}
+    for _ in range(40):
+        proxy = _pick_proxy(Prov(), pool, session, "deepseek-v4-flash-free")
+        used[proxy.id] = used.get(proxy.id, 0) + 1
+        pool.mark_success(proxy)
+
+    assert len(used) == 10, f"only {len(used)} of 10 exits carried traffic: {used}"
+    assert max(used.values()) - min(used.values()) <= 1, \
+        f"load should be even across exits, got {used}"
+
+
+def test_unit_sticky_sessions_assign_by_load_not_by_hash():
+    """When affinity *is* wanted, it must respect load and survive a restart.
+
+    The old implementation picked `hash(session_id) % len(proxies)`, which was
+    wrong twice: it never looked at how busy the chosen proxy was, so a session
+    could be pinned to the most-loaded exit in the pool; and `hash(str)` is
+    salted per process, so the "deterministic" mapping changed on every restart.
+    Assigning via `pick()` and remembering the result gives real affinity *and*
+    real balance.
+    """
+    from providers import proxy_pool as pp
+
+    pool = ProxyPool.from_list([
+        {"id": f"warp-{i + 1}", "url": f"socks5://127.0.0.1:{51001 + i}"}
+        for i in range(10)
+    ])
+    # Load every exit except warp-7, making it the unique least-loaded one. A
+    # load-based assignment must therefore choose warp-7 for *any* session id; a
+    # hash-based one lands wherever the hash falls.
+    for px in pool.get_all_proxies():
+        if px.id == "warp-7":
+            continue
+        for _ in range(5):
+            pool.mark_success(px)
+
+    chosen = {pool.pick_sticky(f"session-{i}").id for i in range(10)}
+    assert chosen == {"warp-7"}, (
+        f"every session must be assigned the least-loaded exit, got {sorted(chosen)} "
+        "-- assignment is not looking at load"
+    )
+
+    # Affinity: once assigned, every later turn returns the same exit, even after
+    # that exit becomes the busiest.
+    session = "session-0"
+    for _ in range(20):
+        pool.mark_success(pool.get_by_id("warp-7"))
+    assert {pool.pick_sticky(session).id for _ in range(5)} == {"warp-7"}, \
+        "an assigned session must keep its exit"
+
+    # A cooling exit releases the session rather than holding it hostage.
+    pool.mark_failure(pool.get_by_id("warp-7"), 429)
+    assert pool.pick_sticky(session).id != "warp-7"
+
+    # The session map cannot grow without bound -- session ids are unbounded and
+    # this process is long-lived.
+    small = ProxyPool.from_list(["socks5://127.0.0.1:1", "socks5://127.0.0.1:2"])
+    for i in range(pp._MAX_SESSIONS + 500):
+        small.pick_sticky(f"s{i}")
+    assert len(small._sessions) <= pp._MAX_SESSIONS, \
+        f"session map grew to {len(small._sessions)}"
+
+
+def test_unit_blocking_upstream_calls_run_off_the_event_loop():
+    """The chat handler must never call sync upstream code on the event loop.
+
+    `chat_completions` is `async def`, but the executor, the dispatcher and the
+    provider under them all use a synchronous `httpx.Client`. Awaiting them
+    directly froze the single event-loop thread for the whole upstream call --
+    one slow model reply made /api/health and every other request hang until it
+    finished (measured: a 4s upstream stalled health by 3.2s). Every blocking
+    call must go through `run_in_threadpool`.
+    """
+    import inspect
+    import app as app_mod
+
+    src = inspect.getsource(app_mod.chat_completions)
+
+    # `_reopen` is a nested helper that runs *inside* the StreamingResponse
+    # iterator, which Starlette already drives in a worker thread -- it may call
+    # the executor synchronously. Only the handler body proper must be clean, so
+    # check the source up to that helper.
+    body_src, _, reopen_src = src.partition("def _reopen()")
+    assert reopen_src, "the mid-stream recovery helper disappeared"
+
+    # The three blocking entry points, each of which must be wrapped.
+    for call in ("executor.execute_nonstream", "executor.execute_stream", "_run_dispatcher"):
+        assert call in src, f"{call} disappeared from the handler"
+
+    # No bare `= executor.execute_...(` / `= _run_dispatcher(` calls remain in the
+    # handler body: every occurrence must be an argument to run_in_threadpool.
+    for bare in ("= executor.execute_nonstream(",
+                 "= executor.execute_stream(",
+                 "= _run_dispatcher("):
+        assert bare not in body_src, (
+            f"blocking call `{bare.strip('= ')}` is invoked directly on the event loop")
+
+    # Two of the four blocking calls now go through `_execute_with_egress_wait`,
+    # which parks an exhausted request on the event loop and threadpools the
+    # executor itself. Either wrapper satisfies the invariant, so count both --
+    # and check the parking wrapper really does hand off to a worker, otherwise
+    # this test would bless a helper that blocks the loop.
+    wrapped = (body_src.count("run_in_threadpool")
+               + body_src.count("_execute_with_egress_wait("))
+    assert wrapped >= 4, (
+        "expected the dispatcher, both non-stream calls and the stream open to be "
+        f"threadpooled, found {wrapped}")
+
+    park_src = inspect.getsource(app_mod._execute_with_egress_wait)
+    assert park_src.count("run_in_threadpool") == 2, (
+        "the egress-wait wrapper must threadpool both the first attempt and the retry")
+    assert "await parking.wait_for_egress" in park_src, (
+        "the wait must be awaited on the event loop, never slept in a worker thread")
+    assert app_mod.run_in_threadpool is not None
+
+
+def test_unit_empty_catalog_is_not_refetched_on_every_request():
+    """An empty catalog must back off, not re-fetch upstream per request.
+
+    The TTL guard was `self._logical and age < TTL`. When a fetch failed,
+    `_logical` stayed empty, the guard short-circuited falsy, and the *next*
+    request re-ran the upstream call. Under real concurrency that stacked:
+    three callers behind one 2s failing fetch measured 2s, 4s and 6s. A separate
+    attempt clock (CATALOG_RETRY_SECONDS) fixes it while still recovering fast.
+    """
+    import threading
+    from models.catalog import UnifiedCatalog
+    from providers.base import Provider
+    from providers.key_pool import KeyPool
+
+    class FailingProvider(Provider):
+        id = "opencode"
+        display_name = "Failing"
+        priority = 10
+
+        def __init__(self):
+            super().__init__(KeyPool([]))
+            self.calls = 0
+
+        def requires_key(self):
+            return False
+
+        def fetch_model_ids(self):
+            self.calls += 1
+            raise RuntimeError("upstream /models down")
+
+        def is_model_free(self, model_id, meta):
+            return True
+
+    prov = FailingProvider()
+    cat = UnifiedCatalog({"opencode": prov})
+
+    # Three concurrent readers must share a single upstream attempt.
+    threads = [threading.Thread(target=cat.free) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert prov.calls == 1, f"empty catalog re-fetched {prov.calls}x instead of backing off"
+
+    # Subsequent reads inside the retry window must not fetch again either.
+    cat.free()
+    cat.free()
+    assert prov.calls == 1, "retry window did not hold"
+
+    # force=True must always bypass the backoff (that is what Refetch catalog does).
+    cat.refresh(force=True)
+    assert prov.calls == 2, "force=True must bypass the retry window"
+
+    # And the window expiring lets it try again.
+    cat._attempted_at = 0.0  # noqa: SLF001 - simulate the window elapsing
+    cat.free()
+    assert prov.calls == 3, "catalog never retries after the window elapses"
+
+
+
+def _fake_warp(count):
+    """A WarpManager stand-in: real instance shape, no wgcf, no subprocesses."""
+    class Inst:
+        def __init__(self, index, port):
+            self.index = index
+            self.port = port
+            self.proxy_url = f"socks5://127.0.0.1:{port}"
+            self.private_key = "k"
+            self.address_v4 = "172.16.0.2/32"
+            self.identity_dir = None
+            self.process = None
+
+    class Warp:
+        def __init__(self, n):
+            self.instances = [Inst(i + 1, 51001 + i) for i in range(n)]
+            self.regenerated = []
+
+        def regenerate_instance(self, inst, log=None):
+            self.regenerated.append(inst.index)
+            return True
+
+        def restart_instance(self, inst, log=None):
+            return True
+
+    return Warp(count)
+
+
+def _daemon(warp, pool, min_healthy=None):
+    """Build a WarpHealthDaemon without starting its thread."""
+    from warp.health import WarpHealthDaemon
+
+    daemon = WarpHealthDaemon(warp, pool, min_healthy=min_healthy, log=lambda *a, **k: None)
+    return daemon
+
+
+def test_unit_a_dumped_identity_rejoins_the_pool_in_the_same_cycle():
+    """A recycled exit must be back in the pool before the cycle ends.
+
+    `_check_and_heal` health-checks everything into `results`, then dumps burned
+    identities, then calls `_sync_pool(results)`. Regeneration replaces the
+    identity wholesale, so any entry it touched is stale by the time the sync
+    reads it -- and `_dump_burned_identities` has already removed that proxy from
+    the pool. An exit whose stale entry said "unhealthy" was therefore removed
+    and never re-added, even though the regeneration had just fixed it.
+
+    Nothing else in the cycle covers that: `_ensure_min_healthy` only runs when
+    `healthy_count < min_healthy`, so a pool that still met its floor left the
+    recycled exit stranded outside the routing pool until some later cycle
+    happened to re-measure it.
+    """
+    from warp import health as health_mod
+
+    warp = _fake_warp(3)
+    pool = ProxyPool.from_list([])
+    # Floor of 1 so `_ensure_min_healthy` stays out of the way -- it re-measures
+    # everything and would mask the handoff this test is about.
+    daemon = _daemon(warp, pool, min_healthy=1)
+
+    # #1 is pooled and burned past the dump threshold.
+    daemon._health_check = lambda inst: {"healthy": True, "index": inst.index}  # noqa: SLF001
+    daemon._sync_pool([{"healthy": True}] * 3)
+    px = pool.get_by_id("warp-1")
+    for _ in range(health_mod.MAX_429_TOTAL):
+        pool.mark_failure(px, 429)
+
+    # #1 reads unhealthy until something regenerates it -- which is the state a
+    # burned exit is actually in. Healing is stubbed out so the only thing that
+    # can repair it is the dump in step 3, isolating the dump -> sync handoff.
+    daemon._heal_instance = lambda inst: None  # noqa: SLF001
+    daemon._health_check = lambda inst: {  # noqa: SLF001
+        "healthy": inst.index != 1 or 1 in warp.regenerated,
+        "index": inst.index,
+    }
+
+    result = daemon.check_and_heal()
+
+    assert 1 in warp.regenerated, warp.regenerated
+    assert result["dumped"] == 1, result
+    # The regenerated exit is back in the pool, not stranded outside it.
+    assert pool.get_by_id("warp-1") is not None, \
+        "a dumped-and-regenerated identity never rejoined the pool"
+    # And the gauge the dashboard draws agrees with the identity count.
+    assert result["pool"]["total"] == 3, result["pool"]
+    assert result["pool"]["available"] == 3, result["pool"]
+
+
+def test_unit_an_auto_routed_stream_reroutes_to_another_model_mid_flight():
+    """A stalled auto-routed stream must retry on a *different* model.
+
+    `stream_guard` gets one retry when a stream dies after bytes are on the wire.
+    That retry reopened on the same model, and the usual reason a stream dies
+    mid-flight is that model stalling -- so the single attempt was spent on the
+    thing that had just failed. `lingling-auto` delegated the choice of model, so
+    the retry is entitled to re-decide; a request that named a model explicitly is
+    not, and must stay on it.
+    """
+    import app as app_mod
+    import json
+
+    seen_models = []
+
+    def fake_execute_stream(messages, model_id, providers, **kwargs):
+        seen_models.append(model_id)
+
+        def gen():
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}'
+            if len(seen_models) == 1:
+                raise RuntimeError("tunnel died mid-answer")
+            yield b'data: {"choices":[{"delta":{"content":" done"},"finish_reason":"stop"}]}'
+
+        class _P:
+            id = "opencode"
+
+        return gen(), _P(), None, []
+
+    original = app_mod.executor.execute_stream
+    app_mod.executor.execute_stream = fake_execute_stream
+    try:
+        # The module-level client, not a fresh `with TestClient(...)`: entering
+        # one runs the lifespan hook, which registers WARP identities.
+        r = client.post("/v1/chat/completions", json={
+            "model": "lingling-auto",
+            "messages": [{"role": "user", "content": "Refactor this component"}],
+            "stream": True,
+        })
+        body = b"".join(r.iter_bytes()).decode("utf-8")
+
+        assert len(seen_models) == 2, f"expected one retry, got {seen_models}"
+        assert seen_models[0] != seen_models[1], \
+            f"the retry reopened on the model that just died: {seen_models}"
+        # The client is told to discard the partial answer before the new one,
+        # and the frame names the model it moved to -- the dashboard renders one
+        # of two different notices off that field.
+        assert "lingling_reset" in body, body[:400]
+        reset = next(
+            json.loads(ln[len("data: "):])
+            for ln in body.splitlines()
+            if ln.startswith("data: ") and "lingling_reset" in ln
+        )["lingling_reset"]
+        assert reset.get("model") == seen_models[1], reset
+    finally:
+        app_mod.executor.execute_stream = original
+
+
+def test_unit_an_explicit_model_is_never_swapped_mid_stream():
+    """Only `lingling-auto` delegates the choice; a named model is a contract.
+
+    A client that asked for `ling-3.0-flash-free` gets that model on the retry
+    too -- silently answering from a different one would make the response
+    disagree with the request, and callers key cost and behaviour off the model
+    they named.
+    """
+    import app as app_mod
+
+    seen_models = []
+
+    def fake_execute_stream(messages, model_id, providers, **kwargs):
+        seen_models.append(model_id)
+
+        def gen():
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}'
+            if len(seen_models) == 1:
+                raise RuntimeError("tunnel died mid-answer")
+            yield b'data: {"choices":[{"delta":{"content":" done"},"finish_reason":"stop"}]}'
+
+        class _P:
+            id = "opencode"
+
+        return gen(), _P(), None, []
+
+    original = app_mod.executor.execute_stream
+    app_mod.executor.execute_stream = fake_execute_stream
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": "ling-3.0-flash-free",
+            "messages": [{"role": "user", "content": "Refactor this component"}],
+            "stream": True,
+        })
+        b"".join(r.iter_bytes())
+
+        assert seen_models == ["ling-3.0-flash-free"] * 2, seen_models
+    finally:
+        app_mod.executor.execute_stream = original
+
+
+def test_unit_text_only_fallback_strips_images():
+    """A text-only retry target receives placeholders, not raw image parts.
+
+    ``dispatcher.fallback_model`` answers an image request from a text-only
+    model when every vision-capable one is down, and OpenCode answers HTTP 400
+    to a text-only model fed image parts -- so every fallback site must replace
+    the images with a placeholder first. This pins the helper every site uses.
+    """
+    import app as app_mod
+
+    class _Vision:
+        vision = True
+
+    class _NoVision:
+        vision = False
+
+    original = app_mod.catalog.by_id
+    app_mod.catalog.by_id = (
+        lambda mid: _Vision() if mid == "mimo-v2.5-free" else _NoVision()
+    )
+    try:
+        image_msg = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in this screenshot"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        }]
+        stripped = app_mod._messages_for_model(image_msg, "deepseek-v4-flash-free", True)
+        assert stripped[0]["content"] == (
+            "what is in this screenshot\n[image was attached here]"
+        ), stripped
+        # The vision model keeps the attachment; a text-only request never strips.
+        assert app_mod._messages_for_model(image_msg, "mimo-v2.5-free", True) is image_msg
+        assert app_mod._messages_for_model(image_msg, "deepseek-v4-flash-free", False) is image_msg
+    finally:
+        app_mod.catalog.by_id = original
+
+
+
+def test_unit_pool_ids_stay_unique_across_removals():
+    """A generated id must never collide with a live one.
+
+    Both pools derived ids from `len(list) + 1`, so removing a middle entry and
+    adding another reused an id: remove `proxy-2` of three and the next add() is
+    `proxy-3` again. `get_by_id`/`remove` return the first match, so the WARP
+    health daemon could heal, repoint or dump the wrong exit.
+    """
+    pool = ProxyPool.from_list([f"socks5://127.0.0.1:{i}" for i in (1, 2, 3)])
+    pool.remove("proxy-2")
+    pool.add("socks5://127.0.0.1:9")
+    ids = [p.id for p in pool.get_all_proxies()]
+    assert len(ids) == len(set(ids)), ids
+
+    # Repeated churn stays unique, and an explicitly-named id is not shadowed by
+    # a later generated one.
+    for _ in range(5):
+        pool.remove(pool.get_all_proxies()[0].id)
+        pool.add("socks5://127.0.0.1:8")
+    pool.add("socks5://127.0.0.1:7", proxy_id="proxy-99")
+    pool.add("socks5://127.0.0.1:6")
+    ids = [p.id for p in pool.get_all_proxies()]
+    assert len(ids) == len(set(ids)), ids
+
+    keys = KeyPool.from_list(["s1", "s2", "s3"])
+    keys.remove("key-2")
+    keys.add("s9")
+    kids = [k.id for k in keys.keys]
+    assert len(kids) == len(set(kids)), kids
+
+
+def test_unit_warp_port_allocation_never_steals_a_sibling():
+    """A regenerating identity must not take another identity's assigned port.
+
+    `_find_free_port` only checked whether a port was *listening*, but siblings
+    are frequently down at exactly the moment the health daemon regenerates one,
+    so their ports scanned as free. Both configs then wrote the same BindAddress
+    and whichever wireproxy started second failed to bind, silently losing an exit.
+    """
+    from warp.manager import _find_free_port, _port_is_open
+
+    # Anchored on a window this machine actually has free, not on BASE_PORT.
+    # Every assertion below is about what the allocator does with *unoccupied*
+    # ports, and a developer running Lingling has real wireproxy processes
+    # listening across BASE_PORT.. -- so hardcoding it made the test's outcome
+    # depend on whether the gateway happened to be up.
+    base = next(
+        (
+            c for c in range(52000, 52900, 10)
+            if not any(_port_is_open("127.0.0.1", c + i) for i in range(6))
+        ),
+        None,
+    )
+    if base is None:
+        raise SkipTest("no free six-port window available for the allocator test")
+
+    siblings = {base + i for i in range(0, 5)}
+
+    # Reserved ports are skipped even though nothing is listening on them, which
+    # is precisely the state a stopped sibling is in.
+    got = _find_free_port(base, reserved=siblings)
+    assert got not in siblings, f"{got} belongs to a sibling identity"
+    assert got >= base + 5, got
+
+    # Without the reservation the scan hands back the first port that is merely
+    # not listening -- how one identity ended up on another's port.
+    assert _find_free_port(base) in siblings
+
+    # A reservation that leaves nothing free in range is an error, not a silent
+    # duplicate: two identities sharing a BindAddress is the failure being fixed.
+    try:
+        _find_free_port(base, max_offset=3,
+                        reserved={base, base + 1, base + 2})
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("exhausting the range must raise, not reuse a port")
+
+
+def test_unit_warp_reload_repairs_duplicate_ports():
+    """Two identities must never load believing they own the same port.
+
+    A pre-fix `regenerate` could hand one identity a sibling's port, leaving both
+    `wireproxy.conf` files holding the same BindAddress. Reloading trusted the
+    files, so `_pid_on_port`/`_kill_pid` acted on each other's process and the
+    proxy pool wrote one URL under two different ids.
+    """
+    from pathlib import Path
+
+    from warp.manager import WarpManager
+
+    root = Path(tempfile.mkdtemp(prefix="lingling-warp-"))
+    identities = root / "identities"
+    # Three identities, two of them wrongly claiming the same port.
+    for idx, port in ((1, 51043), (2, 51043), (3, 51045)):
+        d = identities / f"warp-{idx}"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "wireproxy.conf").write_text(
+            f"[Interface]\nBindAddress = 127.0.0.1:{port}\n", encoding="utf-8")
+        (d / "wgcf-profile.conf").write_text(
+            "[Interface]\nPrivateKey = k\nAddress = 172.16.0.2/32\n", encoding="utf-8")
+
+    mgr = WarpManager(root_dir=root, count=3)
+    ports = [i.port for i in mgr.instances]
+    assert len(ports) == len(set(ports)), f"duplicate ports survived the reload: {ports}"
+    # The first claimant keeps the port it had; only the collider moves.
+    assert mgr.instances[0].port == 51043, ports
+    assert mgr.instances[2].port == 51045, ports
+    # And every proxy_url matches its own port, so the pool cannot alias two ids.
+    for inst in mgr.instances:
+        assert inst.proxy_url.endswith(f":{inst.port}"), inst.proxy_url
+
+
+def test_unit_warp_burn_history_survives_a_flapping_exit():
+    """A proxy that flaps must still accumulate towards being dumped.
+
+    `_sync_pool` removes an unhealthy proxy and re-adds it on recovery, and
+    `ProxyPool.add` builds a fresh Proxy with zeroed counters. So a flapping exit
+    reset its 429 tally every cycle and could never reach MAX_429_TOTAL --
+    `_dump_burned_identities` never fired for exactly the proxies that most needed
+    recycling, which is the whole point of the daemon.
+    """
+    from warp import health as health_mod
+
+    warp = _fake_warp(3)
+    pool = ProxyPool.from_list([])
+    daemon = _daemon(warp, pool)
+
+    healthy = [{"healthy": True}] * 3
+    daemon._sync_pool(healthy)
+    px = pool.get_by_id("warp-1")
+    for _ in range(health_mod.MAX_429_TOTAL - 1):
+        pool.mark_failure(px, 429)
+    burned = px.total_429
+
+    # It drops out and comes back, several times.
+    for _ in range(3):
+        daemon._sync_pool([{"healthy": False}, {"healthy": True}, {"healthy": True}])
+        daemon._sync_pool(healthy)
+
+    after = pool.get_by_id("warp-1")
+    assert after.total_429 == burned, \
+        f"burn history reset across the flap: {burned} -> {after.total_429}"
+
+    # One more 429 crosses the threshold, and the identity is recycled.
+    pool.mark_failure(after, 429)
+    assert daemon._dump_burned_identities() == 1, "a burned identity must be dumped"
+    assert warp.regenerated == [1], warp.regenerated
+    assert pool.get_by_id("warp-1") is None, "a dumped identity leaves the pool"
+
+
+def test_unit_warp_minimum_healthy_never_exceeds_the_identity_count():
+    """`min_healthy` above the identity count is an infinite regeneration loop.
+
+    MIN_HEALTHY_PROXIES was a fixed 6. With LINGLING_WARP_COUNT=3 the daemon could
+    never reach it, so `_ensure_min_healthy` re-registered every identity on every
+    60s cycle -- against Cloudflare's rate-limited account-creation endpoint.
+    """
+    pool = ProxyPool.from_list([])
+
+    small = _daemon(_fake_warp(3), pool)
+    assert small.min_healthy <= 3, small.min_healthy
+
+    warp = _fake_warp(3)
+    daemon = _daemon(warp, pool)
+    # Everything unhealthy: it may regenerate at most what exists, then stop.
+    regenerated = daemon._ensure_min_healthy([{"healthy": False}] * 3)
+    assert regenerated <= 3, regenerated
+    assert len(warp.regenerated) <= 3, warp.regenerated
+
+    # The normal 10-identity install still asks for the documented floor.
+    big = _daemon(_fake_warp(10), pool)
+    from warp.health import MIN_HEALTHY_PROXIES
+    assert big.min_healthy == MIN_HEALTHY_PROXIES, big.min_healthy
+
+
+def test_unit_warp_health_daemon_warmup_skips_probe():
+    """The health daemon's first cycle must not probe or remove proxies.
+
+    The bootstrap thread needs time to register identities and start wireproxy.
+    If the daemon's first cycle immediately probes and removes, it undoes the
+    bootstrap's work: proxies are yanked from the pool before their WARP tunnel
+    has had time to establish, creating a restart loop and an empty pool.
+    """
+    pool = ProxyPool.from_list([])
+    from pathlib import Path
+    from warp.manager import WarpManager
+
+    root = Path(tempfile.mkdtemp(prefix="lingling-warmup-"))
+    mgr = WarpManager(root_dir=root, count=1)
+    daemon = _daemon(mgr, pool)
+    assert daemon._warmup is True, "daemon must start in warmup"
+
+    # Run a full cycle with no instances configured — nothing to probe, nothing
+    # to remove, but the cycle MUST clear _warmup for subsequent cycles.
+    daemon._check_and_heal()
+    assert daemon._warmup is False, (
+        "_warmup must be False after the first _check_and_heal cycle")
+
+
+def test_unit_warp_never_pools_an_unverified_tunnel():
+    """A listening port is not proof the WARP tunnel works.
+
+    `_health_check` only ran the SOCKS5 probe when the proxy was *already* in the
+    pool, so a fresh instance was admitted on "config exists + port listening"
+    alone. A bound port with a dead tunnel therefore carried real traffic for a
+    full 60s cycle before its first probe ever ran.
+    """
+    import socket
+
+    from pathlib import Path
+
+    from warp.manager import WarpManager, _port_is_open
+
+    root = Path(tempfile.mkdtemp(prefix="lingling-warpprobe-"))
+    mgr = WarpManager(root_dir=root, count=1)
+    inst = mgr.instances[0]
+    # Move the instance onto a port nothing is using. `WarpManager` defaults to
+    # BASE_PORT, which on a machine actually running Lingling is a live wireproxy
+    # -- and the first assertion here is that an *unbound* port reads as
+    # unhealthy, so the running gateway made this test contradict itself.
+    free = next(
+        (c for c in range(52900, 53400) if not _port_is_open("127.0.0.1", c)),
+        None,
+    )
+    if free is None:
+        raise SkipTest("no free port available for the tunnel-probe test")
+    inst.port = free
+    inst.proxy_url = f"socks5://127.0.0.1:{free}"
+    inst.identity_dir.mkdir(parents=True, exist_ok=True)
+    (inst.identity_dir / "wgcf-profile.conf").write_text(
+        "[Interface]\nPrivateKey = abc\nAddress = 172.16.0.2/32\n", encoding="utf-8")
+    (inst.identity_dir / "wireproxy.conf").write_text(
+        f"[Interface]\nBindAddress = 127.0.0.1:{inst.port}\n", encoding="utf-8")
+    inst.private_key = "abc"
+    inst.address_v4 = "172.16.0.2/32"
+
+    pool = ProxyPool.from_list([])
+    daemon = _daemon(mgr, pool)
+    # The daemon starts in warmup (first cycle). This test validates the
+    # HTTP probe which only runs post-warmup, so disable it.
+    daemon._warmup = False
+
+    # Nothing listening: unhealthy, and no probe to run.
+    closed = daemon._health_check(inst)
+    assert closed["healthy"] is False, closed
+    assert closed["in_pool"] is False
+
+    # A plain TCP listener answers the port check but speaks no SOCKS5, so the
+    # tunnel probe must run *and* fail even though the proxy is not pooled yet.
+    fake = socket.socket()
+    fake.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        fake.bind(("127.0.0.1", inst.port))
+        fake.listen(1)
+    except OSError:
+        fake.close()
+        raise SkipTest(f"port {inst.port} unavailable on this machine")
+    try:
+        result = daemon._health_check(inst)
+        assert result["port_open"] is True, result
+        assert result["http_probe_ok"] is False, \
+            "the tunnel must be probed before the proxy is ever pooled"
+        assert result["healthy"] is False, result
+
+        # And the sync therefore refuses to admit it.
+        daemon._sync_pool([result])
+        assert pool.get_by_id("warp-1") is None, \
+            "an unverified tunnel must not enter the routing pool"
+    finally:
+        fake.close()
+
+
+
+def test_unit_responses_bridge_forwards_streamed_reasoning():
+    """Thinking must reach a Codex client, not be dropped on the floor.
+
+    `stream_events` read only `delta.content`, but every reasoning model on
+    OpenCode streams its thinking under a different key -- deepseek and ling use
+    `reasoning_content`, nemotron uses `reasoning`. Measured live: 139-434 chars
+    of reasoning per turn, none of it forwarded, while the ledger billed the
+    tokens. The non-streaming path already coped via `_assistant_text`, so the
+    same model gave different output depending on `stream`.
+    """
+    from routing import responses_bridge
+
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        chat = iter([
+            ('data: {"choices":[{"delta":{"%s":"weighing it up"}}]}' % key).encode(),
+            b'data: {"choices":[{"delta":{"content":"91 = 7 x 13"},"finish_reason":"stop"}]}',
+        ])
+        body = b"".join(responses_bridge.stream_events(chat, "m")).decode()
+        assert "response.reasoning_summary_text.delta" in body, f"{key}: no reasoning event"
+        assert "weighing it up" in body, f"{key}: reasoning text lost"
+        assert "91 = 7 x 13" in body, f"{key}: answer lost"
+
+        # Reasoning is its own output item, and the two must not share an index.
+        added = [f for f in body.split("event: ") if f.startswith("response.output_item.added")]
+        assert len(added) == 2, added
+        assert '"type":"reasoning"' in added[0] and '"output_index":0' in added[0]
+        assert '"type":"message"' in added[1] and '"output_index":1' in added[1]
+
+    # A model that answers without thinking keeps its message at index 0, so the
+    # common case is unchanged for clients that key on the index.
+    plain = iter([b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}'])
+    body = b"".join(responses_bridge.stream_events(plain, "m")).decode()
+    assert "response.reasoning_summary_text" not in body
+    assert '"output_index":0' in body and '"type":"message"' in body
+
+
+def test_unit_responses_bridge_answers_when_a_model_only_reasons():
+    """nemotron streams its whole answer as reasoning; the turn must not be empty.
+
+    Verified live: `nemotron-3-ultra-free` streamed 77 chars under `reasoning`
+    and left `content` empty in every delta, so a Codex client received a message
+    item with no text -- a blank reply for a model that answered fine
+    non-streaming. The thinking is promoted to the answer rather than lost.
+    """
+    from routing import responses_bridge
+
+    chat = iter([
+        b'data: {"choices":[{"delta":{"role":"assistant","content":"","reasoning":"The user wants ok."}}]}',
+        b'data: {"choices":[{"delta":{"content":"","reasoning":" So: ok."}}]}',
+    ])
+    body = b"".join(responses_bridge.stream_events(chat, "m")).decode()
+    assert "response.output_text.delta" in body, "no message item was emitted at all"
+    assert "The user wants ok. So: ok." in body
+    # Both items are present and distinctly indexed.
+    assert '"type":"reasoning"' in body and '"type":"message"' in body
+
+
+def test_unit_responses_usage_keeps_the_reasoning_count():
+    """`reasoning_tokens` must survive the hop, where the Responses spec puts it.
+
+    Lingling's ledger recorded thinking correctly while the API response dropped
+    it, so the dashboard and the client disagreed about the same request.
+    """
+    from routing import responses_bridge
+
+    mapped = responses_bridge._usage({
+        "prompt_tokens": 100, "completion_tokens": 250, "total_tokens": 350,
+        "completion_tokens_details": {"reasoning_tokens": 200},
+    })
+    assert mapped["input_tokens"] == 100
+    assert mapped["output_tokens"] == 250
+    assert mapped["output_tokens_details"] == {"reasoning_tokens": 200}
+
+    # Absent or malformed details must not invent a key or raise.
+    assert "output_tokens_details" not in responses_bridge._usage({"prompt_tokens": 1})
+    assert "output_tokens_details" not in responses_bridge._usage(
+        {"completion_tokens_details": {"reasoning_tokens": "lots"}})
+
+
+def test_unit_request_body_fields_lingling_manages_never_reach_the_executor():
+    """A body key that names an executor argument must not become a 500.
+
+    `_passthrough_params` forwards every unrecognised field, and the result is
+    splatted into `run_in_threadpool(executor.execute_*, ...)`. Any key matching a
+    positional or keyword name collided there and raised TypeError -> HTTP 500.
+    `timeout` was the realistic one: a plausible field for a client to send, and
+    it killed the streaming path while non-streaming survived.
+
+    The same collision happens one level deeper: the executor calls
+    `prov.stream_chat(...)` / `prov.chat_completions(...)` with explicit
+    `proxy_url=`/`proxy_id=` keywords, so a client-supplied value for either
+    name collided there and raised TypeError even though the executor's own
+    signatures were clean. Those method signatures are inspected here too.
+    """
+    import inspect
+
+    import app as app_mod
+    from starlette.concurrency import run_in_threadpool
+    from providers.base import OpenAICompatibleProvider
+
+    reserved = set()
+    for fn in (executor.execute_nonstream, executor.execute_stream, run_in_threadpool,
+               OpenAICompatibleProvider.stream_chat, OpenAICompatibleProvider.chat_completions):
+        for name, param in inspect.signature(fn).parameters.items():
+            if param.kind is not param.VAR_KEYWORD:
+                reserved.add(name)
+
+    # Every name either belongs to Lingling (dropped) or is not a collision risk.
+    leaked = reserved - app_mod._PASSTHROUGH_EXCLUDE - {"messages", "kwargs", "args"}
+    assert not leaked, f"these executor argument names would collide: {sorted(leaked)}"
+
+    # And the forwarder actually drops them.
+    body = {"model": "m", "messages": [], "timeout": 5, "model_id": "x",
+            "providers": ["y"], "proxy_pool": None, "func": "z", "temperature": 0.5,
+            "proxy_url": "socks5://127.0.0.1:51001", "proxy_id": "warp-1"}
+    params = app_mod._passthrough_params(body)
+    assert params == {"temperature": 0.5}, params
+
+
+def test_unit_a_wrongly_shaped_body_is_a_client_error_not_a_crash():
+    """Well-formed JSON of the wrong shape must answer 400, not 500.
+
+    Every field read in the handlers assumed a mapping with string values, so a
+    bare list, a numeric `model`, or a `messages` list of strings raised
+    AttributeError/TypeError inside the handler and surfaced as a raw ASGI 500
+    with no ledger row. Malformed *bytes* were already handled; this is the
+    parses-fine-but-is-not-a-request case.
+    """
+    for body in (
+        ["not", "an", "object"],
+        "a bare string",
+        None,
+        42,
+        {"model": 42, "messages": [{"role": "user", "content": "hi"}]},
+        {"model": ["a"], "messages": [{"role": "user", "content": "hi"}]},
+        {"messages": [{"role": "user", "content": "hi"}]},          # no model
+        {"model": "m", "messages": ["a string, not a message"]},
+        {"model": "m", "messages": []},
+        {"model": "m"},                                              # no messages
+    ):
+        r = client.post("/v1/chat/completions", json=body)
+        assert r.status_code == 400, f"{body!r} -> {r.status_code}"
+
+    r = client.post("/v1/responses", json=["not an object"])
+    assert r.status_code == 400, r.status_code
+
+    # A non-string session_id must degrade, not be hashed or crash.
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}],
+        "session_id": {"nested": "dict"},
+    })
+    assert r.status_code in (400, 503), r.status_code   # 400 unknown model, never 500
+
+
+def test_unit_a_recovered_stream_counts_as_delivered():
+    """`ok_recovered` means the user got a complete answer, so it is not a failure.
+
+    `stream_guard` files a mid-flight retry that succeeded as `ok_recovered`, but
+    every success test was `status IN ('ok','ok_stream')` -- in four separate SQL
+    queries plus three places in the dashboard. A working recovery therefore
+    showed up as an outage in success_rate, the Outcomes block and the activity
+    chart's `failed` series.
+    """
+    from pathlib import Path
+
+    from usage.store import UsageStore
+
+    tmp_dir = tempfile.mkdtemp(prefix="lingling-status-")
+    store = UsageStore(str(Path(tmp_dir) / "usage.db"))
+    try:
+        for status in ("ok", "ok_stream", "ok_recovered", "exhausted", "stream_broken"):
+            store.log("m", "m", "user", status=status, latency_ms=100.0)
+
+        summary = store.summary()
+        totals = summary["totals"]
+        assert totals["requests"] == 5
+        assert totals["ok"] == 3, f"ok/ok_stream/ok_recovered are all delivered: {totals}"
+        assert totals["failed"] == 2, totals
+        assert totals["success_rate"] == 60.0, totals
+
+        # The same definition must hold in the per-model, daily and bucket series,
+        # or the dashboard's charts disagree with its own totals.
+        assert summary["per_model"][0]["failed"] == 2, summary["per_model"]
+        assert sum(d["failed"] for d in store.daily(2)) == 2
+        assert sum(b["failed"] for b in store.buckets(60, 60)) == 2
+    finally:
+        store.close()
+
+
+def test_unit_open_routes_answer_with_or_without_a_trailing_slash():
+    """The auth gate runs before FastAPI's slash redirect, so it must normalise.
+
+    `_OPEN_PATHS` was compared against the raw path, so a monitoring probe on
+    `/api/health/` got 401 -- the middleware saw a guarded path and the redirect
+    that would have stripped the slash never ran.
+    """
+    for path in ("/api/health", "/api/health/", "/v1/models", "/v1/models/"):
+        r = client.get(path)
+        assert r.status_code == 200, f"{path} -> {r.status_code}"
+
+
+def test_unit_dispatcher_survives_a_non_object_json_reply():
+    """A model answering `[]` is a parse miss, not an outage.
+
+    `parse_decision` called `.get` on whatever json.loads returned, so a JSON
+    array raised AttributeError. The caller's blanket except turned that into
+    "dispatcher unavailable: 'list' object has no attribute 'get'", which reads
+    like the gateway is down when the model simply replied in the wrong shape.
+    """
+    from routing import dispatcher
+
+    for reply in ("[]", "42", '"a string"', "null", "[1, 2]"):
+        model, reason = dispatcher.parse_decision(reply)
+        assert model is None, f"{reply!r} -> {model!r}"
+        assert "could not parse" in reason or "empty" in reason, reason
+
+    # A decision wrapped in an array is still understood -- the regex fallback
+    # finds the embedded object. What matters is that it does not raise.
+    model, _ = dispatcher.parse_decision('[{"model": "m", "reason": "r"}]')
+    assert model == "m"
+
+    # A real decision still parses, including one wrapped in fences.
+    model, _ = dispatcher.parse_decision('{"model": "ling-3.0-flash-free", "reason": "fast"}')
+    assert model == "ling-3.0-flash-free"
+    model, _ = dispatcher.parse_decision('```json\n{"model": "m", "reason": "r"}\n```')
+    assert model == "m"
+
+
+def test_unit_capability_table_does_not_report_a_real_model_as_zero_context():
+    """Integer division rendered a sub-1K window as `0K` to the routing brain."""
+    from routing import dispatcher
+
+    class M:
+        def __init__(self, ctx):
+            self.id = "m"
+            self.vision = False
+            self.reasoning = True
+            self.context_length = ctx
+            self.capabilities = {"desc": "d"}
+            self.provider_ids = ["opencode"]
+
+    table = dispatcher.build_capability_table([M(500)])
+    assert "context=1K" in table, table
+    assert "context=0K" not in table, table
+    # Unknown stays unknown rather than becoming a fabricated number.
+    assert "context=?" in dispatcher.build_capability_table([M(None)])
+    assert "context=200K" in dispatcher.build_capability_table([M(200_000)])
+
+
+def test_unit_effort_is_reresolved_when_failover_changes_the_model():
+    """Each model honours its own values, so a fallback must re-clamp, not inherit.
+
+    The chat path clamped effort for the primary model and then handed the *same*
+    params dict to the fallback: `max` resolved to deepseek's `max`, then travelled
+    unchanged onto ling, which implements only low/medium/high. OpenCode answers
+    200 for a value it ignores, so it looked like it worked while changing nothing.
+    `_resolve_effort(previous=...)` re-resolves from the client's original label.
+    """
+    import app as app_mod
+    from routing import effort
+
+    deepseek = ["high", "max"]
+    ling = ["low", "medium", "high"]
+
+    # What the two models actually honour, so the expectations below are grounded.
+    assert effort.resolve("max", deepseek) == "max"
+    assert effort.resolve("max", ling) == "high"
+
+    params = {"reasoning_effort": "max", "temperature": 0.2}
+    original = params["reasoning_effort"]
+    sent = app_mod._resolve_effort(params, "deepseek-v4-flash-free")
+    if sent is None:
+        raise SkipTest("live catalog unavailable; effort could not be resolved")
+    assert sent == "max", sent
+
+    # The failover path copies params and re-resolves from the original label.
+    retry = dict(params)
+    again = app_mod._resolve_effort(retry, "ling-3.0-flash-free", previous=original)
+    assert again == "high", f"ling does not implement {again!r}"
+    assert retry["reasoning_effort"] == "high"
+    assert retry["temperature"] == 0.2, "other params must survive the retry"
+
+    # Without `previous` the already-clamped value would be re-clamped as if the
+    # client had asked for it -- which is how the bug produced an illegal value.
+    naive = dict(params)
+    app_mod._resolve_effort(naive, "ling-3.0-flash-free")
+    assert naive.get("reasoning_effort") == "high", \
+        "re-clamping max against ling must still land on high"
+
+
+def test_unit_pool_url_updates_go_through_the_lock():
+    """`url` is read by the executor mid-request, so it must not be written raw.
+
+    The health daemon assigned `px.url` directly on the object `get_by_id`
+    returned -- outside `ProxyPool._lock`, and `url` is the one field the executor
+    reads while building an httpx client. A port migration could therefore land
+    between the read and the connect, sending a request through a stale port.
+    """
+    import inspect
+
+    from warp import health as health_mod
+    import app as app_mod
+
+    pool = ProxyPool.from_list([{"id": "warp-1", "url": "socks5://127.0.0.1:51001"}])
+    assert pool.set_url("warp-1", "socks5://127.0.0.1:51043") is True
+    assert pool.get_by_id("warp-1").url == "socks5://127.0.0.1:51043"
+    assert pool.set_url("nope", "socks5://127.0.0.1:1") is False, \
+        "an unknown id must report failure rather than inventing a proxy"
+
+    # Neither writer may reach in and assign the field itself.
+    for src in (inspect.getsource(health_mod.WarpHealthDaemon._sync_pool),
+                inspect.getsource(app_mod._sync_warp_to_pool)):
+        assert ".url = " not in src, "proxy URLs must be written via pool.set_url()"
+        assert "set_url" in src
+
+
+
+def test_unit_codex_catalog_lists_every_free_model():
+    """A model with no effort dial must still appear in Codex's picker.
+
+    Codex only lists models present in its catalog with a non-empty level list, so
+    `mimo`, `nemotron` and `big-pickle` -- which publish no `reasoning_options` at
+    all -- were invisible in `/model` even though they route fine. They get a
+    single `default` rung instead.
+
+    `default` is deliberately a word `routing.effort` has no rank for, so
+    selecting it resolves to "send no effort parameter" and the model runs on its
+    own default. That is the only thing such a model can do, and it is what the
+    dashboard's effort table already documents for them.
+    """
+    from models import codex_catalog
+    from routing import effort
+
+    # The contract that makes this safe: the word never reaches a provider.
+    assert effort.normalize("default") is None
+    assert effort.resolve("default", ["high", "max"]) is None
+    assert effort.resolve("default", []) is None
+
+    catalog_json = codex_catalog.build(_codex_template(), [
+        _lingling_model("deepseek-v4-flash-free", ["high", "max"]),
+        _lingling_model("mimo-v2.5-free", [], vision=True),
+        _lingling_model("nemotron-3-ultra-free", []),
+        _lingling_model("big-pickle", []),
+    ])
+    entries = {m["slug"]: m for m in catalog_json["models"]}
+    assert set(entries) == {"deepseek-v4-flash-free", "mimo-v2.5-free",
+                            "nemotron-3-ultra-free", "big-pickle"}, sorted(entries)
+
+    # A model with real options gets them; one without gets exactly one rung.
+    assert [lv["effort"] for lv in entries["deepseek-v4-flash-free"]["supported_reasoning_levels"]] \
+        == ["high", "max"]
+    for slug in ("mimo-v2.5-free", "nemotron-3-ultra-free", "big-pickle"):
+        levels = [lv["effort"] for lv in entries[slug]["supported_reasoning_levels"]]
+        assert levels == ["default"], f"{slug}: {levels}"
+        assert entries[slug]["default_reasoning_level"] == "default"
+        assert entries[slug]["supported_reasoning_levels"][0]["description"], \
+            "Codex's parser rejects a level with no description"
+
+
+def test_unit_codex_catalog_tracks_models_dev_without_a_code_change():
+    """A model that starts publishing effort levels must appear on the next run.
+
+    `mimo`, `nemotron` and `big-pickle` publish no `reasoning_options` today, so
+    they are deliberately absent: Codex nulls the effort field for an entry whose
+    level list is empty, making such an entry identical to no entry while adding
+    ~40 KB each. They still work -- they just run on their own default, which is
+    all they can do.
+
+    The set is read live from `capabilities["effort"]` on every run, so if
+    models.dev ever publishes options for one of them it is picked up with no code
+    change. This asserts that, rather than leaving it as a claim in prose.
+    """
+    from models import codex_catalog
+
+    template = _codex_template()
+    today = [
+        _lingling_model("deepseek-v4-flash-free", ["high", "max"]),
+        _lingling_model("mimo-v2.5-free", [], vision=True),
+        _lingling_model("nemotron-3-ultra-free", []),
+        _lingling_model("big-pickle", []),
+    ]
+    entries = {m["slug"]: m for m in codex_catalog.build(template, today)["models"]}
+    # Everything is listed; the ones with no published options carry the stand-in.
+    assert [lv["effort"] for lv in entries["mimo-v2.5-free"]["supported_reasoning_levels"]] \
+        == ["default"]
+
+    # Same code, same call: models.dev now publishes options for two of them.
+    tomorrow = [
+        _lingling_model("deepseek-v4-flash-free", ["high", "max"]),
+        _lingling_model("mimo-v2.5-free", ["low", "high"], vision=True),
+        _lingling_model("nemotron-3-ultra-free", ["medium"]),
+        _lingling_model("big-pickle", []),
+    ]
+    entries = {m["slug"]: m for m in codex_catalog.build(template, tomorrow)["models"]}
+    assert [lv["effort"] for lv in entries["mimo-v2.5-free"]["supported_reasoning_levels"]] \
+        == ["low", "high"], "published options must replace the stand-in"
+    assert [lv["effort"] for lv in entries["nemotron-3-ultra-free"]["supported_reasoning_levels"]] \
+        == ["medium"]
+    # The one still publishing nothing keeps the stand-in.
+    assert [lv["effort"] for lv in entries["big-pickle"]["supported_reasoning_levels"]] \
+        == ["default"]
+    # A vision model keeps its image modality in the entry Codex reads.
+    assert "image" in entries["mimo-v2.5-free"]["input_modalities"]
+
+
+def test_unit_an_exhausted_pool_waits_for_an_exit_instead_of_failing():
+    """A request that finds every exit cooling must wait, not answer 503.
+
+    This is the whole point of parking: OpenCode's free tier meters per IP, so
+    when all ten WARP exits are in cooldown the pool is not broken, it is busy.
+    Failing there ends a coding agent's entire task, and the exits come back
+    seconds later. The request holds until one does.
+    """
+    import asyncio
+
+    from routing import parking
+
+    pool = ProxyPool.from_list([
+        {"id": "warp-1", "url": "socks5://127.0.0.1:51001"},
+        {"id": "warp-2", "url": "socks5://127.0.0.1:51002"},
+    ])
+    # Burn both exits. warp-2 is cooled twice so it stays down longer -- the
+    # waiter must quote the *soonest* exit, not the last one it touched.
+    pool.mark_failure(pool.get_by_id("warp-1"), 429)
+    pool.mark_failure(pool.get_by_id("warp-2"), 429)
+    pool.mark_failure(pool.get_by_id("warp-2"), 429)
+
+    soonest = pool.time_until_available()
+    assert soonest > 0, "both exits should be cooling"
+
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    waited = asyncio.run(
+        parking.wait_for_egress(pool, budget_s=120.0, log=_QuietLog(), sleep=fake_sleep)
+    )
+    assert waited > 0, "an exhausted pool must be waited out, not failed"
+    # It waits for warp-1 (one failure, ~1s) rather than warp-2 (two, ~2s).
+    assert slept and abs(slept[0] - soonest) < 0.05, (slept, soonest)
+    assert slept[0] < pool.get_by_id("warp-2").cooldown_remaining()
+
+
+def test_unit_waiting_is_skipped_when_it_cannot_help():
+    """Parking must stay out of the way of every failure that is not exhaustion.
+
+    Each of these cases used to be -- and must remain -- an immediate failure.
+    Waiting on a healthy pool would add latency to a genuine upstream error, and
+    waiting without a pool is pure delay: the retry would leave from the same
+    burned IP that just failed.
+    """
+    import asyncio
+
+    from routing import parking
+
+    def wait(pool, budget=120.0):
+        async def boom(_seconds):
+            raise AssertionError("slept when waiting could not help")
+        return asyncio.run(
+            parking.wait_for_egress(pool, budget_s=budget, log=_QuietLog(), sleep=boom)
+        )
+
+    # A healthy exit is available: the failure was the upstream's, not the pool's.
+    healthy = ProxyPool.from_list([{"id": "warp-1", "url": "socks5://127.0.0.1:51001"}])
+    assert wait(healthy) == 0.0
+
+    # No pool at all -- every request already egresses from the real IP.
+    assert wait(None) == 0.0
+    assert wait(ProxyPool.from_list([])) == 0.0
+
+    # Cooling, but the caller allows no wait: the old 503 behaviour, opt-out via
+    # LINGLING_EGRESS_WAIT_BUDGET=0.
+    burned = ProxyPool.from_list([{"id": "warp-1", "url": "socks5://127.0.0.1:51001"}])
+    burned.mark_failure(burned.get_by_id("warp-1"), 429)
+    assert wait(burned, budget=0.0) == 0.0
+
+    # Cooling for longer than the budget: holding the client that long is worse
+    # than telling it the truth now.
+    for _ in range(8):
+        burned.mark_failure(burned.get_by_id("warp-1"), 429)
+    assert burned.time_until_available() > 5.0
+    assert wait(burned, budget=5.0) == 0.0
+
+
+def test_unit_a_parked_request_answers_instead_of_503ing():
+    """End to end through the real handler helper: no 503, a real answer.
+
+    The executor is the real one and the first pass genuinely exhausts -- the only
+    exit 429s and the pool cools it. Before parking, that raised AllFailedError
+    and the handler turned it into HTTP 503 with an `exhausted` ledger row. Now
+    `_execute_with_egress_wait` holds the request and the second pass succeeds.
+    """
+    import asyncio
+
+    import app as app_mod
+
+    pool = ProxyPool.from_list([{"id": "warp-1", "url": "socks5://127.0.0.1:51001"}])
+    state = {"calls": 0}
+
+    def flaky(prov, messages, model, secret):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise UpstreamError(429, "rate limited", "flaky")
+        return CANNED
+
+    prov = FakeProvider("flaky", flaky, use_proxy=True)
+
+    # The helper reads the module-level pool and budget, so swap both for the
+    # duration and let the cooldown be real (1s base) rather than mocked away.
+    saved_pool, saved_budget = app_mod.proxy_pool, config.EGRESS_WAIT_BUDGET
+    app_mod.proxy_pool = pool
+    config.EGRESS_WAIT_BUDGET = 30.0
+    try:
+        resp, _prov, _key, _attempts = asyncio.run(
+            app_mod._execute_with_egress_wait(
+                executor.execute_nonstream,
+                [{"role": "user", "content": "hi"}], "m", [prov], proxy_pool=pool,
+            )
+        )
+    finally:
+        app_mod.proxy_pool = saved_pool
+        config.EGRESS_WAIT_BUDGET = saved_budget
+
+    assert resp is CANNED, "the parked request must deliver a real answer"
+    assert state["calls"] == 2, f"expected one retry after the wait, got {state['calls']}"
+
+
+def test_unit_a_failure_the_wait_cannot_fix_still_raises():
+    """Parking must not convert a real error into a delay and then a delay again.
+
+    A non-retryable status never cools an exit, so there is nothing to wait for
+    and the caller must see AllFailedError immediately -- that is what preserves
+    the model-fallback path and the 400/503 the client is owed.
+    """
+    import asyncio
+
+    import app as app_mod
+
+    pool = ProxyPool.from_list([{"id": "warp-1", "url": "socks5://127.0.0.1:51001"}])
+    prov = FakeProvider("broken", UpstreamError(400, "bad request", "broken"), use_proxy=True)
+
+    saved_pool, saved_budget = app_mod.proxy_pool, config.EGRESS_WAIT_BUDGET
+    app_mod.proxy_pool = pool
+    config.EGRESS_WAIT_BUDGET = 30.0
+    try:
+        try:
+            asyncio.run(
+                app_mod._execute_with_egress_wait(
+                    executor.execute_nonstream,
+                    [{"role": "user", "content": "hi"}], "m", [prov], proxy_pool=pool,
+                )
+            )
+        except executor.AllFailedError as exc:
+            assert exc.attempts[0]["status"] == 400
+        else:
+            raise AssertionError("a 400 must not be parked and retried")
+    finally:
+        app_mod.proxy_pool = saved_pool
+        config.EGRESS_WAIT_BUDGET = saved_budget
+
+
+def test_unit_the_egress_wait_never_blocks_the_event_loop():
+    """The wait must be an await, not a sleep in a threadpool worker.
+
+    A parked request holds its coroutine for up to two minutes. If that wait
+    happened inside `run_in_threadpool`, a burned pool plus a busy agent would
+    consume every worker slot -- starving the requests that could still go out,
+    including the retry this feature depends on.
+    """
+    import asyncio
+    import inspect
+
+    from routing import parking
+
+    src = inspect.getsource(parking.wait_for_egress)
+    assert "time.sleep" not in src, "a blocking sleep would hold a worker thread"
+    assert "await sleep(" in src, "the wait must yield to the event loop"
+    assert inspect.iscoroutinefunction(parking.wait_for_egress)
+
+    # And the default really is asyncio.sleep, not something injected only in tests.
+    default = inspect.signature(parking.wait_for_egress).parameters["sleep"].default
+    assert default is asyncio.sleep, default
+
+
+def test_unit_a_mid_stream_retry_waits_for_an_exit_too():
+    """The one mid-stream retry must not be spent on an exit that has to refuse.
+
+    `guarded_stream` gets a single attempt when a stream dies after bytes are on
+    the wire. It used to reopen instantly, so if every exit happened to be cooling
+    at that moment the retry hit a burned IP, failed, and the user lost the rest
+    of the answer -- the pre-first-token wait did not cover this path because
+    recovery happens inside an already-running SSE response.
+    """
+    from routing import parking
+    from routing import stream_guard
+
+    pool = ProxyPool.from_list([{"id": "warp-1", "url": "socks5://127.0.0.1:51001"}])
+    pool.mark_failure(pool.get_by_id("warp-1"), 429)
+    assert pool.time_until_available() > 0, "the only exit should be cooling"
+
+    slept = []
+    opened = []
+
+    def hold():
+        yield from parking.hold_stream_for_egress(
+            pool, budget_s=30.0, log=_QuietLog(), sleep=slept.append,
+        )
+
+    def dies_after_one_chunk():
+        yield b'data: {"choices":[{"delta":{"content":"half an ans"}}]}'
+        raise RuntimeError("tunnel dropped")
+
+    def reopen():
+        opened.append(pool.time_until_available())
+        return iter([
+            b'data: {"choices":[{"delta":{"content":"the rest"},"finish_reason":"stop"}]}',
+            b"data: [DONE]",
+        ])
+
+    outcome = stream_guard.StreamOutcome()
+    frames = list(stream_guard.guarded_stream(
+        open_stream=reopen, first=dies_after_one_chunk(), outcome=outcome,
+        on_chunk=lambda raw: None, log=_QuietLog(), hold=hold,
+    ))
+
+    assert slept, "the retry reopened without waiting for a free exit"
+    assert opened, "the stream was never retried at all"
+    assert outcome.recovered and outcome.completed
+
+    # The client is told to discard the partial answer and then gets the retry.
+    body = b"".join(frames)
+    assert stream_guard.RESET_KEY.encode() in body
+    assert b"the rest" in body
+
+    # A held connection must not look hung: keepalives go out during the wait,
+    # and they are SSE comments so no client parses them as content.
+    keepalives = [f for f in frames if f.startswith(b":")]
+    assert keepalives, "a silent hold reads as a dead connection to the client"
+    for frame in keepalives:
+        assert b"data:" not in frame, frame
+
+
+def test_unit_the_stream_hold_releases_the_worker_and_skips_usage():
+    """Two properties the mid-stream hold must have, both invisible in the output.
+
+    A StreamingResponse is driven by a threadpool worker, one `next()` at a time.
+    Sleeping the whole wait in a single `next()` would pin that worker for up to
+    two minutes; slicing it hands the thread back between keepalives. And the
+    keepalives must never reach usage harvesting -- no upstream produced them, so
+    counting them would corrupt the ledger's token totals.
+    """
+    from routing import parking
+
+    pool = ProxyPool.from_list([{"id": "warp-1", "url": "socks5://127.0.0.1:51001"}])
+    # Cool it well past one slice so the hold has to loop.
+    for _ in range(4):
+        pool.mark_failure(pool.get_by_id("warp-1"), 429)
+    total = pool.time_until_available()
+    assert total > parking._SLICE_S, total
+
+    slept = []
+    frames = list(parking.hold_stream_for_egress(
+        pool, budget_s=60.0, log=_QuietLog(), sleep=slept.append,
+    ))
+
+    assert len(slept) > 1, f"the wait was not sliced: {slept}"
+    assert all(s <= parking._SLICE_S for s in slept), slept
+    assert abs(sum(slept) - total) < 0.05, (sum(slept), total)
+    assert len(frames) == len(slept), "one keepalive per slice"
+
+    # Harvesting must ignore them: they are comments, not data frames.
+    seen = {}
+    import app as app_mod
+    for frame in frames:
+        app_mod._harvest_stream_usage(frame, seen)
+    assert seen == {}, seen
+
+
+def test_unit_a_healthy_pool_does_not_delay_a_mid_stream_retry():
+    """Recovery must stay instant for every failure that is not exhaustion.
+
+    A dropped tunnel with nine healthy exits left is the common case, and the
+    answer there is to reopen immediately. Waiting would add a second of dead air
+    to a stream that could have resumed at once.
+    """
+    from routing import parking
+
+    def wait(pool, budget=30.0):
+        def boom(_seconds):
+            raise AssertionError("slept when a free exit was available")
+        return list(parking.hold_stream_for_egress(
+            pool, budget_s=budget, log=_QuietLog(), sleep=boom,
+        ))
+
+    healthy = ProxyPool.from_list([{"id": "warp-1", "url": "socks5://127.0.0.1:51001"}])
+    assert wait(healthy) == []
+    assert wait(None) == []
+    assert wait(ProxyPool.from_list([])) == []
+
+    burned = ProxyPool.from_list([{"id": "warp-1", "url": "socks5://127.0.0.1:51001"}])
+    burned.mark_failure(burned.get_by_id("warp-1"), 429)
+    assert wait(burned, budget=0.0) == [], "budget 0 must restore the old behaviour"
+    for _ in range(8):
+        burned.mark_failure(burned.get_by_id("warp-1"), 429)
+    assert wait(burned, budget=5.0) == [], "a wait past the budget must not happen"
+
+
+def test_unit_warp_kill_job_arms_and_reports():
+    """The kill-on-close job reports real results instead of silent no-ops.
+
+    The first implementation returned nothing, and the ctypes defaults
+    truncated 64-bit handles, so every OS call silently failed -- children
+    were never added to the job and outlived the gateway. This pins the
+    public contract: ``ensure_kill_job()``/``assign()`` return booleans and
+    ``job_active()`` reflects whether the job is really armed. On POSIX they
+    are honest no-ops.
+    """
+    import os
+
+    import warp.job as job_mod
+
+    if os.name != "nt":
+        assert job_mod.ensure_kill_job() is False
+        assert job_mod.assign(4242) is False
+        assert job_mod.job_active() is False
+        return
+
+    assert job_mod.ensure_kill_job() is True, "job must arm on Windows"
+    assert job_mod.job_active() is True
+    # Our own process is a legitimate member once the job is armed.
+    assert job_mod.assign(os.getpid()) is True
+
+
+def test_unit_warp_spawn_sites_join_the_kill_job():
+    """Every wireproxy spawn must be put in the kill-on-close job.
+
+    Regression for the orphan bug. The spawn sites called a bare
+    ``ensure_kill_job()`` that was never imported into the manager's
+    namespace. The resulting NameError was swallowed by the per-instance
+    try/except *after* ``Popen`` had already started wireproxy, so every proxy
+    came up looking healthy but never joined the job -- and survived the
+    gateway's death, holding its SOCKS5 port forever. Both spawn paths must
+    call ``job.ensure_kill_job()`` and ``job.assign(pid)``.
+    """
+    from pathlib import Path
+    from unittest import mock
+
+    from warp.manager import WarpManager
+
+    root = Path(tempfile.mkdtemp(prefix="lingling-warpjob-"))
+    ident = root / "identities" / "warp-1"
+    ident.mkdir(parents=True, exist_ok=True)
+    (ident / "wireproxy.conf").write_text(
+        "[Interface]\nPrivateKey = k\nAddress = 172.16.0.2/32\n"
+        "[Socks5]\nBindAddress = 127.0.0.1:51111\n", encoding="utf-8")
+    (ident / "wgcf-profile.conf").write_text(
+        "[Interface]\nPrivateKey = k\nAddress = 172.16.0.2/32\n", encoding="utf-8")
+
+    quiet = lambda *a, **k: None  # noqa: E731
+    fake_proc = mock.Mock()
+    fake_proc.pid = 4242
+    fake_proc.poll.return_value = None
+
+    # --- restart_instance path -------------------------------------------
+    mgr = WarpManager(root_dir=root, count=1)
+    with mock.patch("warp.manager.job") as fake_job, \
+            mock.patch("warp.manager.subprocess.Popen", return_value=fake_proc) as popen, \
+            mock.patch("warp.manager._port_is_open", side_effect=[True, True]), \
+            mock.patch("warp.manager._pid_on_port", return_value=None), \
+            mock.patch("warp.manager.time.sleep"):
+        ok = mgr.restart_instance(mgr.instances[0], log=quiet)
+
+    assert popen.called, "restart_instance did not spawn wireproxy"
+    fake_job.ensure_kill_job.assert_called_once_with()
+    fake_job.assign.assert_called_once_with(4242)
+    assert ok is True, "restart_instance must report the port as open"
+
+    # --- start_all path ----------------------------------------------------
+    # A fresh manager so no stale process handle marks the instance as running.
+    mgr2 = WarpManager(root_dir=root, count=1)
+    with mock.patch("warp.manager.job") as fake_job2, \
+            mock.patch.object(WarpManager, "ensure_tools", return_value={}), \
+            mock.patch("warp.manager.subprocess.Popen", return_value=fake_proc) as popen2, \
+            mock.patch("warp.manager._port_is_open", side_effect=[False, True, True]), \
+            mock.patch("warp.manager.time.sleep"):
+        mgr2.start_all(log=quiet)
+
+    assert popen2.called, "start_all did not spawn wireproxy"
+    fake_job2.ensure_kill_job.assert_called()
+    assert any(c.args == (4242,) for c in fake_job2.assign.call_args_list), \
+        "start_all must assign the spawned pid to the kill job"
+
+
+def test_unit_shutdown_stops_the_warp_proxies():
+    """Graceful shutdown must stop the WARP proxies on the way out.
+
+    Closing the backend window is a hard kill covered by the kill-on-close
+    job; this is the polite path (and the only one on POSIX), so a stopped
+    gateway never leaves a SOCKS5 port busy. The lifespan's ``finally`` must
+    stop the health daemon, call ``warp_manager.stop_all()`` and close the
+    usage store.
+    """
+    import asyncio
+    from unittest import mock
+
+    import app as app_mod
+
+    async def _enter_and_exit():
+        with mock.patch.object(app_mod, "_startup_sync_warp", return_value=None), \
+                mock.patch.object(app_mod, "warp_health_daemon") as hd, \
+                mock.patch.object(app_mod, "warp_manager") as wm, \
+                mock.patch.object(app_mod, "usage_store") as us:
+            async with app_mod.lifespan(None):
+                pass
+        return hd, wm, us
+
+    hd, wm, us = asyncio.run(_enter_and_exit())
+    wm.stop_all.assert_called_once_with()
+    hd.stop.assert_called_once_with()
+    us.close.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+_TESTS = [
+    # hermetic unit tests first (fast, no network)
+    test_unit_keyless_single_attempt,
+    test_unit_keyless_failover_to_keyed,
+    test_unit_retry_codes_failover,
+    test_unit_non_retryable_stops,
+    test_unit_all_fail,
+    test_unit_stream_first_chunk_failover,
+    test_unit_fast_model_bypasses_proxy_pool,
+    test_unit_session_token_signing,
+    test_unit_secfetch_header_no_longer_grants_access,
+    test_unit_session_cookie_authenticates,
+    test_unit_usage_finalize_and_prune,
+    test_unit_stream_guard_recovers_broken_stream,
+    test_unit_stream_guard_no_retry_after_completion,
+    test_unit_stream_guard_gives_up_after_one_retry,
+    test_unit_stream_guard_respects_opt_out,
+    test_unit_stream_guard_forwards_every_chunk_verbatim,
+    test_unit_stream_guard_client_disconnect_does_not_retry,
+    test_unit_responses_bridge_request_maps_codex_shape_to_chat,
+    test_unit_responses_bridge_stream_events_for_text_and_tool_calls,
+    test_unit_responses_bridge_keeps_images_and_indexes_items,
+    test_unit_responses_bridge_reports_a_truncated_stream,
+    test_unit_effort_maps_harness_labels_by_rank,
+    test_unit_effort_clamps_to_each_models_published_values,
+    test_unit_effort_sets_come_from_models_dev_not_a_hardcoded_table,
+    test_unit_codex_reasoning_block_becomes_chat_reasoning_effort,
+    test_unit_codex_catalog_declares_effort_so_codex_stops_nulling_it,
+    test_unit_codex_catalog_entries_clone_a_real_codex_model,
+    test_unit_codex_catalog_auto_entry_spans_every_routable_model,
+    test_unit_api_key_store_survives_a_truncated_write,
+    test_unit_usage_row_limit_is_capped,
+    test_unit_stream_headers_survive_nonlatin1_reason,
+    test_unit_catalog_serves_last_good_list_through_a_fetch_failure,
+    test_unit_hot_models_route_through_the_proxy_pool,
+    test_unit_codex_catalog_lists_every_free_model,
+    test_unit_codex_catalog_tracks_models_dev_without_a_code_change,
+    test_unit_responses_bridge_forwards_streamed_reasoning,
+    test_unit_responses_bridge_answers_when_a_model_only_reasons,
+    test_unit_responses_usage_keeps_the_reasoning_count,
+    test_unit_request_body_fields_lingling_manages_never_reach_the_executor,
+    test_unit_a_wrongly_shaped_body_is_a_client_error_not_a_crash,
+    test_unit_a_recovered_stream_counts_as_delivered,
+    test_unit_open_routes_answer_with_or_without_a_trailing_slash,
+    test_unit_dispatcher_survives_a_non_object_json_reply,
+    test_unit_capability_table_does_not_report_a_real_model_as_zero_context,
+    test_unit_the_fallback_routes_on_the_request_not_on_the_router_model,
+    test_unit_a_reason_with_camelcase_words_is_not_mangled,
+    test_unit_text_only_fallback_strips_images,
+    test_unit_effort_is_reresolved_when_failover_changes_the_model,
+    test_unit_pool_url_updates_go_through_the_lock,
+    test_unit_pool_ids_stay_unique_across_removals,
+    test_unit_warp_port_allocation_never_steals_a_sibling,
+    test_unit_warp_reload_repairs_duplicate_ports,
+    test_unit_warp_burn_history_survives_a_flapping_exit,
+    test_unit_warp_minimum_healthy_never_exceeds_the_identity_count,
+    test_unit_warp_never_pools_an_unverified_tunnel,
+    test_unit_warp_health_daemon_warmup_skips_probe,
+    test_unit_a_dumped_identity_rejoins_the_pool_in_the_same_cycle,
+    test_unit_one_session_still_spreads_across_every_exit,
+    test_unit_sticky_sessions_assign_by_load_not_by_hash,
+    test_unit_blocking_upstream_calls_run_off_the_event_loop,
+    test_unit_empty_catalog_is_not_refetched_on_every_request,
+    test_unit_an_exhausted_pool_waits_for_an_exit_instead_of_failing,
+    test_unit_waiting_is_skipped_when_it_cannot_help,
+    test_unit_a_parked_request_answers_instead_of_503ing,
+    test_unit_a_failure_the_wait_cannot_fix_still_raises,
+    test_unit_the_egress_wait_never_blocks_the_event_loop,
+    test_unit_a_mid_stream_retry_waits_for_an_exit_too,
+    test_unit_the_stream_hold_releases_the_worker_and_skips_usage,
+    test_unit_a_healthy_pool_does_not_delay_a_mid_stream_retry,
+    test_unit_an_auto_routed_stream_reroutes_to_another_model_mid_flight,
+    test_unit_an_explicit_model_is_never_swapped_mid_stream,
+    test_unit_warp_kill_job_arms_and_reports,
+    test_unit_warp_spawn_sites_join_the_kill_job,
+    test_unit_shutdown_stops_the_warp_proxies,
+    # live integration (real OpenCode Zen, keyless)
+    test_live_health,
+    test_live_models,
+    test_live_v1_models_openai_compatible,
+    test_live_responses_nonstream_keyless,
+    test_live_free_chat_direct,
+    test_live_multimodel_routing,
+    test_live_streaming_keyless,
+    test_live_premium_rejected,
+    test_live_usage_recorded,
+    test_live_apikey_gate,
+]
+
+
+def main():
+    passed = failed = skipped = 0
+    failures = []
+    print("Lingling real test suite")
+    print("=" * 70)
+    for fn in _TESTS:
+        t0 = time.time()
+        try:
+            fn()
+        except SkipTest as exc:
+            skipped += 1
+            print(f"  SKIP  {fn.__name__:<40} {exc}")
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            failures.append((fn.__name__, exc))
+            print(f"  FAIL  {fn.__name__:<40} {time.time() - t0:5.1f}s  {exc!r}")
+        else:
+            passed += 1
+            print(f"  PASS  {fn.__name__:<40} {time.time() - t0:5.1f}s")
+    print("=" * 70)
+    print(f"{passed} passed, {failed} failed, {skipped} skipped")
+    if failures:
+        print("\nFailures:")
+        for name, exc in failures:
+            print(f"  - {name}: {exc!r}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+
+def test_unit_a_retired_model_is_hidden_until_ttl(tmp_path, monkeypatch):
+    """Advertised-`-free` models that 400 "unavailable for free" are removed from
+    the catalog, stay gone across refreshes, and are persisted so the Codex
+    generator (a separate process) agrees. After the TTL they are re-offered,
+    in case OpenCode restores the free tier."""
+    from models.catalog import UnifiedCatalog
+    from providers.base import Provider, ProviderModel
+    from providers.key_pool import KeyPool
+    from core import config as core_config
+
+    class FetchProvider(Provider):
+        id = "opencode"
+        display_name = "Fetch"
+        priority = 10
+
+        def __init__(self):
+            super().__init__(KeyPool([]))
+            self._ids = []
+
+        def requires_key(self):
+            return False
+
+        def fetch_model_ids(self):
+            return self._ids
+
+        def is_model_free(self, model_id, meta):
+            return model_id.endswith("-free")
+
+        def build_model(self, model_id):
+            return ProviderModel(
+                id=model_id, provider_id=self.id, name=model_id, free=True,
+                vision=False, reasoning=True, context_length=1000, max_output=100,
+            )
+
+    monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
+    monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
+
+    prov = FetchProvider()
+    cat = UnifiedCatalog({"opencode": prov})
+    prov._ids = ["good-free", "dead-free"]
+    cat.refresh(force=True)
+    assert sorted(m.id for m in cat.free()) == ["dead-free", "good-free"]
+
+    # A request to the dead model fails -> mark it retired.
+    cat.mark_unavailable("dead-free")
+
+    assert "dead-free" not in [m.id for m in cat.free()]
+    assert "dead-free" not in [m.id for m in cat.vision_free()]
+    assert cat.by_id("dead-free") is None
+    assert cat.is_unavailable("dead-free") is True
+    assert "dead-free" in cat.meta()["retired_models"]
+    assert cat.meta()["free"] == 1
+
+    # It must stay gone after a refresh re-advertises it.
+    cat.refresh(force=True)
+    assert "dead-free" not in [m.id for m in cat.free()]
+
+    # Persisted: a fresh catalog (as the Codex generator builds) also hides it.
+    prov2 = FetchProvider()
+    prov2._ids = ["good-free", "dead-free"]
+    cat2 = UnifiedCatalog({"opencode": prov2})
+    cat2.refresh(force=True)
+    assert "dead-free" not in [m.id for m in cat2.free()]
+
+    # After the TTL passes it is offered again (OpenCode may restore it).
+    monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 0)
+    prov3 = FetchProvider()
+    prov3._ids = ["good-free", "dead-free"]
+    cat3 = UnifiedCatalog({"opencode": prov3})
+    cat3.refresh(force=True)
+    assert "dead-free" in [m.id for m in cat3.free()]
+
+
+def test_unit_app_flags_a_model_retired_when_the_400_says_unavailable(monkeypatch):
+    """The 400 "unavailable for free" retires the model; other 400s do not."""
+    import app as app_mod
+    from providers.base import UpstreamError
+    from routing import executor as exec_mod
+
+    marked = []
+
+    class FakeCat:
+        def mark_unavailable(self, mid):
+            marked.append(mid)
+
+    monkeypatch.setattr(app_mod, "catalog", FakeCat())
+
+    exc = exec_mod.AllFailedError(
+        UpstreamError(400, "This model is unavailable for free. use inclusionai/ling-3.0-flash"),
+        [],
+    )
+    assert app_mod._flag_model_retired(exc, "ling-3.0-flash-free") is True
+    assert marked == ["ling-3.0-flash-free"]
+
+    # A non-retirement 400 must not retire the model.
+    exc2 = exec_mod.AllFailedError(UpstreamError(400, "bad request shape"), [])
+    assert app_mod._flag_model_retired(exc2, "x-free") is False
+    assert marked == ["ling-3.0-flash-free"]
+
+    # A 429 is not retirement either.
+    exc3 = exec_mod.AllFailedError(UpstreamError(429, "rate limited"), [])
+    assert app_mod._flag_model_retired(exc3, "x-free") is False
