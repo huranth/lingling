@@ -251,30 +251,59 @@ class WarpManager:
         return results
 
     def _download_latest(self, dest: Path, repo: str, picker) -> None:
-        """Fetch the latest release asset matching picker(asset_name) -> bool."""
+        """Fetch the latest release asset matching picker(asset_name) -> bool.
+
+        Downloads run over TLS with certificate verification. If a fetch fails
+        it is retried once with a *request-scoped* unverified context, so a
+        machine whose CA store cannot pin GitHub's chain can still bootstrap.
+
+        The unverified context is deliberately NOT installed process-wide. The
+        original used ``urllib.request.install_opener``, which silently disabled
+        TLS verification for every later urllib request in the process -- once
+        it ran, any subsequent download (including the other WARP binary, or a
+        future models.dev fetch) went out unverified, and a MITM could inject
+        anything, including the executable being downloaded. Each fallback here
+        builds its own opener for exactly one call and leaves the global opener
+        untouched.
+        """
         import ssl
         import urllib.request
-        
-        # Create SSL context that verifies certificates
-        # This handles Windows SSL certificate verification issues
-        ctx = ssl.create_default_context()
-        
+
+        def _unverified_opener():
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=ctx)
+            )
+
+        def _stream_to(url: str, path: Path, unverified: bool) -> None:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36",
+            })
+            if unverified:
+                resp = _unverified_opener().open(req, timeout=60)
+            else:
+                resp = urllib.request.urlopen(req, timeout=60)
+            with resp, open(path, "wb") as out:
+                shutil.copyfileobj(resp, out)
+
         api = f"https://api.github.com/repos/{repo}/releases/latest"
         try:
-            with urllib.request.urlopen(api, timeout=30, context=ctx) as r:
+            with urllib.request.urlopen(api, timeout=30) as r:
                 release = json.loads(r.read().decode())
         except Exception:
-            # Fallback: use unverified context if default SSL fails
-            # This happens when Python can't verify GitHub's certificates
-            ctx_unverified = ssl.create_default_context()
-            ctx_unverified.check_hostname = False
-            ctx_unverified.verify_mode = ssl.CERT_NONE
+            # One retry with a fresh, request-scoped unverified context (no
+            # install_opener): some Windows builds cannot pin GitHub's chain.
             try:
-                with urllib.request.urlopen(api, timeout=30, context=ctx_unverified) as r:
+                with _unverified_opener().open(api, timeout=30) as r:
                     release = json.loads(r.read().decode())
             except Exception as e:
-                raise RuntimeError(f"failed to fetch release info from GitHub API: {e}")
-        
+                raise RuntimeError(
+                    f"failed to fetch release info from GitHub API: {e}"
+                ) from e
+
         asset = None
         for a in release.get("assets", []):
             if picker(a["name"]):
@@ -282,29 +311,20 @@ class WarpManager:
                 break
         if asset is None:
             raise RuntimeError(f"no suitable asset in {repo} latest release")
-        
+
         # Download under the asset's real name so _is_archive() can see the
         # extension (downloading as 'wireproxy.exe.tmp' hides the .tar.gz).
         tmp = self.tools_dir / asset["name"]
-        
+        src = asset["browser_download_url"]
         try:
-            urllib.request.urlretrieve(asset["browser_download_url"], tmp)
+            _stream_to(src, tmp, unverified=False)
         except Exception:
-            # If standard download fails, retry with unverified context
+            # One scoped, non-global retry (never install_opener).
             try:
-                req = urllib.request.Request(asset["browser_download_url"])
-                req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-                
-                ctx_unverified = ssl.create_default_context()
-                ctx_unverified.check_hostname = False
-                ctx_unverified.verify_mode = ssl.CERT_NONE
-                
-                opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx_unverified))
-                urllib.request.install_opener(opener)
-                urllib.request.urlretrieve(asset["browser_download_url"], tmp)
+                _stream_to(src, tmp, unverified=True)
             except Exception as e:
-                raise RuntimeError(f"failed to download asset: {e}")
-        
+                raise RuntimeError(f"failed to download asset: {e}") from e
+
         if _is_archive(tmp.name):
             _extract_binary(tmp, dest, binary_name=dest.stem)
             tmp.unlink(missing_ok=True)
