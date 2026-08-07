@@ -414,11 +414,17 @@ def stream_events(
         yield sse("response.output_item.done", {
             "type": "response.output_item.done", "output_index": reasoning_index, "item": item,
         })
-    if text_item_id is None and reasoning_item_id is not None and not finished:
+    if text_item_id is None and reasoning_item_id is not None:
         # Some models stream their whole answer as reasoning and never emit a
         # content delta (nemotron does this). Without a message item the client
         # renders an empty turn, so the thinking becomes the answer rather than
         # being lost.
+        #
+        # This must apply whether or not the upstream signalled a
+        # finish_reason. A reasoning-only stream that completes normally still
+        # carries no content delta -- gating the promotion on ``not finished``
+        # meant exactly those completed answers vanished, leaving the client a
+        # collapsed thinking block and nothing else.
         text_item_id = f"msg_{int(time.time() * 1000)}"
         text_index = next_index
         next_index += 1
