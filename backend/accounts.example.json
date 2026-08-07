@@ -1,0 +1,12 @@
+[
+  {
+    "id": "account-1",
+    "label": "Primary OpenCode account",
+    "api_key": "YOUR_OPENCODE_API_KEY_1"
+  },
+  {
+    "id": "account-2",
+    "label": "Backup OpenCode account",
+    "api_key": "YOUR_OPENCODE_API_KEY_2"
+  }
+]
