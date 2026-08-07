@@ -141,10 +141,6 @@ FREE_MODEL_CAPS: Dict[str, Dict[str, Any]] = {
         "vision": True, "reasoning": True, "coding": True, "tool_calls": True,
         "desc": "multimodal: understands images/screenshots/photos; also strong general reasoning; the ONLY free vision model",
     },
-    "ling-3.0-flash-free": {
-        "vision": False, "reasoning": True, "coding": True, "tool_calls": True,
-        "desc": "balanced general-purpose chat and light coding; fast; text-only",
-    },
     "nemotron-3-ultra-free": {
         "vision": False, "reasoning": True, "coding": True, "tool_calls": True,
         "desc": "NVIDIA model tuned for deep multi-step reasoning, math and planning; text-only",

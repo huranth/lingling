@@ -116,6 +116,23 @@ RETIRED_MODELS_FILE = Path(
 # catalog.mark_unavailable); persisted so the gateway and the Codex catalog
 # generator agree on which models are actually servable.
 RETIRED_MODEL_TTL_DAYS = int(os.getenv("LINGLING_RETIRED_MODEL_TTL_DAYS", "7"))
+# Models already known to have been dropped by the upstream, seeded so they are
+# hidden from the very first startup instead of only after the first runtime
+# 400. OpenCode keeps advertising retired models in /models for a long time,
+# so "dynamic fetching" alone cannot know they are dead.
+# Comma-separated; set to "" to clear every seed. Runtime-learned retirements
+# (RETIRED_MODELS_FILE) are still merged on top of these at every startup.
+RETIRED_MODELS_SEED = os.getenv("LINGLING_RETIRED_MODELS", "ling-3.0-flash-free")
+
+
+def retired_seed_ids() -> frozenset:
+    """The known-dead model ids hidden from the catalog even before first use.
+
+    Unlike runtime-learned retirements (which cool down after
+    ``RETIRED_MODEL_TTL_DAYS``), seeded ids are re-stamped ``now`` on every
+    catalog load, so they stay hidden until the operator unseeds them.
+    """
+    return frozenset(m.strip() for m in RETIRED_MODELS_SEED.split(",") if m.strip())
 
 # ---------------------------------------------------------------------------
 # User API keys (for authenticating clients like Cline / Claude Code)

@@ -133,9 +133,19 @@ class UnifiedCatalog:
 
     # -- retired models ----------------------------------------------------
     def _load_unavailable(self) -> None:
-        """Restore the retired set from disk, dropping entries past their TTL."""
+        """Restore the retired set: seeded known-dead ids plus persisted runtime ones.
+
+        Seeded ids (``config.retired_seed_ids()``) are hidden from the very
+        first startup -- OpenCode keeps advertising dropped models, so the
+        runtime 400-learning only triggers on first use. They are re-stamped
+        ``now`` on every load, so they never expire while they remain seeded.
+        Runtime-learned entries (below) keep their TTL.
+        """
         ttl = config.RETIRED_MODEL_TTL_DAYS * 86400
         now = time.time()
+        self._unavailable = {}
+        for mid in config.retired_seed_ids():
+            self._unavailable[mid] = now
         try:
             raw = json.loads(Path(config.RETIRED_MODELS_FILE).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):

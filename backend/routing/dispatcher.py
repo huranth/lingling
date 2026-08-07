@@ -130,7 +130,7 @@ The reason names the kind of work and why that model fits it. Examples:
 {"model": "north-mini-code-free", "reason": "Writing a React component is code generation, and this model is specialized for it."}
 {"model": "nemotron-3-ultra-free", "reason": "Finding why the deploy fails needs multi-step diagnosis rather than code output."}
 {"model": "mimo-v2.5-free", "reason": "The user attached a screenshot, so only a vision-capable model can answer."}
-{"model": "ling-3.0-flash-free", "reason": "A one-line factual question is best served by the fastest model."}
+{"model": "deepseek-v4-flash-free", "reason": "A one-line factual question is best served by the fastest model."}
 """
 
 
