@@ -65,6 +65,7 @@ from providers.base import extract_assistant_text, extract_usage
 from usage.store import UsageStore
 from warp.manager import WarpManager, _port_is_open
 from warp import health as warp_health
+from warp import probe as warp_probe
 
 VERSION = "0.2.0"
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -202,6 +203,40 @@ def _bootstrap_warp() -> None:
             "bootstrap: WARP ready (%d in pool)",
             proxy_pool.status().get("total", 0),
         )
+        # --- startup probe: test every proxy with a real model request ---
+        if config.PROBE_ON_STARTUP and len(proxy_pool) > 0:
+            try:
+                summary = warp_probe.probe_all(
+                    proxy_pool, log=log.info,
+                )
+                # Heal dead (expired) and rate-limited proxies.
+                expired_healed = warp_probe.heal_expired(
+                    proxy_pool, summary, warp_manager, log=log.info,
+                )
+                rl_healed = warp_probe.heal_rate_limited(
+                    proxy_pool, summary, warp_manager, log=log.info,
+                )
+                if expired_healed or rl_healed:
+                    log.info(
+                        "probe: healed %d expired + %d rate-limited identities",
+                        expired_healed, rl_healed,
+                    )
+                # Log a single summary row so the dashboard shows one entry.
+                try:
+                    usage_store.log(
+                        "startup-probe", "startup-probe", "probe",
+                        reason=(
+                            f"{summary.healthy}/{summary.total} healthy, "
+                            f"{summary.rate_limited} rate-limited, "
+                            f"{summary.dead} dead"
+                        ),
+                        status="ok" if summary.healthy > 0 else "exhausted",
+                        provider="warp",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception as exc:  # noqa: BLE001
+                log.warning("probe: startup probe failed (%s)", exc)
     except Exception as exc:  # noqa: BLE001
         # A failed bootstrap must not stop the gateway: it still routes fine
         # directly, just without IP rotation.
@@ -846,6 +881,21 @@ def warp_refresh() -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         log.exception("WARP refresh failed: %s", exc)
         raise HTTPException(500, f"WARP refresh failed: {exc}")
+
+
+@app.get("/api/warp/probe")
+def warp_probe_results() -> Dict[str, Any]:
+    """Latest startup probe results: per-proxy health status.
+
+    Shows which WARP exit IPs are healthy, rate-limited, or dead.  The probe
+    runs once at startup after WARP bootstrap; this endpoint exposes the
+    results to the frontend.  The Egress view renders them in the identity
+    rack so the operator can see at a glance which exits are usable.
+    """
+    results = warp_probe.latest_summary()
+    if results is None:
+        return {"probed": False, "message": "no probe has run yet"}
+    return {"probed": True, **results}
 
 
 @app.get("/api/usage")
