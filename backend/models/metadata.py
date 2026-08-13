@@ -40,7 +40,11 @@ def _load(force: bool = False) -> Dict[str, Dict[str, Any]]:
         if not force and _cache and (time.time() - _cache_at) < _CACHE_TTL:
             return _cache
         try:
-            resp = httpx.get(config.MODELS_DEV_API, timeout=config.REQUEST_TIMEOUT)
+            resp = httpx.get(
+                config.MODELS_DEV_API,
+                timeout=config.REQUEST_TIMEOUT,
+                headers={"User-Agent": config.UPSTREAM_USER_AGENT},
+            )
             resp.raise_for_status()
             payload = resp.json()
         except Exception:

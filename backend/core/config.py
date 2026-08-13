@@ -43,6 +43,16 @@ DISPATCHER_MODEL = os.getenv("LINGLING_DISPATCHER_MODEL", "deepseek-v4-flash-fre
 OPENCODE_BASE_URL = os.getenv(
     "LINGLING_OPENCODE_BASE", "https://opencode.ai/zen/v1"
 ).rstrip("/")
+# User-Agent sent on every upstream request. This one line is what makes the
+# best free models work at all. OpenCode keeps deepseek-v4-flash-free,
+# mimo-v2.5-free and big-pickle behind the official client's User-Agent: send
+# anything else and you get an instant FreeUsageLimitError 429 on the first
+# call, from any IP, with plenty of quota left. We found this the hard way --
+# the exact same request that 429s as `python-httpx/...` comes back 200 as
+# `opencode/1.0`. So rotating egress IPs was never going to help those models;
+# the block was on the header the whole time. The lighter free models don't
+# check it. Overridable in case OpenCode ever changes the accepted format.
+UPSTREAM_USER_AGENT = os.getenv("LINGLING_UPSTREAM_USER_AGENT", "opencode/1.0")
 # OpenCode account keys (the rotation pool / key router).
 OPENCODE_ACCOUNTS_FILE = Path(
     os.getenv("LINGLING_ACCOUNTS_FILE", str(_BACKEND_DIR / "accounts.json"))
@@ -174,6 +184,16 @@ ALLOWED_ORIGINS_ENV = os.getenv("LINGLING_ALLOWED_ORIGINS", "")
 # launcher would have needed a credential to bootstrap the server it just
 # started. Doing it in-process removes that entirely.
 BOOTSTRAP_WARP = os.getenv("LINGLING_BOOTSTRAP_WARP", "0") not in ("0", "false", "False", "")
+
+# ---------------------------------------------------------------------------
+# Startup probe
+# ---------------------------------------------------------------------------
+# After WARP identities are started, send a real model request through each
+# proxy to detect rate-limited or dead exit IPs immediately.  Without this,
+# the gateway would only discover burned IPs when a real user request fails.
+PROBE_ON_STARTUP = os.getenv("LINGLING_PROBE_ON_STARTUP", "1") not in ("0", "false", "False", "")
+PROBE_MODEL = os.getenv("LINGLING_PROBE_MODEL", "deepseek-v4-flash-free")
+PROBE_TIMEOUT = float(os.getenv("LINGLING_PROBE_TIMEOUT", "15"))
 
 # ---------------------------------------------------------------------------
 # Streaming recovery

@@ -154,7 +154,17 @@ class Provider(ABC):
         # header; a credential is attached only when one is actually
         # configured -- the same "Bearer only if present" rule OmniRoute
         # uses when forwarding upstream auth.
-        headers = {"Content-Type": "application/json"}
+        #
+        # The User-Agent is not cosmetic: OpenCode gates its premium free
+        # models behind the official client's UA. A request identifying as
+        # `python-httpx/...` gets an instant `FreeUsageLimitError` 429 no
+        # matter the IP or quota, while the identical request with an
+        # `opencode/...` UA returns 200. Sending it here is what lets
+        # deepseek-v4-flash-free / mimo-v2.5-free / big-pickle work at all.
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": config.UPSTREAM_USER_AGENT,
+        }
         if secret:
             headers["Authorization"] = f"Bearer {secret}"
         return headers
@@ -274,7 +284,10 @@ class OpenAICompatibleProvider(Provider):
         return None
 
     def fetch_model_ids(self) -> List[str]:
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": config.UPSTREAM_USER_AGENT,
+        }
         secret = self._models_secret()
         if secret:
             headers["Authorization"] = f"Bearer {secret}"
