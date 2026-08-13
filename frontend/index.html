@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -2913,7 +2913,8 @@ function gaugeSVG(avail, total){
   '</svg>';
 }
 
-function slotRow(s){
+function slotRow(s, probeById){
+  probeById = probeById || {};
   // #-prefixed label for every slot, whether it arrived as a pool proxy
   // (`id: "warp-1"`) or as a bare warp instance (`index: 1`). Before, the
   // pool-backed slots rendered "#1" while instance-only slots rendered "1",
@@ -2922,21 +2923,26 @@ function slotRow(s){
     : (typeof s.id === 'string' ? s.id.replace(/^warp-/, '') : '?');
   const idx = '#' + (rawIdx || '?');
   const port = s.port ?? ((String(s.url || '').match(/:(\d+)$/) || [])[1] || '—');
-  // /api/warp reports `running`; /api/warp/health reports `alive`; the proxy
-  // pool reports neither and exposes cooldown/failure counters instead.
+  // Check probe results for this proxy.
+  const probeResult = probeById[s.id] || probeById[`warp-${rawIdx}`];
+  const probeStatus = probeResult ? probeResult.status : null;
   const cooling = !!s.in_cooldown;
   const fails = s.consecutive_failures || 0;
   const up = s.alive ?? s.running ?? (!cooling && fails <= 2);
   const load = Number(s.window_load || 0);
   const loadPct = clamp(Math.round(load / 6 * 100), 0, 100);
-  // Cooldown is the only state worth showing per slot. The lifetime 429 tally
-  // used to sit here too, but it reads as a fault when it is really a record of
-  // the pool doing its job -- a rotated-and-recovered IP looked identical to a
-  // broken one. Current state lives in the chip; history lives in the ledger.
-  const chip = cooling
+  // Cooldown and probe state drive the chip. A probe result (rate-limited /
+  // dead) takes precedence because it reflects a real request outcome; a
+  // cooling badge or up/down state is shown only when no probe flag applies.
+  const probeChip = probeStatus === 'rate_limited'
+    ? '<span class="chip bad"><span class="dot"></span>rate-limited</span>'
+    : (probeStatus === 'dead'
+      ? '<span class="chip bad"><span class="dot"></span>dead</span>'
+      : '');
+  const chip = probeChip || (cooling
     ? '<span class="chip warn"><span class="dot"></span>cooling ' + Number(s.cooldown_remaining_s || 0).toFixed(0) + 's</span>'
     : (up ? '<span class="chip ok"><span class="dot"></span>up</span>'
-          : '<span class="chip bad"><span class="dot"></span>down</span>');
+          : '<span class="chip bad"><span class="dot"></span>down</span>'));
   return '<div class="slot">' +
     '<span class="ix">' + esc(idx) + '</span>' +
     '<span class="pt">:' + esc(port) + '</span>' +
@@ -2969,18 +2975,34 @@ function retimeEgressPoll(cooling){
 }
 
 
+async function getProbe(){
+  const r = await fetch('/api/warp/probe');
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
 async function loadEgress(){
   const zone = $('egress-zone');
   if (!zone) return;
   if (!zone.dataset.built) zone.innerHTML = '<div class="load"><span class="spin"></span>probing the pool…</div>';
   try {
-    const [warp, pool] = await Promise.all([getWarp().catch(() => null), getProxies().catch(() => null)]);
+    const [warp, pool, probe] = await Promise.all([
+      getWarp().catch(() => null),
+      getProxies().catch(() => null),
+      getProbe().catch(() => null),
+    ]);
     const total = (pool && (pool.total ?? (pool.proxies || []).length)) || 0;
     const avail = (pool && (pool.available ?? 0)) || 0;
     const cool = (pool && (pool.in_cooldown ?? 0)) || 0;
     const configured = (warp && (warp.count ?? 0)) || 0;
     const registered = (warp && (warp.identities_registered ?? 0)) || 0;
     const running = (warp && (warp.proxies_running ?? 0)) || 0;
+
+    // Build a map of probe results by proxy id for the identity rack.
+    const probeById = {};
+    if (probe && probe.probed && probe.results) {
+      probe.results.forEach(r => probeById[r.proxy_id] = r);
+    }
 
     // Always use warp instances as the base for the identity rack so the
     // real-time `running` field (from _is_running()) is never lost.  Pool
@@ -2995,6 +3017,15 @@ async function loadEgress(){
       const pp = poolById["warp-" + inst.index];
       return pp ? Object.assign({}, pp, { running: inst.running }) : inst;
     });
+
+    // Probe summary for the pool health block.
+    const probeHealth = probe && probe.probed
+      ? '<div class="vital"><span class="k">startup probe</span><span class="v">' +
+          probe.healthy + '/' + probe.total + ' healthy' +
+          (probe.rate_limited ? ', ' + probe.rate_limited + ' rate-limited' : '') +
+          (probe.dead ? ', ' + probe.dead + ' dead' : '') +
+          '</span></div>'
+      : '';
 
     // Speed the poll up while anything is cooling so the countdown is
     // watchable, during the first 30s of the page so startup changes are
@@ -3016,6 +3047,7 @@ async function loadEgress(){
               '<div class="vital"><span class="k">cooling</span><span class="v' + (cool ? ' hot' : '') + '">' + cool + '</span></div>' +
               '<div class="vital"><span class="k">base port</span><span class="v">' + ((warp && warp.base_port) || '—') + '</span></div>' +
               '<div class="vital"><span class="k">tools</span><span class="v">' + ((warp && warp.tools_ready) ? 'ready' : 'missing') + '</span></div>' +
+              probeHealth +
             '</div>' +
           '</div>' +
         '</div>' +
@@ -3028,7 +3060,7 @@ async function loadEgress(){
               configured + ' identities. One-time.</span></div>'
             : '') +
           '<div class="bb flush">' +
-            (slots.length ? '<div class="rack">' + slots.map(slotRow).join('') + '</div>'
+            (slots.length ? '<div class="rack">' + slots.map(s => slotRow(s, probeById)).join('') + '</div>'
                           : '<div class="empty">No exits in the pool.</div>') +
           '</div>' +
         '</div>' +
