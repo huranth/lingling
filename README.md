@@ -178,6 +178,10 @@ single-user gateway. The important ones:
 | `LINGLING_EGRESS_WAIT_BUDGET` | `120` | Max seconds to wait for a cooled egress pool |
 | `LINGLING_STREAM_IDLE_TIMEOUT` | `90` | Treat a silent stream as broken after this (s) |
 | `LINGLING_RETIRED_MODELS` | `ling-3.0-flash-free` | Models hidden from the catalog from startup (comma-separated; e.g. dropped free models OpenCode still advertises) |
+| `LINGLING_PROBE_ON_STARTUP` | `1` | Send a real model request through each WARP proxy at startup to detect rate-limited/dead IPs |
+| `LINGLING_PROBE_MODEL` | `deepseek-v4-flash-free` | Model used for the startup probe |
+| `LINGLING_PROBE_TIMEOUT` | `15` | Timeout (seconds) for each startup probe request |
+| `LINGLING_UPSTREAM_USER_AGENT` | `opencode/1.0` | User-Agent sent upstream. OpenCode gates its premium free models behind the official client's UA — without this, deepseek-v4-flash-free / mimo-v2.5-free / big-pickle return an instant 429 |
 | `LINGLING_ALLOWED_ORIGINS` | *(empty)* | Extra CORS origins, comma-separated |
 
 The full list is in `backend/core/config.py`. All settings are read from the
@@ -199,6 +203,17 @@ fails because the whole egress pool is temporarily cooling, the request waits
 for the next free IP instead of dying with a 503 (which would make Cline or Codex
 abandon the whole task). The wait is capped by `LINGLING_EGRESS_WAIT_BUDGET` and
 emits SSE keepalives so the client doesn't think the connection hung.
+
+Every request Lingling sends upstream identifies itself as the OpenCode client
+through its `User-Agent` (`LINGLING_UPSTREAM_USER_AGENT`, default `opencode/1.0`).
+This one header matters more than it looks. OpenCode keeps its best free models —
+`deepseek-v4-flash-free`, `mimo-v2.5-free`, `big-pickle` — behind it. Send a
+request with any other User-Agent and you get an instant `FreeUsageLimitError`
+429, on the very first call, no matter which IP you come from or how much quota
+is left. That is the whole reason rotating egress IPs never unblocked those
+models: the wall was never the IP, it was the User-Agent. The lighter free
+models don't check it, which is exactly why they kept working while the good
+ones didn't.
 
 Streaming gets one retry if it dies mid-answer. The partial text is discarded,
 the request reopens on a fresh IP (re-deciding the model too, for auto-routed
@@ -225,6 +240,17 @@ Everything in this README is implemented and exercised end-to-end:
   instead of hanging the session.
 - WARP egress identities auto-register, get health-checked on a timer, and are
   recycled when rate-limited, so the pool stays warm without manual intervention.
+- **Startup probe**: on launch, every WARP proxy is tested with a real model
+  request to immediately detect rate-limited or dead exit IPs.  The probe
+  results appear in the dashboard Egress view, and a single summary row is
+  logged in the Ledger so the operator sees what happened at a glance.
+- **Two healers** run automatically:
+  1. *Expired-IP healer* -- removes proxies whose WARP tunnel has expired or
+     whose exit IP is unreachable, then regenerates a fresh identity so the
+     slot is not permanently lost.
+  2. *Rate-limited healer* -- when a proxy returns HTTP 429, it is immediately
+     removed from the pool and replaced with a freshly registered Cloudflare
+     WARP identity that gives the slot a new exit IP.
 - The WARP bootstrap and the Codex/Claude one-click setups download their tools
   over verified TLS only; a failed download never disables certificate checking
   process-wide.
@@ -245,6 +271,7 @@ Everything in this README is implemented and exercised end-to-end:
 | Codex bridge | `backend/routing/responses_bridge.py` | Responses ↔ chat completions |
 | Claude bridge | `backend/claudecode/` | Anthropic Messages ↔ chat completions |
 | WARP | `backend/warp/` | Identity manager, auto-healing health daemon, kill-on-close job |
+| Probe | `backend/warp/probe.py` | Startup probe + expired/rate-limited healers |
 | Usage | `backend/usage/store.py` | SQLite request ledger |
 | Dashboard | `frontend/` | Single-page app |
 
