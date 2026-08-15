@@ -1,17 +1,10 @@
 """Token and request usage logging, backed by SQLite.
 
-Every routed request is recorded: which model was requested, which model and
-*provider* it was routed to, who made the routing decision (user / dispatcher /
-fallback), the dispatcher's reason, input/output token counts, latency, and
-outcome. ``/api/usage`` aggregates this into totals, a per-model breakdown, a
-per-provider breakdown, and a recent-requests feed for the dashboard.
-
-Streaming requests are logged in two phases. :meth:`UsageStore.log` returns the
-new row id at first-chunk time (so a stream that dies mid-flight still leaves a
-record), then :meth:`UsageStore.finalize` fills in token counts and the true
-duration once the upstream emits its terminal ``usage`` chunk. Without that
-second phase every streamed request records zero tokens -- which is what made
-the dashboard ledger read empty.
+Every routed request is recorded (requested vs routed model, provider, who
+decided, reason, token counts, latency, outcome) and aggregated for
+``/api/usage``. Streaming is logged in two phases: :meth:`log` returns a row id
+at first-chunk time (so a stream that dies mid-flight still leaves a record) and
+:meth:`finalize` fills in token counts and true duration on the terminal chunk.
 """
 
 from __future__ import annotations

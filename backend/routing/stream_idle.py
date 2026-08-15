@@ -1,21 +1,17 @@
 """Notice a stream that has gone silent without dying.
 
 ``execute_stream`` guards the first chunk and ``stream_guard`` retries a stream
-that raises; neither covers a stream that simply stops producing while the
-connection stays open. One real session sat 885 seconds with zero tokens before
-being filed as broken.
+that raises; neither covers a stream that stops producing while the connection
+stays open (one real session sat 885s with zero tokens). httpx's read timeout
+misses it too: the provider reads with ``iter_lines()`` and drops empty lines,
+so SSE keepalives reset the read timeout while delivering nothing usable.
 
-httpx's read timeout does not catch it either: the provider reads with
-``iter_lines()`` and drops empty lines, so SSE keepalives (which are empty
-lines) reset the read timeout while delivering nothing usable. The clock has to
-tick on usable frames.
-
-The upstream generator is drained onto a bounded queue by a worker thread, and
-the caller reads that queue with a deadline; no frame within the budget raises
-:class:`StreamStalled`. The reader thread is then left to finish on its own --
-it cannot be closed from here (closing a generator another thread is blocked
-inside raises ``ValueError``), and its own ``REQUEST_TIMEOUT`` ends the
-connection. That timeout is why the idle budget is much smaller than it.
+A worker thread drains the upstream onto a bounded queue; the caller reads with
+a deadline and raises :class:`StreamStalled` if no frame arrives in budget. The
+reader is then left to finish on its own -- it cannot be closed from here
+(closing a generator another thread is blocked in raises ValueError), and its
+own ``REQUEST_TIMEOUT`` ends the connection (which is why the idle budget is
+smaller than it).
 """
 
 from __future__ import annotations

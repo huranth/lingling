@@ -1,18 +1,13 @@
-"""The two-layer multi-model dispatcher (multi-provider aware).
+"""Two-layer multi-model dispatcher (multi-provider aware).
 
 Selecting ``lingling-auto`` sends the conversation to a small, fast, free
-*dispatcher* model (``deepseek-v4-flash-free``). The dispatcher reads the
-conversation plus a capability table of every free model -- now annotated with
-which providers serve each model -- and returns a JSON routing decision:
-``{"model": "<id>", "reason": "<short>"}``. The executor then forwards the
-*entire* conversation to the chosen model across the providers that serve it
-(the context bridge + cross-provider failover).
+dispatcher model, which reads the conversation plus a capability table of every
+free model and returns a JSON routing decision ``{"model", "reason"}``. The
+executor then forwards the full conversation to the chosen model.
 
-Hard rules:
-* If the conversation contains an image, candidates are restricted to
-  vision-capable models before the dispatcher decides.
-* The dispatcher is nudged to prefer models served by multiple providers, since
-  those can fail over if one provider is rate-limited.
+Hard rules: an image restricts candidates to vision-capable models before the
+dispatcher decides, and the dispatcher is nudged toward models served by
+multiple providers (those can fail over if one provider is rate-limited).
 """
 
 from __future__ import annotations
@@ -29,10 +24,8 @@ CallModel = Callable[[List[Dict[str, Any]], str], str]
 
 
 def _capability_hint(model: Any) -> str:
-    # Prefer the curated human-readable description attached by the provider
-    # (providers.opencode.FREE_MODEL_CAPS) -- it is empirically verified and
-    # tells the dispatcher exactly what each model is good at. Fall back to an
-    # inferred hint only when no curated description exists.
+    # Prefer the curated description (FREE_MODEL_CAPS) -- empirically verified.
+    # Fall back to an inferred hint only when none exists.
     caps = getattr(model, "capabilities", None)
     if isinstance(caps, dict) and caps.get("desc"):
         return str(caps["desc"])
@@ -58,7 +51,7 @@ def build_capability_table(candidates: List[Any]) -> str:
     for m in candidates:
         # Round up, never down: `//` and bare round() both rendered a 500-token
         # window as "0K" (round(0.5) is 0 -- banker's rounding), telling the
-        # routing brain a real model had no context at all.
+        # dispatcher a real model had no context.
         ctx = f"{max(1, round(m.context_length / 1000))}K" if m.context_length else "?"
         vision = "yes" if m.vision else "no"
         reasoning = "yes" if m.reasoning else "no"
@@ -390,12 +383,11 @@ def fallback_model(
 ) -> str:
     """Deterministic fallback when the dispatcher cannot decide.
 
-    ``messages`` lets the fallback route on the *kind of work* instead of
+    ``messages`` lets the fallback route on the *kind of work* rather than
     ignoring the request. Without it this returned ``DISPATCHER_MODEL`` whenever
-    that model was in the pool, so every dispatcher outage, unparseable reply and
-    hallucinated id sent the turn to the router's own model no matter what was
-    asked -- a refactor got a general chat model, and the model-failover path
-    retried on the same profile it had just failed with.
+    it was in the pool, so every dispatcher outage or bad reply sent the turn to
+    the router's own model regardless of what was asked -- and the failover path
+    retried on the profile it had just failed with.
 
     ``exclude`` removes models that already failed, so failover picks a genuinely
     different one.

@@ -1,14 +1,9 @@
 """Stateless bridge between OpenAI Responses and Chat Completions.
 
-Codex now speaks only ``POST /v1/responses``. Lingling's providers speak the
-older chat-completions wire format, so this module translates at the boundary
-and leaves routing, failover, WARP egress, and usage logging in the existing
-executor path.
-
-The bridge is intentionally stateless: callers must send full context in
-``input``. Server-side ``previous_response_id`` would require storing response
-items and replaying them, which Lingling's local proxy model does not otherwise
-need.
+Codex now speaks only ``POST /v1/responses``; Lingling's providers speak chat
+completions, so this translates at the boundary and leaves routing, failover,
+egress and usage logging to the existing executor path. Stateless by design:
+callers must send full context in ``input`` (no ``previous_response_id``).
 """
 
 from __future__ import annotations

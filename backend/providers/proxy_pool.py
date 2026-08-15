@@ -1,27 +1,17 @@
 """Load-balanced egress proxy pool with exponential cooldown.
 
-OpenCode's free tier is rate-limited by the client's IP (a Redis daily+lifetime
-counter plus a MySQL token ledger, keyed on the connecting IP). Rotating OpenCode
-keys does nothing for free models -- the limit is on the IP, not the credential.
-So Lingling routes OpenCode requests through a pool of egress proxies and cools a
-proxy down on rate-limit/auth/server errors, exactly like the key pool cools a
-burned key. When OpenCode returns 429/403 from one proxy's IP, that proxy is
-backed off and the next request uses a different egress IP.
+OpenCode rate-limits its free tier by connecting IP, not by key, so requests are
+routed through a pool of egress proxies and a proxy is cooled on
+rate-limit/auth/server errors -- exactly like the key pool cools a burned key.
 
-Selection strategy -- *proactive* load balancing, not reactive:
+Selection is *proactive* load balancing:
 
-* :meth:`ProxyPool.pick` returns the **least-recently-loaded available proxy**,
-  measured by a decaying ``window_load`` counter. This spreads traffic evenly
-  from the very first request instead of hammering one IP until it dies.
-* :meth:`ProxyPool.pick_sticky` keeps a conversation on one exit IP. It is **off
-  by default** (``LINGLING_PROXY_STICKY=0``) because it defeats the pool's whole
-  purpose here: OpenCode's limit is per-IP, and a coding agent sends one stable
-  session id for hours, so pinning meant a single IP absorbed an entire session's
-  quota while the other nine sat idle. Where affinity genuinely is needed, the
-  assignment is made by *load* on first use and remembered, not by hashing the
-  session id -- a hash ignores how busy the chosen proxy already is, and
-  ``hash(str)`` is randomised per process so the mapping was not even stable
-  across restarts.
+* :meth:`pick` returns the least-recently-loaded available proxy (by a decaying
+  ``window_load``), spreading traffic evenly from the first request.
+* :meth:`pick_sticky` pins a conversation to one exit IP. Off by default
+  (``LINGLING_PROXY_STICKY=0``): it defeats the per-IP purpose, and affinity,
+  when needed, is assigned by load and remembered rather than by hashing the
+  session id (``hash(str)`` is randomised per process, so it wasn't even stable).
 """
 
 from __future__ import annotations
@@ -343,8 +333,8 @@ class ProxyPool:
             if status_code == 429:
                 proxy.total_429 += 1
             # 404 is deliberately excluded: the executor treats it as a hard,
-            # non-retryable failure, so cooling this exit could only bench a
-            # healthy IP for a problem no other IP would fix.
+            # non-retryable failure, so cooling this exit would bench a healthy IP
+            # for a problem no other IP would fix.
             if status_code not in (401, 403, 429, 500, 502, 503, 504):
                 return 0.0
             proxy.consecutive_failures += 1

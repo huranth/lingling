@@ -1,27 +1,9 @@
-"""Lingling gateway — a dumb routing proxy for free AI models.
+"""Lingling gateway -- a dumb routing proxy for free AI models.
 
-Lingling takes whatever an OpenAI-compatible client (Cline, Claude Code, any
-harness) sends and routes it to free models on OpenCode, defeating OpenCode's
-per-IP free-tier limit via a rotating pool of egress proxies (Cloudflare WARP
-identities by default). The client owns all prompting; Lingling only routes.
-
-Endpoints
----------
-GET    /api/health                     liveness + provider/catalog summary
-GET    /api/models?refresh=0           multi-model entry + pooled free models
-POST   /api/models/refresh             force a catalog re-fetch
-GET    /api/providers                  per-provider status
-GET    /api/providers/{pid}/keys       a provider's key pool (secret-free)
-POST   /api/providers/{pid}/keys       add a key/token to a provider
-DELETE /api/providers/{pid}/keys/{kid} remove a key from a provider
-GET    /api/accounts                   OpenCode key pool (shortcut)
-POST   /api/accounts                   add an OpenCode key (shortcut)
-GET    /api/keys                       list user API keys (masked)
-POST   /api/keys                       create a user API key
-DELETE /api/keys/{kid}                 revoke a user API key
-GET    /api/usage?limit=N              usage summary + recent requests
-GET    /v1/models                       OpenAI-compatible model list
-POST   /v1/chat/completions            OpenAI-compatible router (key-gated)
+Takes whatever an OpenAI-compatible client (Cline, Claude Code, Codex) sends and
+routes it to free models on OpenCode, defeating the per-IP free-tier limit via a
+rotating pool of egress proxies (Cloudflare WARP by default). The client owns
+all prompting; Lingling only routes. See the README for the endpoint list.
 """
 
 from __future__ import annotations
@@ -75,9 +57,8 @@ app = FastAPI(
     version=VERSION,
     description="Dumb routing proxy for free AI models (OpenCode + IP rotation)",
 )
-# CORS is deliberately narrow. With allow_origins=["*"] any page on the
-# internet could read /api/keys or fire POST /api/warp/refresh from a
-# visitor's browser; credentialed requests need an explicit origin list.
+# CORS is deliberately narrow: with allow_origins=["*"] any internet page could
+# read /api/keys or fire POST /api/warp/refresh from a visitor's browser.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=auth.allowed_origins(),
@@ -87,34 +68,26 @@ app.add_middleware(
 )
 log = logging.getLogger("uvicorn.error")
 
-# Routes reachable with no credential at all. Everything else under /api/ and
-# /v1/ is gated by the middleware below.
-#   /api/health  - liveness, exposes no secrets; monitoring needs it keyless.
-#   /v1/models   - many clients populate their model picker before auth.
-#   /            - serves the dashboard and mints its session cookie.
-#
-# Compared after stripping a trailing slash: this middleware runs *before*
-# FastAPI's redirect_slashes, so `/api/health/` from a monitoring probe was
-# answered with 401 instead of being recognised as an open route.
+# Routes reachable with no credential. Everything else under /api/ and /v1/ is
+# gated below. Compared after stripping a trailing slash, because this
+# middleware runs before FastAPI's redirect_slashes -- so `/api/health/` from a
+# monitoring probe is recognised as open rather than answered 401.
 _OPEN_PATHS = frozenset({
     "/", "/api/health", "/v1", "/v1/models", "/docs", "/openapi.json", "/redoc",
-    # Claude Code probes this on startup to see whether the endpoint is alive.
-    # It is not a documented Anthropic route and carries nothing, but leaving it
-    # gated logged a scary `auth reject` line for a harmless liveness check.
+    # Claude Code HEADs this on startup; gating it logged a scary auth-reject
+    # line for a harmless liveness check.
     "/api/hello",
 })
 
 
 @app.middleware("http")
 async def _gate(request: Request, call_next):
-    """Require a session cookie or an API key for every /api/ and /v1/ route.
+    """Require a session cookie or API key for every /api/ and /v1/ route.
 
-    Previously only /v1/chat/completions was gated, which left DELETE
-    /api/usage, DELETE /api/keys/{id} and POST /api/warp/refresh open to any
-    caller that could reach the port -- a local process, a LAN host if bound
-    to 0.0.0.0, or a web page via the wildcard CORS policy. The blast radius
-    (wipe the ledger, revoke keys, destroy every WARP identity) is too large
-    to leave ungated.
+    Previously only /v1/chat/completions was gated, leaving DELETE /api/usage,
+    DELETE /api/keys/{id} and POST /api/warp/refresh open to any local process
+    or LAN host -- too large a blast radius (wipe the ledger, revoke keys,
+    destroy WARP identities) to leave ungated.
     """
     path = request.url.path
     guarded = path.startswith("/api/") or path.startswith("/v1/")
@@ -143,17 +116,10 @@ async def _gate(request: Request, call_next):
 def _startup_sync_warp(*, start_daemon: bool = True) -> None:
     """Sync already-running WARP proxies into the pool, then start the daemon.
 
-    The WARP wireproxy processes persist across Lingling restarts (they are
-    standalone subprocesses), so running `start_all()` again would either skip
-    them (now that `_is_running()` is checked) or unnecessarily migrate ports.
-    Instead, we directly sync their URLs into the proxy pool so the egress
-    rotation works immediately without the user having to click "Start".
-    The health daemon then takes over: it periodically verifies every proxy and
-    auto-heals any that are dead or burned by rate limits.
-
-    When ``LINGLING_BOOTSTRAP_WARP=1`` the daemon start is deferred to
-    :func:`_bootstrap_warp` so its first cycle doesn't race with the
-    background registration thread.
+    The wireproxy processes persist across Lingling restarts, so rather than
+    re-running start_all() we sync their URLs straight into the pool and let the
+    health daemon take over. Daemon start is deferred to _bootstrap_warp when
+    ``LINGLING_BOOTSTRAP_WARP=1`` so its first cycle doesn't race registration.
     """
     try:
         added = _sync_warp_to_pool()
@@ -189,9 +155,9 @@ def _startup_sync_warp(*, start_daemon: bool = True) -> None:
 def _bootstrap_warp() -> None:
     """Register and start WARP identities in-process (LINGLING_BOOTSTRAP_WARP=1).
 
-    Doing this here rather than over HTTP is deliberate: /api/warp/setup and
-    /api/warp/start are authenticated, so `start.bat` would otherwise need a
-    credential to bootstrap the server it just launched.
+    Done here rather than over HTTP because /api/warp/setup and /start are
+    authenticated -- start.bat would otherwise need a credential to bootstrap
+    the server it just launched.
     """
     try:
         status = warp_manager.status()
@@ -252,16 +218,10 @@ def _bootstrap_warp() -> None:
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Startup/shutdown for the gateway.
-
-    Replaces the deprecated @app.on_event hooks and adds the shutdown half the
-    health daemon never had.
-    """
-    # Raise the sync-worker thread ceiling. Every streamed request occupies one
-    # thread for the life of the stream, so anyio's default (~40) is the real
-    # concurrency limit; under many users that queues requests long before the
-    # egress pool does. The executor work is mostly I/O wait, so the extra
-    # threads are cheap.
+    """Startup/shutdown for the gateway (replaces the @app.on_event hooks)."""
+    # Raise the sync-worker thread ceiling. Every streamed request holds one
+    # thread for the life of the stream, so anyio's ~40 default is the real
+    # concurrency limit; the work is I/O-bound, so the extra threads are cheap.
     try:
         import anyio
         limiter = anyio.to_thread.current_default_thread_limiter()
@@ -332,34 +292,33 @@ app.router.lifespan_context = lifespan
 # raised TypeError -> HTTP 500. `timeout` is the realistic one: a plausible
 # field for a client to send, and it killed the streaming path while the
 # non-streaming path survived (different call shape).
+# OpenAI-compatible fields Lingling manages itself, excluded from passthrough.
+# `**params` is splatted into the executor and provider calls, so a body field
+# colliding with a positional/keyword arg there raised TypeError -> 500.
+# `timeout` was the realistic one: a plausible field to send, and it killed the
+# streaming path while the non-streaming path survived (different call shape).
 _PASSTHROUGH_EXCLUDE = frozenset({
     "model", "messages", "stream", "lingling", "session_id", "lingling_recover",
     # executor.execute_nonstream / execute_stream signature
     "model_id", "providers", "proxy_pool", "timeout",
-    # provider stream_chat / chat_completions signature. `proxy_url`, `proxy_id`,
-    # `secret` and `self` are bound explicitly by the executor/method; forwarding
-    # a client-supplied value for any of them collided with that binding and
-    # raised TypeError -> HTTP 500. (This class of bug was invisible to the guard
-    # test below until it started inspecting the provider method signatures too.)
+    # provider stream_chat / chat_completions signature (bound explicitly by the
+    # executor, so a client-supplied value would collide and raise TypeError)
     "proxy_url", "proxy_id", "secret", "self",
     # starlette.concurrency.run_in_threadpool signature
     "func",
 })
 def _passthrough_params(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Forward every OpenAI-compatible request parameter except fields Lingling manages."""
+    """Forward every OpenAI-compatible request parameter except managed fields."""
     return {k: v for k, v in body.items() if k not in _PASSTHROUGH_EXCLUDE}
 
 
 def _header_safe(value: str) -> str:
-    """Make a string safe to put in an HTTP header value.
+    """Make a string safe as an HTTP header value.
 
-    Starlette encodes header values as latin-1, so any character above U+00FF
-    raises UnicodeEncodeError when the response is constructed. The dispatcher's
-    ``reason`` is model-generated free text and routinely contains an em-dash or
-    smart quotes, so this is a normal path, not an adversarial one.
-
-    Only the X-Lingling-* mirror is sanitised; the full reason still reaches the
-    client intact in the JSON/SSE body.
+    Starlette encodes headers as latin-1, so any character above U+00FF raises.
+    The dispatcher's ``reason`` is model-generated and routinely has em-dashes or
+    smart quotes, so this is a normal path. Only the X-Lingling-* mirror is
+    sanitised; the full reason still reaches the client in the body.
     """
     if not value:
         return ""
@@ -368,23 +327,20 @@ def _header_safe(value: str) -> str:
         ("\u201c", '"'), ("\u201d", '"'), ("\u2026", "..."), ("\u2022", "*"),
     ):
         value = value.replace(uni, ascii_)
-    # Control characters must go before the latin-1 pass: CR, LF and NUL are all
-    # valid latin-1, so they survive it, and Starlette then refuses the header
-    # with RuntimeError("Invalid HTTP header value") -- aborting the response and
-    # leaving the client with nothing. The reason is model-generated text, so a
-    # stray line break in it is a normal occurrence, not an attack.
+    # Control chars must go before the latin-1 pass: CR/LF/NUL are valid latin-1
+    # and survive it, and Starlette then rejects the header with RuntimeError,
+    # aborting the whole response.
     value = "".join(" " if ch in "\r\n\t" else ch for ch in value if ch >= " ")
     return value.encode("latin-1", "replace").decode("latin-1")
 
 
 def _harvest_stream_usage(raw: bytes, into: Dict[str, int]) -> None:
-    """Read token counts out of an SSE line without altering the byte stream.
+    """Read token counts off an SSE line without altering the byte stream.
 
-    OpenCode's final content chunk carries an OpenAI-shaped ``usage`` object,
-    and it also emits a proprietary ``x-opencode-type: inference-cost`` frame
-    with a ``normalizedUsage`` block. Both are accepted; later frames win so
-    the most complete numbers survive. Anything unparseable is ignored --
-    telemetry must never be able to break a response.
+    OpenCode's final content chunk carries an OpenAI ``usage`` object, and it
+    also emits a proprietary ``normalizedUsage`` frame. Both are read; later
+    frames win. Anything unparseable is ignored -- telemetry must never break a
+    response.
     """
     if not raw.startswith(b"data:"):
         return
@@ -506,13 +462,8 @@ def _start_warp_at_startup() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 @app.api_route("/api/hello", methods=["GET", "HEAD"])
 def hello() -> Dict[str, Any]:
-    """Liveness probe Claude Code sends on startup.
-
-    Not a documented Anthropic route, but Claude Code HEADs it to decide whether
-    the endpoint is reachable. Answering it keeps the backend log honest: the
-    alternative was a 401 `auth reject` line on every session start, which reads
-    like a problem and is not one.
-    """
+    """Liveness probe Claude Code HEADs on startup. Answering it avoids a scary
+    401 auth-reject line on every session start."""
     return {"ok": True, "name": "Lingling"}
 
 
@@ -1009,23 +960,16 @@ def _resolve_effort(
 ) -> Optional[str]:
     """Translate a client's ``reasoning_effort`` into one the target honours.
 
-    Harnesses disagree on how to name thinking depth, and each OpenCode model
-    publishes its own set of values it actually implements. Effort therefore
-    cannot be resolved until routing has chosen a model, which is why this runs
-    here rather than in the request parsers.
+    Runs here, not in the request parsers, because the legal values depend on
+    the model routing chose. Mutates ``params`` in place; the parameter is
+    dropped when the label is unusable or the model exposes no effort control
+    (OpenCode returns 200 for a value it ignores, so forwarding one would look
+    like it worked while changing nothing).
 
-    Mutates ``params`` in place. The parameter is dropped entirely when the label
-    is unusable *or* when the model exposes no effort control -- OpenCode returns
-    200 for a value a model ignores, so forwarding one would look like it worked
-    while changing nothing.
-
-    ``previous`` re-resolves against a *different* model on the failover path.
-    Without it the already-clamped value for the primary model would be re-clamped
-    as if the client had asked for it: `max` clamped to deepseek's `max`, then
-    carried unchanged onto ling, which does not implement it. Passing the original
-    label makes the second resolution independent of the first.
-
-    Returns the value actually sent, for logging.
+    ``previous`` re-resolves against a different model on the failover path:
+    without it the primary's already-clamped value would be re-clamped as if the
+    client asked for it (`max` clamped to deepseek's `max`, then carried onto
+    ling, which lacks it). Returns the value actually sent, for logging.
     """
     requested = params.pop("reasoning_effort", None)
     if previous is not None:
@@ -1053,11 +997,8 @@ def _messages_for_model(
 ) -> List[Dict[str, Any]]:
     """Make ``messages`` safe for ``model_id``, stripping images it cannot see.
 
-    ``dispatcher.fallback_model`` answers an image request from a text-only
-    model when every vision-capable one is down or burning. A text-only model
-    cannot read image parts -- OpenCode answers HTTP 400 -- so every fallback
-    site replaces them with the same placeholder the primary-target path uses
-    (see ``vision_bridge.strip_images_for_text_model``). Idempotent, and a
+    A text-only model rejects image parts (OpenCode 400), so every fallback site
+    swaps them for the same placeholder the primary path uses. Idempotent, and a
     no-op for a vision-capable model or a text-only request.
     """
     if not has_images:
@@ -1071,11 +1012,10 @@ def _messages_for_model(
 def _flag_model_retired(exc: Exception, model_id: str) -> bool:
     """Hide a model from the catalog when the upstream retired its free tier.
 
-    OpenCode advertises an advertised-`-free` model even after it stops serving
-    it, so the catalog lists it and requests 400 with "This model is unavailable
-    for free". On that failure, record the model as retired (persisted, TTL),
-    which drops it from /v1/models, the dashboard, the dispatcher candidates and
-    the Codex/Claude listings. Returns True when flagged.
+    OpenCode advertises a ``-free`` model even after it stops serving it, so a
+    request 400s with "unavailable for free". On that failure the model is
+    recorded as retired (persisted, TTL), dropping it from /v1/models, the
+    dashboard, dispatcher candidates and the Codex/Claude listings.
     """
     err = getattr(exc, "last_error", None)
     if err is None or getattr(err, "status_code", None) != 400:
@@ -1093,27 +1033,20 @@ def _flag_model_retired(exc: Exception, model_id: str) -> bool:
 async def _execute_with_egress_wait(fn, *args, **kwargs):
     """Run an executor call, waiting out a fully-cooled egress pool once.
 
-    The executor is synchronous, so it always goes through the threadpool. When
-    it reports that every attempt failed, this asks the proxy pool whether the
-    failure was exhaustion -- every exit in cooldown -- and if so holds the
-    request until the soonest exit returns, then tries once more.
-
-    ``parking.wait_for_egress`` returns 0 when waiting cannot help (an exit is
-    already free, there is no pool, or the wait exceeds the budget), and then the
-    original ``AllFailedError`` propagates and the caller behaves exactly as it
-    did before parking existed -- model fallback included.
+    On AllFailedError this asks the pool whether the failure was exhaustion
+    (every exit cooling) and, if so, holds the request until the soonest exit
+    returns then retries once. ``wait_for_egress`` returns 0 when waiting can't
+    help, and the original error propagates -- so the caller behaves exactly as
+    before parking existed, model fallback included.
     """
-    # Use the proxy_pool the caller passed, not the module-level one. The
-    # executor receives it via kwargs; the egress-wait check must consult the
-    # same pool or it can wait against an empty/wrong one (most visible in
-    # tests, where a custom pool is passed but the module-level var was used).
+    # Use the caller's proxy_pool (passed via kwargs), not the module-level one,
+    # or the egress-wait check could consult the wrong pool (visible in tests).
     pool = kwargs.get("proxy_pool", proxy_pool)
     try:
         return await run_in_threadpool(fn, *args, **kwargs)
     except executor.AllFailedError as exc:
-        # fn is always execute_nonstream/execute_stream, whose second positional
-        # arg is the model id. If the upstream retired its free tier, stop
-        # offering the model (before the egress wait / model fallback below).
+        # fn is execute_nonstream/execute_stream; args[1] is the model id. If the
+        # upstream retired its free tier, stop offering the model.
         if len(args) > 1 and isinstance(args[1], str):
             _flag_model_retired(exc, args[1])
         waited = await parking.wait_for_egress(pool, config.EGRESS_WAIT_BUDGET, log)
@@ -1320,11 +1253,9 @@ async def chat_completions(request: Request):
     def _reopen():
         """Open a replacement upstream stream for mid-flight recovery.
 
-        Goes back through the executor, so the retry picks a fresh exit IP under
-        the pool's normal policy rather than reusing the one that just died. For
-        an auto-routed turn it also picks a fresh *model*, excluding the one that
-        broke. Only the generator is kept; the chosen model is recorded on
-        `reroute` so the ledger and the log can report where the answer came from.
+        Goes back through the executor for a fresh exit IP. An auto-routed turn
+        also picks a fresh model (excluding the one that broke); the chosen model
+        is recorded on `reroute` so the ledger reports where the answer came from.
         """
         retry_model = target
         retry_params = params
@@ -1371,12 +1302,10 @@ async def chat_completions(request: Request):
         )
 
     def event_stream():
-        # OpenCode's SSE bytes are forwarded verbatim -- no re-spacing, no field
-        # mirroring, no reasoning rewriting. Two things are layered on top:
-        #   1. each frame is *read* in passing to harvest token counts, without
-        #      which every streamed request records zero usage;
-        #   2. a stream that dies before the model reported completion is
-        #      retried once on a fresh exit IP (see stream_guard).
+        # OpenCode's SSE bytes are forwarded verbatim. Two things layer on top:
+        # each frame is read in passing to harvest token counts (else streamed
+        # requests record zero usage), and a stream that dies before completion
+        # is retried once on a fresh exit IP (see stream_guard).
         seen: Dict[str, int] = {}
         outcome = stream_guard.StreamOutcome()
         try:

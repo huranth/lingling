@@ -1,24 +1,15 @@
 """One mid-stream retry for the streaming chat path.
 
-Failover before the first chunk belongs to the executor (a burned IP answers 429
-at the door, so the request never starts). This covers the other failure mode: a
-stream that dies after bytes are already on the wire, when HTTP cannot change
-its status anymore.
+Pre-first-chunk failover belongs to the executor. This covers the other failure:
+a stream that dies after bytes are on the wire, when HTTP can no longer change
+its status. It wraps the upstream generator, keeps a copy of the text, and if
+the stream ends before the model reports completion it reopens once (a fresh
+exit IP) and emits the replacement after a reset marker: ``{"lingling_reset"}``.
 
-It wraps the upstream generator, keeps a copy of the text, and if the stream
-ends before the model reports completion it reopens once (a fresh exit IP, under
-the pool's normal policy) and emits the replacement answer after an explicit
-reset marker: ``{"lingling_reset": {...}}``. A client that understands the
-marker discards what it rendered and starts over; the dashboard does exactly
-that.
-
-The retried answer will differ from the partial one -- models are not
-deterministic. Clients that ignore the marker see the answer twice, so recovery
-is opt-out per request (``{"lingling_recover": false}``) and disableable with
-``LINGLING_STREAM_RECOVERY=0``. There is one retry, not a loop, and a stream
-that hangs without dying is not covered (nothing signals a failure). This also
-breaks pure pass-through: one response's worth of text is held in memory for
-the life of the request.
+The retried answer differs from the partial one (models aren't deterministic),
+so recovery is opt-out per request (``{"lingling_recover": false}``) and via
+``LINGLING_STREAM_RECOVERY=0``. One retry, not a loop; a stream that hangs
+without dying is not covered. One response's text is held in memory meanwhile.
 """
 
 from __future__ import annotations

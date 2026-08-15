@@ -1,11 +1,9 @@
-"""Generic API-key pool with round-robin rotation and exponential cooldown.
+"""Round-robin API-key pool with exponential cooldown backoff.
 
-Every provider Lingling aggregates owns one of these pools. Keys (API keys or
-auth tokens) are tried round-robin; a key that hits a rate limit (HTTP 429) or
-an auth failure (401/403) is put into an exponentially growing cooldown so load
-spreads across the pool and a single exhausted key never blocks the gateway. A
-successful request resets the key. This mirrors the rotation policy proven in
-OmniRoute's ``OpencodeExecutor`` and is the basis of the per-provider key router.
+Every provider owns one. Keys are tried round-robin; a key that hits a
+rate-limit (429) or auth failure (401/403) enters an exponentially growing
+cooldown so load spreads and one exhausted key never blocks the gateway. A
+successful request resets the key.
 """
 
 from __future__ import annotations
@@ -58,7 +56,7 @@ class KeyPool:
         self._lock = threading.Lock()
         # Monotonic, so remove-then-add cannot reuse a live id (deriving from
         # len(keys) did: removing key-2 of three left ['key-1','key-3'] and the
-        # next add() was 'key-3' again, and remove() acts on the first match).
+        # next add() collided on 'key-3').
         self._next_id = len(self.keys) + 1
 
     def _fresh_id(self) -> str:
@@ -148,16 +146,15 @@ class KeyPool:
     def mark_failure(self, key: Key, status_code: int) -> float:
         """Apply cooldown backoff for rate-limit / auth / server failures.
 
-        Returns the cooldown duration (seconds) that was applied.
+        Returns the cooldown duration (seconds) applied.
         """
         with self._lock:
             key.total_requests += 1
             if status_code == 429:
                 key.total_429 += 1
-            # The same statuses the executor treats as retryable (routing.executor
-            # `_RETRYABLE`). A key that failed with one of these must not be
-            # re-picked on the very next attempt; 426/409/410/428/504 used to be
-            # missing, so those failed over without ever cooling the key.
+            # Must match the executor's `_RETRYABLE` set: a key that failed with
+            # one of these must not be re-picked immediately. 426/409/410/428/504
+            # were once missing, so those failed over without cooling the key.
             if status_code not in (401, 403, 426, 409, 410, 428, 429, 500, 502, 503, 504):
                 return 0.0
             key.consecutive_failures += 1

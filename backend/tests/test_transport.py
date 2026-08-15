@@ -95,3 +95,90 @@ def test_chat_completions_sends_user_agent(monkeypatch):
     prov.chat_completions([{"role": "user", "content": "hi"}], "deepseek-v4-flash-free", "")
 
     assert captured["headers"]["User-Agent"] == config.UPSTREAM_USER_AGENT
+
+
+def test_strip_lone_surrogates_removes_broken_half():
+    """A lone high surrogate (truncated-emoji case) is dropped."""
+    from providers.base import strip_lone_surrogates
+
+    broken = "hello \ud83d world"          # high surrogate, no low half
+    assert strip_lone_surrogates(broken) == "hello  world"
+
+
+def test_strip_lone_surrogates_keeps_whole_emoji():
+    """A complete emoji decodes to one non-surrogate code point and survives."""
+    from providers.base import strip_lone_surrogates
+
+    assert strip_lone_surrogates("nice \U0001f600!") == "nice \U0001f600!"
+
+
+def test_strip_lone_surrogates_recurses_into_messages():
+    """Surrogates buried in nested message structures are cleaned too."""
+    from providers.base import strip_lone_surrogates
+
+    body = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "ok"},
+            {"role": "assistant", "content": "bad \udc00 tail"},
+            {"role": "user", "content": [{"type": "text", "text": "part \ud83d"}]},
+        ],
+    }
+    cleaned = strip_lone_surrogates(body)
+    assert cleaned["messages"][1]["content"] == "bad  tail"
+    assert cleaned["messages"][2]["content"][0]["text"] == "part "
+
+
+def test_chat_completions_body_survives_utf8_encode_with_lone_surrogate(monkeypatch):
+    """A message with a lone surrogate must serialize to UTF-8 without raising.
+
+    This reproduces the production 500: httpx serializes the outbound body with
+    ``json.dumps(..., ensure_ascii=False).encode("utf-8")``. Before the fix the
+    encode raised ``UnicodeEncodeError`` on the surrogate; now the body is clean.
+    """
+    import json as _json
+
+    captured = {}
+
+    class FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            captured["body"] = json
+            # Mirror what httpx does on the wire -- must not raise.
+            _json.dumps(json, ensure_ascii=False).encode("utf-8")
+            return FakeResp()
+
+    from providers import connection_pool
+
+    class FakePool:
+        def get_client(self, proxy_id, proxy_url, timeout):
+            import contextlib
+
+            @contextlib.contextmanager
+            def _cm():
+                yield FakeClient()
+
+            return _cm()
+
+    monkeypatch.setattr(connection_pool, "get_connection_pool", lambda: FakePool())
+
+    prov = OpenCodeProvider(KeyPool([]))
+    prov.chat_completions(
+        [{"role": "user", "content": "broken \ud83d emoji"}],
+        "deepseek-v4-flash-free", "",
+    )
+
+    sent = captured["body"]["messages"][0]["content"]
+    assert "\ud83d" not in sent
+    assert sent == "broken  emoji"

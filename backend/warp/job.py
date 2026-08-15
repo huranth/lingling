@@ -1,31 +1,16 @@
 """Windows Job Object: WARP children die with the gateway, no matter how it dies.
 
-Lingling spawns long-lived `wireproxy.exe` (and short-lived `wgcf.exe`)
-children. Closing the backend window kills the Python process but on Windows
-nothing kills the children -- the SOCKS5 proxies survive as orphans and keep
-their ports busy forever (see `start.bat`'s old "then run taskkill /F /IM
-wireproxy.exe" stop instructions, which existed precisely because of this).
+Closing the backend kills Python but on Windows nothing kills the long-lived
+`wireproxy.exe` children -- they survive as orphans holding their ports. A Job
+Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` fixes it at the OS level: when
+the last handle to the job closes (our process exits by any path), Windows
+terminates every process in the job. Children spawned after we join inherit
+membership, so the common path needs no per-child bookkeeping. No-op on POSIX.
 
-A Job Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` fixes it at the OS
-level: the moment the last handle to the job closes -- i.e. our process exits,
-by any path: window close, Ctrl+C, a crash, Task Manager -- Windows terminates
-every process in the job. Children spawned after our process joined the job
-inherit membership automatically, so no per-child bookkeeping is needed in the
-common case.
-
-The module is a no-op on POSIX, where each child is already its own session
-leader and dies with its controlling terminal's death.
-
-``ensure_kill_job()`` is safe to call repeatedly (idempotent) and lazily --
-the job is only created when the WARP manager actually spawns something.
-
-Why the ctypes ceremony: ``kernel32`` calls return 64-bit HANDLEs, and the
-``ctypes.windll`` default of a 32-bit ``c_int`` return type truncates them.
-The first version of this module did exactly that and every
-``AssignProcessToJobObject`` silently failed -- children were never in the
-job, so closing the gateway still orphaned the proxies. ``_kernel()`` sets
-explicit restypes/argtypes so handles round-trip intact, and it uses
-``use_last_error=True`` so ``GetLastError`` is available for diagnostics.
+Gotcha: kernel32 returns 64-bit HANDLEs, and ``ctypes.windll``'s default 32-bit
+return type truncates them -- the first version did that, so every
+``AssignProcessToJobObject`` silently failed. ``_kernel()`` sets explicit
+restypes/argtypes so handles round-trip intact.
 """
 
 from __future__ import annotations

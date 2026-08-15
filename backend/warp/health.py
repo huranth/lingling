@@ -1,14 +1,10 @@
 """Background health daemon for WARP egress proxies.
 
-Runs a background thread that periodically:
-1. TCP-checks every WARP SOCKS5 port
-2. Does a full HTTP(S) probe through working proxies to verify the tunnel
-3. Restarts dead wireproxy processes
-4. Regenerates WARP identities that can't be revived
-5. Removes unhealthy proxies from the proxy pool (never pollutes with broken ones)
-6. Ensures a minimum number of healthy proxies (6-7 by default)
-7. Dumps WARP identities that accumulate too many 429s or consecutive failures
-   and immediately creates fresh ones — so rate-limited IPs are recycled automatically.
+Periodically: TCP-checks every WARP SOCKS5 port, HTTP-probes working ones to
+verify the tunnel, restarts dead wireproxy processes, regenerates identities
+that can't be revived, removes unhealthy proxies from the pool, keeps a minimum
+number healthy, and dumps identities with too many 429s or consecutive failures
+(recycling burned IPs automatically).
 """
 
 from __future__ import annotations
@@ -29,12 +25,11 @@ from warp.manager import WarpManager, _identity_config_ok, _port_is_open
 # ---------------------------------------------------------------------------
 PORT_CHECK_TIMEOUT = 1.0          # seconds for TCP port check
 HTTP_PROBE_TIMEOUT = 6.0          # seconds for full HTTP proxy probe (hits opencode.ai)
-MAX_CONSECUTIVE_FAILURES = 10     # proxy with this many consecutive failures → dump identity
-MAX_429_TOTAL = 50                # proxy with this many lifetime 429s → dump identity
-# Floor on healthy proxies. Derived from the configured identity count, not fixed:
-# a hardcoded 6 against LINGLING_WARP_COUNT=3 could never be satisfied, so
-# _ensure_min_healthy re-registered every identity on every 60s cycle forever,
-# hammering Cloudflare's rate-limited account-creation endpoint.
+MAX_CONSECUTIVE_FAILURES = 10     # this many consecutive failures -> dump identity
+MAX_429_TOTAL = 50                # this many lifetime 429s -> dump identity
+# Floor on healthy proxies. A hardcoded 6 against LINGLING_WARP_COUNT=3 could
+# never be met, so _ensure_min_healthy re-registered every identity each cycle
+# forever, hammering Cloudflare's rate-limited account-creation endpoint.
 MIN_HEALTHY_PROXIES = 6
 CHECK_INTERVAL = 60               # seconds between health check cycles
 

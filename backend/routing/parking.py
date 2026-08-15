@@ -1,25 +1,14 @@
-"""Waiting out an exhausted egress pool instead of failing the request.
+"""Wait out an exhausted egress pool instead of failing the request.
 
-When every WARP exit answers 429 at once, the request used to end as HTTP 503.
-For a coding agent that is not one lost turn: Cline and Codex abandon the whole
-task, and the human restarts from scratch -- while the pool quietly recovers a
-minute later and sits idle.
+When every WARP exit answers 429 at once, ending as HTTP 503 makes a coding
+agent (Cline, Codex) abandon the whole task -- while the pool quietly recovers a
+minute later. So the request waits for the soonest exit and retries, since a
+70-second turn beats a dead session.
 
-But the exits are only *cooling*, not dead, and the pool already knows exactly
-when the next one comes back (:meth:`ProxyPool.time_until_available`). So the
-request waits for it and tries again. A turn that takes 70 seconds is an
-annoyance; a turn that fails is a dead session, and nobody would trade those
-the other way around.
-
-Two deliberate choices:
-
-* **The wait happens on the event loop** (``asyncio.sleep``), never inside a
-  worker thread. A parked request must not hold a threadpool slot that the
-  executor needs for the requests that can still go out.
-* **The pool's own state is the trigger.** There is no "was this a rate limit?"
-  inspection of the error, because ``mark_failure`` only cools an exit for the
-  statuses where a different IP would actually help. If nothing is in cooldown
-  there is nothing to wait for, and waiting cannot fix a 400.
+Two deliberate choices: the wait happens on the event loop (``asyncio.sleep``),
+never in a worker thread that the executor needs; and the pool's own cooldown
+state is the trigger (``mark_failure`` only cools an exit where a different IP
+would help), so if nothing is cooling there is nothing to wait for.
 """
 
 from __future__ import annotations

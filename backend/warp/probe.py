@@ -1,22 +1,10 @@
 """Startup probe: test every WARP proxy with a real model request.
 
-When the backend starts, each WARP egress identity gets a tiny real chat
-completion sent through it. This catches things a TCP port check or an HTTP
-CONNECT probe can't see:
-
-* **Burned exit IPs** -- OpenCode's free tier returns 429 from an IP that has
-  already used up its quota. The SOCKS5 tunnel can be perfectly healthy while
-  the IP behind it is spent; only a real request tells you that.
-* **Expired identities** -- Cloudflare rotates WARP exit IPs over time, so a
-  tunnel that still connects may be pointing at an IP that no longer works.
-
-Two healers act on what the probe finds:
-
-1. **Expired-IP healer** -- drops proxies whose tunnel is dead and regenerates
-   a fresh identity so the slot doesn't stay empty.
-
-2. **Rate-limited healer** -- when a proxy comes back 429, it's swapped out for
-   a brand-new Cloudflare identity, which means a brand-new exit IP.
+At startup each WARP egress gets a tiny real chat completion, catching what a
+TCP or HTTP-CONNECT check cannot: burned exit IPs (OpenCode 429s an IP that has
+used its quota, even through a healthy tunnel) and expired identities (Cloudflare
+rotates exit IPs over time). Two healers act on the results -- one drops dead
+tunnels and regenerates them, one swaps rate-limited exits for fresh identities.
 """
 
 from __future__ import annotations

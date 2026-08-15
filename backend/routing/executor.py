@@ -1,13 +1,9 @@
-"""Executor with failover across the OpenCode provider and its key pool.
+"""Executor: run a chat completion with failover across proxies and keys.
 
-Given a chosen model, the executor tries OpenCode (rotating keys if any are
-configured) and rotates egress proxies on retryable errors (rate limit / auth /
-server errors). This is the mechanism behind "keep trying until some free
-model somewhere succeeds" -- when one proxy IP burns, the next attempt uses a
-different IP.
-
-Non-streaming requests get full failover. Streaming requests bind to the best
-available provider/key up front (mid-stream failover is not attempted).
+Given a chosen model, tries the providers that serve it, rotating egress proxies
+(and keys, if configured) on retryable errors so a burned IP or key fails over
+to the next. Non-streaming gets full failover; streaming binds to the first
+provider whose stream yields a chunk (mid-stream failover lives in stream_guard).
 """
 
 from __future__ import annotations
@@ -19,9 +15,8 @@ from core import config
 from providers.base import Provider, UpstreamError  # noqa: F401
 from providers.proxy_pool import ProxyPool
 
-# Retryable upstream statuses: rate-limit (429), auth (401/403), and the usual
-# server errors. Kept broad so a transient 5xx from the upstream doesn't fail
-# the whole request when another proxy/key would succeed.
+# Statuses worth retrying on a different proxy/key: rate-limit, auth, and
+# transient server errors.
 _RETRYABLE = (401, 403, 426, 409, 410, 428, 429, 500, 502, 503, 504)
 
 

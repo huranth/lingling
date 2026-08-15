@@ -1,21 +1,13 @@
 """Cloudflare WARP egress rotation -- free, unlimited, OpenCode-specific.
 
-OpenCode rate-limits its free tier by IP. Cloudflare WARP gives every account a
-fresh exit IP, and accounts are free and unlimited. So we register N separate
-WARP identities (via `wgcf`), turn each into a local SOCKS5 proxy (via
-`wireproxy`), and feed them all into Lingling's ProxyPool. When OpenCode 429s
-one WARP IP, the pool cools it and rotates to the next -- automatically.
+OpenCode rate-limits its free tier by IP. WARP gives every account a fresh exit
+IP, free and unlimited, so we register N identities (via `wgcf`), turn each into
+a local SOCKS5 proxy (via `wireproxy`), and feed them into the ProxyPool:
 
-Mirrors github.com/MrAlony/oc-quota (WARP + wireproxy + 429 interceptor), but
-native to Lingling: no Rust, no .bat, no 9Router. Just Python + the two WARP
-tools. Architecture (all on 127.0.0.1):
+    socks5://127.0.0.1:51001 --> wireproxy #1 --> WARP identity #1 --> opencode.ai
+    socks5://127.0.0.1:51002 --> wireproxy #2 --> WARP identity #2 --> opencode.ai
 
-    Lingling ProxyPool picks one of:
-        socks5://127.0.0.1:51001  --> wireproxy #1 --> WARP identity #1 --> opencode.ai
-        socks5://127.0.0.1:51002  --> wireproxy #2 --> WARP identity #2 --> opencode.ai
-        ...
-
-Each WARP identity = a different Cloudflare exit IP. All free, all unlimited.
+When OpenCode 429s one WARP IP, the pool cools it and rotates to the next.
 """
 
 from __future__ import annotations

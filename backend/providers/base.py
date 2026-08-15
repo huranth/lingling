@@ -1,21 +1,15 @@
 """Provider abstraction.
 
-Lingling aggregates many free-tier gateways behind one router. Each gateway is
-a :class:`Provider`: it knows its base URL, holds a credential pool, can list
-its models dynamically, and can run a chat completion. Adding a new free
-provider is one small subclass.
-
-Both OpenCode and any future OpenAI-compatible gateway speak the OpenAI wire
-protocol, so the shared :class:`OpenAICompatibleProvider` implements the
-transport (POST ``{base}/chat/completions`` with a bearer credential, streaming
-and not) and a
-default ``GET /models`` reader. A concrete provider supplies its base URL, how
-to read its live model list (auth if needed), and how to decide which of its
-models are free.
+Each free-tier gateway is a :class:`Provider`: it knows its base URL, holds a
+credential pool, lists its models, and runs chat completions. OpenCode and any
+future OpenAI-compatible gateway share :class:`OpenAICompatibleProvider`, which
+implements the transport; a concrete provider supplies its base URL, how to read
+its model list, and how to decide which models are free.
 """
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, Generator, List, Optional
@@ -25,6 +19,32 @@ import httpx
 from core import config
 from models import metadata
 from providers.key_pool import KeyPool
+
+
+# Matches any UTF-16 surrogate code point (U+D800..U+DFFF).
+_LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def strip_lone_surrogates(obj: Any) -> Any:
+    """Recursively drop unpaired UTF-16 surrogate code points from a body.
+
+    A client that truncates history mid-emoji can send only half of a surrogate
+    pair (e.g. ``\\ud83d``). httpx serializes the body with
+    ``json.dumps(ensure_ascii=False).encode("utf-8")``, which cannot encode a
+    lone surrogate and raises UnicodeEncodeError before any bytes leave -- so the
+    request 500s and every retry on the same body fails identically. Whole emoji
+    decode to a single non-surrogate code point and are left untouched.
+    """
+    if isinstance(obj, str):
+        # Fast path: most strings have no surrogates at all.
+        if _LONE_SURROGATE_RE.search(obj):
+            return _LONE_SURROGATE_RE.sub("", obj)
+        return obj
+    if isinstance(obj, dict):
+        return {k: strip_lone_surrogates(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [strip_lone_surrogates(v) for v in obj]
+    return obj
 
 
 class UpstreamError(Exception):
@@ -77,9 +97,8 @@ class Provider(ABC):
 
     def __init__(self, keys: KeyPool) -> None:
         self.keys = keys
-        # Whether the most recent list_models() fetch succeeded. The catalog
-        # reads this to keep serving the last good model list through a
-        # transient fetch failure instead of blanking out (see UnifiedCatalog).
+        # Whether the most recent list_models() fetch succeeded, so the catalog
+        # can keep serving the last good list through a transient fetch failure.
         self.last_fetch_ok: bool = True
 
     # -- configuration -----------------------------------------------------
@@ -87,18 +106,12 @@ class Provider(ABC):
         return True
 
     def needs_proxy(self) -> bool:
-        """Whether this provider's requests should be routed through the egress
-        proxy pool. Override to True for IP-rate-limited keyless providers
-        (OpenCode free tier).
-        """
+        """Whether requests route through the egress proxy pool. True for
+        IP-rate-limited keyless providers (OpenCode free tier)."""
         return False
 
     def prefer_direct(self, model_id: str) -> bool:
-        """Whether latency-sensitive requests for *model_id* bypass egress proxies.
-
-        This is deliberately opt-in at provider level: a provider that requires
-        a proxy for connectivity can retain its normal proxy behavior.
-        """
+        """Whether latency-sensitive requests for *model_id* bypass the pool."""
         return False
 
     def is_configured(self) -> bool:
@@ -134,11 +147,10 @@ class Provider(ABC):
     def list_models(self) -> List[ProviderModel]:
         """Fetch live ids and build enriched models.
 
-        Returns ``[]`` on any failure (provider unconfigured or unreachable) so
-        one provider never breaks the whole catalog. ``last_fetch_ok`` records
-        whether the fetch actually succeeded, so the catalog can distinguish
-        "this provider genuinely has no models" from "the /models call just
-        failed" and avoid discarding a good cached list on a transient blip.
+        Returns ``[]`` on any failure so one provider never breaks the catalog.
+        ``last_fetch_ok`` records whether the fetch succeeded, so the catalog can
+        tell "no models" from "the /models call failed" and keep a good cached
+        list through a transient blip.
         """
         try:
             ids = self.fetch_model_ids()
@@ -150,17 +162,13 @@ class Provider(ABC):
 
     # -- transport ---------------------------------------------------------
     def auth_headers(self, secret: str) -> Dict[str, str]:
-        # Keyless providers (OpenCode Zen free tier) send NO Authorization
-        # header; a credential is attached only when one is actually
-        # configured -- the same "Bearer only if present" rule OmniRoute
-        # uses when forwarding upstream auth.
+        # Authorization is attached only when a credential is configured
+        # (OpenCode's free tier is keyless).
         #
-        # The User-Agent is not cosmetic: OpenCode gates its premium free
-        # models behind the official client's UA. A request identifying as
-        # `python-httpx/...` gets an instant `FreeUsageLimitError` 429 no
-        # matter the IP or quota, while the identical request with an
-        # `opencode/...` UA returns 200. Sending it here is what lets
-        # deepseek-v4-flash-free / mimo-v2.5-free / big-pickle work at all.
+        # Gotcha: the User-Agent is load-bearing. OpenCode gates its premium free
+        # models behind the official client's UA -- a `python-httpx/...` request
+        # gets an instant FreeUsageLimitError 429 regardless of IP or quota,
+        # while the identical request as `opencode/...` returns 200.
         headers = {
             "Content-Type": "application/json",
             "User-Agent": config.UPSTREAM_USER_AGENT,
@@ -214,6 +222,10 @@ class OpenAICompatibleProvider(Provider):
         for k, v in params.items():
             if v is not None:
                 body[k] = v
+        # A client that truncated history mid-emoji can leave a lone UTF-16
+        # surrogate in the messages; UTF-8 can't encode it and httpx would 500
+        # on serialization before any bytes leave. Drop the broken halves.
+        body = strip_lone_surrogates(body)
         timeout_val = float(timeout or config.REQUEST_TIMEOUT)
 
         # Reuse pooled clients so a repeat request to the same proxy skips the
@@ -240,27 +252,24 @@ class OpenAICompatibleProvider(Provider):
         proxy_id: Optional[str] = None,
         **params: Any,
     ) -> Generator[bytes, None, None]:
-        """Stream a chat completion with connection pooling for speed.
-        
-        OPTIMIZED: Uses pooled httpx clients to avoid SOCKS5 handshake on every request.
-        """
+        """Stream a chat completion, reusing pooled clients for speed."""
         body: Dict[str, Any] = {"model": model, "messages": messages, "stream": True}
         for k, v in params.items():
             if v is not None:
                 body[k] = v
-        
+        # See chat_completions: strip lone UTF-16 surrogates so a truncated-emoji
+        # message doesn't 500 in httpx's UTF-8 serialization before we connect.
+        body = strip_lone_surrogates(body)
+
         timeout_val = float(timeout or config.REQUEST_TIMEOUT)
-        
-        # Use connection pool for faster subsequent requests
+
         from providers.connection_pool import get_connection_pool
         pool = get_connection_pool()
-        
-        # Generate proxy_id if not provided
         if proxy_id is None and proxy_url:
             proxy_id = proxy_url.split("://")[-1].replace(":", "_")[:32]
         elif proxy_id is None:
             proxy_id = "_direct_"
-        
+
         with pool.get_client(proxy_id, proxy_url, timeout_val) as client:
             try:
                 with client.stream(

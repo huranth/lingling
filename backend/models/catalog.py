@@ -1,13 +1,9 @@
 """Unified multi-provider catalog of free models.
 
-Each provider lists its own models; this catalog merges them into one view.
-Models are grouped by id into a :class:`LogicalModel` that records *which
-providers serve it*. That grouping is what enables cross-provider failover:
-``deepseek-v4-flash-free`` served by OpenCode becomes one
-logical model; the executor can then try different egress proxies in turn
-when one IP burns.
-
-Only free models become logical models; premium models are counted as filtered.
+Each provider lists its own models; this catalog merges them by id into a
+:class:`LogicalModel` that records which providers serve it. That grouping is
+what enables cross-provider failover. Only free models become logical models;
+premium ones are counted as filtered.
 """
 
 from __future__ import annotations
@@ -256,13 +252,10 @@ class UnifiedCatalog:
     def by_id(self, model_id: str) -> Optional[LogicalModel]:
         """Resolve a model from the current catalog view.
 
-        This runs on every routed request, so it deliberately does not
-        re-fetch the upstream list when the model is already known. The model
-        list refreshes on its own clock (``free()``/``meta()``/``/api/models``
-        and the refresh endpoint); an explicit model request must not pay an
-        upstream round-trip just because the 10-minute TTL happened to expire.
-        Only a model the cached view does not know falls through to a refresh,
-        so a model the upstream just published still resolves by name.
+        Runs on every routed request, so it does not re-fetch when the model is
+        already known -- an explicit request must not pay an upstream round-trip
+        just because the TTL happened to expire. Only an unknown model falls
+        through to a refresh, so a just-published model still resolves by name.
         """
         if model_id in self._unavailable:
             return None

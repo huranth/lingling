@@ -1,9 +1,8 @@
 """Pooled httpx clients so repeat requests skip the SOCKS5 handshake.
 
-Every request used to build a fresh httpx.Client: a new SOCKS5 handshake, DNS
-lookup and TCP connect each time (roughly 50-200ms of overhead). Pooled clients
-reuse a warm connection per proxy. The pick is O(1) and the lock is only taken
-when the pool structure actually changes.
+A fresh client per request paid a SOCKS5 handshake, DNS lookup and TCP connect
+each time (~50-200ms). Pooled clients reuse a warm connection per proxy; the
+pick is O(1) and the lock is taken only when the pool structure changes.
 """
 
 from __future__ import annotations
@@ -77,14 +76,14 @@ class ConnectionPool:
             "limits": httpx.Limits(
                 max_connections=10,
                 max_keepalive_connections=5,
-                # Keep the client's own idle keepalive in step with the pool's
-                # prune window so a warm tunnel is actually reusable for the
-                # whole time the pool says it is.
+                # Keep the client's own keepalive in step with the pool's prune
+                # window so a warm tunnel stays reusable for as long as the pool
+                # claims it is.
                 keepalive_expiry=config.CONNECTION_POOL_IDLE_S,
             ),
         }
-        # HTTP/2 is a speed win but needs the optional h2 package. Enable it only
-        # when it's actually installed; silently fall back to HTTP/1.1 otherwise.
+        # HTTP/2 is a speed win but needs the optional h2 package; enable it only
+        # when installed, else fall back to HTTP/1.1.
         try:
             import h2  # noqa: F401
             kwargs["http2"] = True

@@ -1,23 +1,12 @@
 """Which OpenCode model a Claude Code request actually means.
 
-Claude Code sends Anthropic model ids -- ``claude-sonnet-4-6``, ``claude-opus-5``
-and so on -- and also makes background calls on whatever id resolves for its
-``haiku`` alias (session titles, conversation summaries). None of those exist
-here, so a request naming one has to be resolved to a real free model or it 404s.
-
-Two rules, in order:
-
-1. **An OpenCode model id passes through untouched.** Setting
-   ``ANTHROPIC_MODEL=deepseek-v4-flash-free`` is the honest way to pin a model,
-   and it must keep working.
-2. **Anything else routes by size class.** ``haiku`` -> fast, ``sonnet`` -> the
-   general-purpose default, ``opus`` -> the deepest thinker available. An
-   unrecognised id gets the dispatcher, which is the same answer Lingling gives
-   any client that asks for something it cannot name.
-
-The alias targets are configurable but deliberately *not* hardcoded to a specific
-model list: catalogs change, and a missing target falls back to whatever the
-catalog does offer rather than failing the request.
+Claude Code sends Anthropic model ids (``claude-sonnet-4-6``, and its ``haiku``
+alias for background calls), none of which exist here, so each must resolve to a
+real free model or it 404s. Two rules: an OpenCode id passes through untouched
+(``ANTHROPIC_MODEL=deepseek-v4-flash-free`` must keep working); anything else
+routes by size class (haiku -> fast, sonnet -> general, opus -> deepest, unknown
+-> dispatcher). Alias targets are picked live from the catalog, never hardcoded,
+so a missing target falls back to what the catalog does offer.
 """
 
 from __future__ import annotations

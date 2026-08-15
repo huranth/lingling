@@ -1,8 +1,8 @@
 """Provider registry: build the active providers from configuration.
 
-OpenCode credentials come from a JSON file (same shape as
-``accounts.example.json``). Because OpenCode rate-limits by IP (not by key),
-the key pool is optional — the real countermeasure is the egress proxy pool.
+OpenCode credentials come from a JSON file (see ``accounts.example.json``).
+Because OpenCode rate-limits by IP, not key, the key pool is optional -- the
+real countermeasure is the egress proxy pool.
 """
 
 from __future__ import annotations

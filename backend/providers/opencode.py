@@ -1,23 +1,14 @@
 """OpenCode provider.
 
 OpenCode Zen (https://opencode.ai/zen/v1) is an OpenAI-compatible gateway whose
-free tier is keyless: ``GET /models`` and the free models on
-``POST /chat/completions`` both answer with no credential. The web-created
-"OpenCode Zen API key" only gates paid models, which Lingling does not serve,
-so Lingling talks to OpenCode keyless by default. Configured account keys
-(``accounts.json``) are optional for the free tier.
+free tier is keyless. A model is free by OpenCode's ``-free`` suffix or by being
+a known keyless free model in ``FREE_MODEL_CAPS`` (e.g. ``big-pickle``);
+everything else is treated as premium (fail closed). models.dev pricing is not
+consulted because it mislabels some paid models as free.
 
-A model is free by OpenCode's own ``-free`` suffix, or by being a known keyless
-free model listed in ``FREE_MODEL_CAPS`` (e.g. ``big-pickle``). models.dev
-pricing is intentionally not consulted -- it mislabels some paid OpenCode
-models as free -- so anything else is treated as premium (fail closed).
-
-OpenCode's ``/models`` returns only ``{id, object, created, owned_by}`` (no
-modalities), and models.dev has gaps. ``FREE_MODEL_CAPS`` is a curated overlay
-of hand-verified notes, not a gate: a ``-free`` model without an entry is still
-served with capabilities inferred from models.dev and the id itself, so new
-free models appear with no code change.
-routing dispatcher reads when a hand-checked description exists.
+``FREE_MODEL_CAPS`` is a curated overlay of hand-verified notes, not a gate: a
+``-free`` model without an entry is still served, with capabilities inferred
+from models.dev and the id, so new free models appear with no code change.
 """
 
 from __future__ import annotations

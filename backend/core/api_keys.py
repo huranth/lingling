@@ -1,9 +1,8 @@
-"""User API keys for authenticating OpenAI-compatible clients (Cline, etc).
+"""User API keys for authenticating OpenAI-compatible clients.
 
-Keys are random ``ll_<32 hex chars>`` tokens stored in a JSON file. Clients
-present them as ``Authorization: Bearer ll_...`` or ``x-api-key: ll_...``.
-This is a local, single-user store -- not a multi-tenant secrets manager --
-so keys are stored in plaintext (the file is the trust boundary).
+Random ``ll_<32 hex>`` tokens in a JSON file, presented as
+``Authorization: Bearer ll_...`` or ``x-api-key``. A local single-user store,
+so tokens are plaintext -- the file is the trust boundary.
 """
 from __future__ import annotations
 
@@ -19,8 +18,8 @@ from core import config
 
 _LOCK = threading.Lock()
 
-# How stale ``last_used_at`` may get before validate() rewrites the file. Keeps
-# a disk write off the hot path of every authenticated request.
+# How stale ``last_used_at`` may get before validate() rewrites the file, so a
+# disk write stays off the hot path of every authenticated request.
 _LAST_USED_RESOLUTION_S = 60
 
 
@@ -39,8 +38,8 @@ def _save(keys: List[Dict[str, Any]]) -> None:
     """Persist the keyring atomically.
 
     ``_load`` treats unparseable JSON as "no keys", so a half-written file would
-    silently revoke every client's access. Writing a sibling temp file and
-    renaming means readers only ever see the complete old file or the new one.
+    silently revoke every client. Write-to-temp-then-rename means readers only
+    ever see the complete old file or the new one.
     """
     path = Path(config.API_KEYS_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,7 +48,7 @@ def _save(keys: List[Dict[str, Any]]) -> None:
         json.dump(keys, fh, indent=2)
         fh.flush()
         os.fsync(fh.fileno())
-    os.replace(tmp, path)  # atomic on POSIX and on Windows (same directory)
+    os.replace(tmp, path)  # atomic on POSIX and Windows (same directory)
 
 
 def _generate_token() -> str:
@@ -57,8 +56,7 @@ def _generate_token() -> str:
 
 
 def create_key(label: str = "") -> Dict[str, Any]:
-    """Create a new API key and persist it. Returns the full key record
-    (including the plaintext token, shown once to the user)."""
+    """Create and persist a key. Returns the full record (plaintext token)."""
     with _LOCK:
         keys = _load()
         key = {
@@ -103,9 +101,8 @@ def revoke_key(key_id: str) -> bool:
 def validate(token: Optional[str]) -> bool:
     """Return True if ``token`` matches a stored key.
 
-    ``last_used_at`` is refreshed at most once per
-    ``_LAST_USED_RESOLUTION_S``. It used to be written on every call, which put
-    a full keyring rewrite on the hot path of every authenticated request.
+    ``last_used_at`` is refreshed at most once per ``_LAST_USED_RESOLUTION_S`` to
+    keep a full keyring rewrite off the hot path of every authenticated request.
     """
     if not token:
         return False
@@ -124,3 +121,4 @@ def validate(token: Optional[str]) -> bool:
                     _save(keys)
                 return True
         return False
+
