@@ -155,6 +155,18 @@ FREE_MODEL_CAPS: Dict[str, Dict[str, Any]] = {
     # dispatcher its real strengths instead of guessing from the id. 1M-token
     # context, 131K output, tool calling, reasoning, text-only (confirmed live +
     # modeled in models.dev: attachment=false, modalities=[text], limit.context=1M).
+    # Hy3 Free, served by OpenCode as hy3-free (verified live). -free suffix,
+    # so it is already served; the curated entry gives the dispatcher its real
+    # strengths instead of guessing from the id.
+    "hy3-free": {
+        "vision": False, "reasoning": True, "coding": True, "tool_calls": True,
+        "desc": "fast general-purpose free model with reasoning and tool calling",
+    },
+    # Meituan's LongCat-2.0, served by OpenCode as longcat-2.0-free. Carries the
+    # -free suffix so it is already served; this curated entry gives the
+    # dispatcher its real strengths instead of guessing from the id. 1M-token
+    # context, 131K output, tool calling, reasoning, text-only (confirmed live +
+    # modeled in models.dev: attachment=false, modalities=[text], limit.context=1M).
     "longcat-2.0-free": {
         "vision": False, "reasoning": True, "coding": True, "tool_calls": True,
         "desc": "Meituan 1M-context reasoning model with tool calling; excellent for very long documents and in-depth coding; text-only",
