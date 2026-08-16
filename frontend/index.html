@@ -502,12 +502,13 @@ h1,h2,h3,.display{font-family:var(--font-display);font-weight:600;letter-spacing
 .snippet b{color:var(--accent);font-weight:500}
 
 .rack{display:flex;flex-direction:column}
-.slot{display:grid;grid-template-columns:34px 90px minmax(0,200px) minmax(0,1fr) 74px;align-items:center;
+.slot{display:grid;grid-template-columns:58px 90px minmax(0,200px) minmax(0,1fr) 74px;align-items:center;
   gap:var(--space-sm);padding:9px var(--space-md);border-bottom:var(--rule-hair) solid var(--rule);
   transition:background var(--dur-micro) var(--ease-out)}
 .slot:last-child{border-bottom:none}
 .slot:hover{background:var(--paper-3)}
-.slot .ix{font-family:var(--font-mono);font-size:11px;color:var(--ink-4)}
+.slot .ix{display:flex;align-items:center;gap:6px;white-space:nowrap;
+  font-family:var(--font-mono);font-size:11px;color:var(--ink-4)}
 .slot .pt{font-family:var(--font-mono);font-size:12px;color:var(--ink-2)}
 .slot .ld{display:flex;align-items:center;gap:8px;min-width:0}
 .slot .ld .t{flex:1;height:6px;border-radius:99px;background:var(--paper-4);overflow:hidden;min-width:40px}
@@ -517,7 +518,7 @@ h1,h2,h3,.display{font-family:var(--font-display);font-weight:600;letter-spacing
 .slot .ld .n{font-family:var(--font-mono);font-size:10.5px;color:var(--ink-4);min-width:30px}
 .slot .st{justify-self:end}
 @media (max-width:820px){
-  .slot{grid-template-columns:30px minmax(0,1fr) auto;row-gap:6px}
+  .slot{grid-template-columns:58px minmax(0,1fr) auto;row-gap:6px}
   .slot .ld{grid-column:1 / -1}
 }
 
@@ -752,6 +753,10 @@ h1,h2,h3,.display{font-family:var(--font-display);font-weight:600;letter-spacing
      GET    /api/proxies             total, available, in_cooldown, proxies[]
      GET    /api/warp                count, tools_ready, identities_registered,
                                      proxies_running, base_port, instances[]
+     GET    /api/warp/probe          probed, interval_s, server_time,
+                                     healthy/rate_limited/dead, results[]
+     POST   /api/warp/probe          run the real-model probe + healers now
+     POST   /api/warp/formation      assemble distinct exit lanes now
    ========================================================================== */
 'use strict';
 
@@ -827,9 +832,15 @@ const createKey  = (label) => api('/api/keys', { method:'POST', body:JSON.string
 const revokeKey  = (id) => api('/api/keys/' + encodeURIComponent(id), { method:'DELETE' });
 const getProxies = () => api('/api/proxies');
 const getWarp    = () => api('/api/warp');
-const warpHealth = () => api('/api/warp/health?probe=true');
 const warpRefresh= () => api('/api/warp/refresh', { method:'POST' });
 const warpStart  = () => api('/api/warp/start', { method:'POST' });
+// Real-model probe of every exit, healing rate-limited/dead ones. This — not
+// /api/warp/health — is what the Probe button wants: that endpoint's SOCKS5
+// CONNECT check cannot see a 429, it only proves the tunnel is up.
+const warpProbeNow = () => api('/api/warp/probe', { method:'POST' });
+// Assemble distinct exit lanes (duplicate slots re-rolled onto empty exits,
+// placements verified without spending OpenCode quota).
+const warpFormNow  = () => api('/api/warp/formation', { method:'POST' });
 const chatOnce   = (payload) => api('/v1/chat/completions', { method:'POST', body:JSON.stringify(payload) });
 
 
@@ -906,12 +917,6 @@ async function chatStream(payload, onDelta, opts = {}){
       for (const ln of lines) takeLine(ln);
     }
     if (buf.trim()) takeLine(buf.trim());
-  } catch (err) {
-    // Handle AbortError separately from other errors
-    if (err.name === 'AbortError') {
-      return { lingling: routing, resets };
-    }
-    throw err;
   } finally {
     // Only release lock if stream wasn't already aborted by user
     try {
@@ -931,7 +936,7 @@ const HEAD = {
   console: { kicker:'Transcript',       title:'Console',  lede:'Prompts sent here take the same route your editor does.' },
   ledger:  { kicker:'Recorded traffic', title:'Ledger',   lede:'Updates every 5 seconds. Drag blocks to rearrange.' },
   keys:    { kicker:'Credentials',      title:'Keys',     lede:'Bearer tokens for Codex, Cline, or any OpenAI-compatible client.' },
-  egress:  { kicker:'Exit IPs',         title:'Egress',   lede:'One WARP identity per slot; each carries its own rate-limit budget.' }
+  egress:  { kicker:'Exit IPs',         title:'Egress',   lede:'One lane per exit IP — WARP slots and Tor lanes, each with its own rate-limit budget.' }
 };
 
 const state = {
@@ -1001,7 +1006,8 @@ function renderDeckActions(view){
     ledger:  '<button class="btn" id="act-refresh-usage"><i data-lucide="refresh-cw"></i>Refresh</button>' +
              '<button class="btn danger" id="act-clear-usage"><i data-lucide="trash-2"></i>Clear ledger</button>',
     keys:    '<button class="btn" id="act-refresh-keys"><i data-lucide="refresh-cw"></i>Refresh</button>',
-    egress:  '<button class="btn" id="act-warp-probe"><i data-lucide="stethoscope"></i>Probe</button>' +
+    egress:  '<button class="btn key" id="act-warp-form"><i data-lucide="git-merge"></i>Form lanes</button>' +
+             '<button class="btn" id="act-warp-probe"><i data-lucide="stethoscope"></i>Probe</button>' +
              '<button class="btn danger" id="act-warp-refresh"><i data-lucide="rotate-ccw"></i>Rebuild pool</button>'
   };
   host.innerHTML = sets[view] || '';
@@ -1011,6 +1017,7 @@ function renderDeckActions(view){
   bind('act-refresh-usage',  (e) => { spinBtn(e.currentTarget); loadLedger(true); });
   bind('act-clear-usage',    () => clearLedger());
   bind('act-refresh-keys',   (e) => { spinBtn(e.currentTarget); loadKeys(); });
+  bind('act-warp-form',      () => warpAction('form'));
   bind('act-warp-probe',     () => warpAction('probe'));
   bind('act-warp-refresh',   () => warpAction('refresh'));
 }
@@ -1373,14 +1380,6 @@ function patchLiveTurn(t){
   if (near) box.scrollTop = box.scrollHeight;
   return true;
 }
-function patchLiveRoute(id, routing){
-  const el = liveTurnEl(id);
-  if (!el) return;
-  const gut = el.querySelector('.gut');
-  if (!gut) return;
-  const old = gut.querySelector('.route'); if (old) old.remove();
-  gut.insertAdjacentHTML('beforeend', routeGutter(routing));
-}
 
 /* The backend forwards upstream SSE bytes untouched, so deltas concatenate
    verbatim — no re-spacing, which is what the old build got wrong. */
@@ -1449,13 +1448,22 @@ async function send(){
     .map((t) => ({ role:t.role, content:t.content }));
   const idx = state.turns.length - 1;
   let got = false;
+  // The tape can be wiped mid-flight (btn-wipe stops the stream, but the
+  // abort still unwinds through here). Writing through the captured index
+  // into a wiped — possibly refilled — array resurrected a ghost turn at
+  // completion. Every write re-checks the turn is still ours.
+  const liveTurn = () => {
+    const t = state.turns[idx];
+    return (t && t.id === id) ? t : null;
+  };
 
   try {
     const data = await chatStream(
       { model: $('model-select').value, messages: wire },
       ({ content:c, reasoning:r }) => {
         got = true;
-        const cur = state.turns[idx] || { role:'assistant' };
+        const cur = liveTurn();
+        if (!cur) return;
         cur.content = joinDelta(cur.content || '', c || '');
         cur.reasoning = joinDelta(cur.reasoning || '', r || '');
         cur.typing = false;
@@ -1468,7 +1476,8 @@ async function send(){
         // not match the partial word-for-word, so the partial is discarded
         // rather than appended to, and the turn is labelled.
         onReset: (info) => {
-          const cur = state.turns[idx] || { role:'assistant' };
+          const cur = liveTurn();
+          if (!cur) return;
           cur.content = '';
           cur.reasoning = '';
           cur.typing = true;
@@ -1486,43 +1495,51 @@ async function send(){
         }
       }
     );
-    state.turns[idx] = { ...state.turns[idx], typing:false, routing:data.lingling || null };
-    renderTape();
-    state.lastRoute = data.lingling || null;
-    renderLastRoute();
-    showConsoleRoute(data.lingling);
-    announce('Answer complete.');
+    if (liveTurn()) {
+      state.turns[idx] = { ...state.turns[idx], typing:false, routing:data.lingling || null };
+      renderTape();
+      state.lastRoute = data.lingling || null;
+      renderLastRoute();
+      showConsoleRoute(data.lingling);
+      announce('Answer complete.');
+    }
   } catch(e) {
     if (e && e.name === 'AbortError') {
       // A stop is a user action: keep whatever arrived, mark it, no error.
-      const cur = state.turns[idx] || {};
-      state.turns[idx] = { ...state.turns[idx], typing:false, stopped:true };
-      // If nothing arrived at all the turn would render as a silent blank,
-      // which reads like the assistant ignored the user.  Say what happened.
-      if (!cur.content && !cur.reasoning) {
-        state.turns[idx].content = '[Request stopped before the model answered.]';
+      const cur = liveTurn();
+      if (cur) {
+        state.turns[idx] = { ...cur, typing:false, stopped:true };
+        // If nothing arrived at all the turn would render as a silent blank,
+        // which reads like the assistant ignored the user.  Say what happened.
+        if (!cur.content && !cur.reasoning) {
+          state.turns[idx].content = '[Request stopped before the model answered.]';
+        }
+        announce('Request stopped.');
       }
-      announce('Request stopped.');
     } else if (!got) {
       // Stream never opened. Retry once non-streaming so the operator still
       // gets an answer (and a real error if the gateway is genuinely down).
       try {
         const data = await chatOnce({ model: $('model-select').value, messages: wire });
         const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
-        state.turns[idx] = {
-          ...state.turns[idx], typing:false,
-          content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? ''),
-          reasoning: msg.reasoning_content || msg.reasoning || '',
-          routing: data.lingling || null
-        };
+        if (liveTurn()) {
+          state.turns[idx] = {
+            ...state.turns[idx], typing:false,
+            content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? ''),
+            reasoning: msg.reasoning_content || msg.reasoning || '',
+            routing: data.lingling || null
+          };
+        }
         state.lastRoute = data.lingling || null;
         renderLastRoute();
         showConsoleRoute(data.lingling);
       } catch(e2) {
-        state.turns[idx] = { ...state.turns[idx], typing:false, error: e2.message };
+        if (liveTurn()) {
+          state.turns[idx] = { ...state.turns[idx], typing:false, error: e2.message };
+        }
         announce('Request failed: ' + e2.message);
       }
-    } else {
+    } else if (liveTurn()) {
       state.turns[idx] = { ...state.turns[idx], typing:false, error:'Stream interrupted — ' + e.message };
       announce('Stream interrupted.');
     }
@@ -2188,6 +2205,10 @@ function redrawGrids(){
 
 function watchGridWidth(grid, el){
   if (!el || typeof ResizeObserver === 'undefined') return;
+  // The catalog grid host persists across refetches, and each build attached a
+  // new observer to it — every manual refresh pinned another live observer
+  // (and a destroyed grid) for the session. Drop the previous one first.
+  if (el._gridRO) el._gridRO.disconnect();
   let last = el.clientWidth;
   const ro = new ResizeObserver(() => {
     const w = el.clientWidth;
@@ -2198,6 +2219,7 @@ function watchGridWidth(grid, el){
     }
   });
   ro.observe(el);
+  el._gridRO = ro;
 }
 
 window.addEventListener('resize', () => {
@@ -2570,14 +2592,23 @@ function buildLog(recent){
    poll, so the figures, charts and share strips stay current without the
    client recomputing anything.
    ========================================================================== */
+// Full fetch and incremental poll write the same state (including the
+// high-water row id); without sequencing, a slow full load landing after a
+// fast poll rolled the mark back and dropped the polled row from the rebuilt
+// grid until the next tick — the same overlap class the egress view guards
+// against with egressSeq.
+let ledgerSeq = 0;
+
 async function loadLedger(force){
   const host = $('board');
   if (!host) return;
   if (force || !host.dataset.built) {
     host.innerHTML = '<div class="load"><span class="spin"></span>reading the ledger…</div>';
   }
+  const seq = ++ledgerSeq;
   try {
     const u = await getUsage(500);
+    if (seq !== ledgerSeq) return;   // a newer load/poll already rendered
     state.summary = u.summary || null;
     state.recent = u.recent || [];
     state.live = u.live || [];
@@ -2598,8 +2629,10 @@ async function loadLedger(force){
 }
 
 async function pollLedger(){
+  const seq = ++ledgerSeq;
   try {
     const u = await api('/api/usage/since/' + state.lastRowId);
+    if (seq !== ledgerSeq) return;   // a full load is re-rendering; skip
     const rows = u.rows || [];
     state.summary = u.summary || state.summary;
     state.live = u.live || state.live;
@@ -2875,10 +2908,17 @@ async function dropKey(id){
 function copy(text, btn){
   const done = () => {
     if (!btn) return;
+    // A second click during the 1.4s restore window captured the "Copied"
+    // markup as the "original", leaving the button mislabelled for good.
+    if (btn.dataset.copying === '1') return;
+    btn.dataset.copying = '1';
     const old = btn.innerHTML;
     btn.innerHTML = '<i data-lucide="check"></i>Copied';
     icons(btn);
-    setTimeout(() => { btn.innerHTML = old; icons(btn); }, 1400);
+    setTimeout(() => {
+      btn.innerHTML = old; icons(btn);
+      delete btn.dataset.copying;
+    }, 1400);
   };
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(done).catch(() => legacyCopy(text, done));
@@ -2913,8 +2953,9 @@ function gaugeSVG(avail, total){
   '</svg>';
 }
 
-function slotRow(s, probeById){
+function slotRow(s, probeById, laneOf){
   probeById = probeById || {};
+  laneOf = laneOf || {};
   // #-prefixed label for every slot, whether it arrived as a pool proxy
   // (`id: "warp-1"`) or as a bare warp instance (`index: 1`). Before, the
   // pool-backed slots rendered "#1" while instance-only slots rendered "1",
@@ -2926,6 +2967,7 @@ function slotRow(s, probeById){
   // Check probe results for this proxy.
   const probeResult = probeById[s.id] || probeById[`warp-${rawIdx}`];
   const probeStatus = probeResult ? probeResult.status : null;
+  const probeLat = probeResult ? Math.round(probeResult.latency_ms || 0) : 0;
   const cooling = !!s.in_cooldown;
   const fails = s.consecutive_failures || 0;
   const up = s.alive ?? s.running ?? (!cooling && fails <= 2);
@@ -2934,6 +2976,18 @@ function slotRow(s, probeById){
   // Cooldown and probe state drive the chip. A probe result (rate-limited /
   // dead) takes precedence because it reflects a real request outcome; a
   // cooling badge or up/down state is shown only when no probe flag applies.
+  // Latency, exit IP and any upstream error live in the tooltip — the chip
+  // stays one short word so it never grows over its column. The lane chip
+  // names the grouping outright (L1, L2, ...).
+  const tipBits = [];
+  if (probeResult && probeResult.exit_ip) tipBits.push('exit ' + probeResult.exit_ip);
+  if (probeStatus === 'ok' && probeLat) tipBits.push(probeLat + 'ms');
+  if (probeResult && probeResult.error) tipBits.push(probeResult.error);
+  const chipTitle = tipBits.length ? ' title="' + esc(tipBits.join(' · ')) + '"' : '';
+  const lane = probeResult && probeResult.exit_ip ? laneOf[probeResult.exit_ip] : '';
+  const laneChip = lane
+    ? '<span class="chip" style="min-width:0;padding:2px 7px" title="exit lane">' + esc(lane) + '</span>'
+    : '';
   const probeChip = probeStatus === 'rate_limited'
     ? '<span class="chip bad"><span class="dot"></span>rate-limited</span>'
     : (probeStatus === 'dead'
@@ -2941,10 +2995,11 @@ function slotRow(s, probeById){
       : '');
   const chip = probeChip || (cooling
     ? '<span class="chip warn"><span class="dot"></span>cooling ' + Number(s.cooldown_remaining_s || 0).toFixed(0) + 's</span>'
-    : (up ? '<span class="chip ok"><span class="dot"></span>up</span>'
-          : '<span class="chip bad"><span class="dot"></span>down</span>'));
-  return '<div class="slot">' +
-    '<span class="ix">' + esc(idx) + '</span>' +
+    : (up
+      ? '<span class="chip ok"><span class="dot"></span>up</span>'
+      : '<span class="chip bad"><span class="dot"></span>down</span>'));
+  return '<div class="slot"'+ chipTitle + '>' +
+    '<span class="ix">' + esc(idx) + laneChip + '</span>' +
     '<span class="pt">:' + esc(port) + '</span>' +
     '<span class="ld"><span class="t"><i class="' + (cooling ? 'cool' : '') +
       '" style="width:' + loadPct + '%"></i></span><span class="n">' + load.toFixed(1) + '</span></span>' +
@@ -2975,22 +3030,34 @@ function retimeEgressPoll(cooling){
 }
 
 
-async function getProbe(){
-  const r = await fetch('/api/warp/probe');
-  if (!r.ok) throw new Error(r.status);
-  return r.json();
+// Polls can outlive their successors: while cooling, loadEgress fires every
+// second, and a slow earlier response landing after a fast later one would
+// roll the rack back to stale data. Every render claims a sequence number and
+// ignores itself if a newer poll has started meanwhile.
+let egressSeq = 0;
+
+function fmtAge(s){
+  if (s < 90) return s + 's';
+  if (s < 5400) return Math.round(s / 60) + 'm';
+  return (s / 3600).toFixed(1) + 'h';
 }
 
 async function loadEgress(){
   const zone = $('egress-zone');
   if (!zone) return;
+  const seq = ++egressSeq;
   if (!zone.dataset.built) zone.innerHTML = '<div class="load"><span class="spin"></span>probing the pool…</div>';
   try {
     const [warp, pool, probe] = await Promise.all([
       getWarp().catch(() => null),
       getProxies().catch(() => null),
-      getProbe().catch(() => null),
+      api('/api/warp/probe').catch(() => null),
     ]);
+    // A single failed source degrades the view; all three failing means the
+    // backend is gone, and rendering "0 of 0 exits" would read as "pool
+    // empty" — a very different (and wrong) message.
+    if (!warp && !pool && !probe) throw new Error('backend unreachable');
+    if (seq !== egressSeq) return;   // a newer poll already rendered
     const total = (pool && (pool.total ?? (pool.proxies || []).length)) || 0;
     const avail = (pool && (pool.available ?? 0)) || 0;
     const cool = (pool && (pool.in_cooldown ?? 0)) || 0;
@@ -3003,6 +3070,16 @@ async function loadEgress(){
     if (probe && probe.probed && probe.results) {
       probe.results.forEach(r => probeById[r.proxy_id] = r);
     }
+    // Lane labels, built before anything below uses them: slots on the same
+    // exit share a lane (and its rate-limit budget), so exits are numbered
+    // L1..Ln and the rack groups by that label. (Declaring this after the
+    // sort that reads it crashed every Egress render — TDZ — until the
+    // browser test caught it.)
+    const laneOf = {};
+    [...new Set(Object.values(probeById)
+      .filter(r => r && r.exit_ip).map(r => r.exit_ip))].sort()
+      .forEach((ip, i) => { laneOf[ip] = 'L' + (i + 1); });
+    const exitCount = Object.keys(laneOf).length;
 
     // Always use warp instances as the base for the identity rack so the
     // real-time `running` field (from _is_running()) is never lost.  Pool
@@ -3013,19 +3090,58 @@ async function loadEgress(){
     const poolById = {};
     if (pool && pool.proxies) pool.proxies.forEach(p => poolById[p.id] = p);
     const baseInstances = (warp && warp.instances) || [];
+    const warpIds = new Set(baseInstances.map(i => "warp-" + i.index));
     const slots = baseInstances.map(inst => {
       const pp = poolById["warp-" + inst.index];
       return pp ? Object.assign({}, pp, { running: inst.running }) : inst;
     });
+    // Non-WARP lanes (Tor exits, user-added SOCKS proxies) get rack rows too —
+    // they are real lanes with their own exit IPs and rate-limit budgets.
+    (pool && pool.proxies || []).forEach(p => {
+      if (!warpIds.has(p.id)) slots.push(p);
+    });
+    // Rack order follows lanes: slots sharing an exit sit together, which is
+    // the grouping that matters when one lane's IP burns.
+    const laneSortKey = (s) => {
+      const pid = s.id || ("warp-" + s.index);
+      return laneOf[(probeById[pid] || {}).exit_ip] || 'Z';
+    };
+    slots.sort((a, b) => {
+      const la = laneSortKey(a), lb = laneSortKey(b);
+      if (la !== lb) return la < lb ? -1 : 1;
+      const na = a.index ?? 999, nb = b.index ?? 999;
+      return na === nb ? String(a.id || '').localeCompare(String(b.id || '')) : na - nb;
+    });
 
-    // Probe summary for the pool health block.
-    const probeHealth = probe && probe.probed
-      ? '<div class="vital"><span class="k">startup probe</span><span class="v">' +
+    // Probe summary for the pool health block, with freshness. Age comes from
+    // the server's own clock (server_time), so a client clock skew can't make
+    // a just-finished probe read as minutes old. The distinct-exit count is
+    // the pool's real capacity: identities sharing one exit IP share one
+    // rate-limit budget, so "10 slots, 2 exits" means 2 usable lanes.
+    let probeHealth = '';
+    if (probe && probe.probed && probe.completed_at != null) {
+      const ageS = probe.server_time != null
+        ? Math.max(0, Math.round(probe.server_time - probe.completed_at)) : null;
+      const cadence = probe.interval_s > 0
+        ? ' · every ' + (probe.interval_s >= 60
+            ? (probe.interval_s / 60 >= 10 ? Math.round(probe.interval_s / 60) : (probe.interval_s / 60).toFixed(1)) + 'm'
+            : Math.round(probe.interval_s) + 's')
+        : '';
+      probeHealth = '<div class="vital"><span class="k">exit probe</span><span class="v">' +
           probe.healthy + '/' + probe.total + ' healthy' +
           (probe.rate_limited ? ', ' + probe.rate_limited + ' rate-limited' : '') +
           (probe.dead ? ', ' + probe.dead + ' dead' : '') +
-          '</span></div>'
-      : '';
+          (ageS != null ? ' · ' + fmtAge(ageS) + ' ago' : '') +
+          cadence + '</span></div>' +
+        '<div class="vital"><span class="k">exit lanes</span><span class="v' +
+          (exitCount && exitCount < probe.total ? ' hot' : '') + '">' +
+          (exitCount ? exitCount + ' across ' + probe.total + ' slots' : '—') +
+          (exitCount < probe.total ? ' — Form lanes to spread' : '') +
+          '</span></div>';
+    } else if (probe && probe.probed === false) {
+      probeHealth = '<div class="vital"><span class="k">exit probe</span>' +
+          '<span class="v">not run yet</span></div>';
+    }
 
     // Speed the poll up while anything is cooling so the countdown is
     // watchable, during the first 30s of the page so startup changes are
@@ -3060,7 +3176,7 @@ async function loadEgress(){
               configured + ' identities. One-time.</span></div>'
             : '') +
           '<div class="bb flush">' +
-            (slots.length ? '<div class="rack">' + slots.map(s => slotRow(s, probeById)).join('') + '</div>'
+            (slots.length ? '<div class="rack">' + slots.map(s => slotRow(s, probeById, laneOf)).join('') + '</div>'
                           : '<div class="empty">No exits in the pool.</div>') +
           '</div>' +
         '</div>' +
@@ -3071,28 +3187,45 @@ async function loadEgress(){
     // poll rate — startup changes (wireproxy coming up) should be visible
     // instantly at 1s, not every 8s.
     if (!zone.dataset.egressBootDone) {
-      setTimeout(() => { zone.dataset.egressBootDone = '1'; retimeEgressPoll(cool > 0); }, 30000);
+      // Re-derive from current state, not the `cool` snapshot taken at first
+      // render: a cooldown that started inside the boot window must not be
+      // cancelled by this timer, or the 1s countdown poll drops to 8s mid-drain.
+      setTimeout(() => {
+        zone.dataset.egressBootDone = '1';
+        retimeEgressPoll(state.egressCooling);
+      }, 30000);
     }
     const start = $('act-warp-start');
     if (start) start.addEventListener('click', () => warpAction('start'));
   } catch(e) {
+    if (seq !== egressSeq) return;   // a newer poll already rendered
+    zone.dataset.built = '1';
     zone.innerHTML = '<div class="empty">Egress unavailable — ' + esc(e.message) + '</div>';
   }
 }
 
 async function warpAction(kind){
-  const ids = { probe:'act-warp-probe', refresh:'act-warp-refresh', start:'act-warp-start' };
+  const ids = { probe:'act-warp-probe', refresh:'act-warp-refresh', start:'act-warp-start',
+                form:'act-warp-form' };
   const btn = $(ids[kind]);
   const old = btn ? btn.innerHTML : '';
   // Rebuilding wipes every registered identity — irreversible, so confirm.
   if (kind === 'refresh' && !window.confirm(
       'Rebuild the pool?\n\nThis stops every wireproxy, deletes all WARP identity ' +
       'directories, and re-registers them from scratch. In-flight requests will fail.')) return;
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span>' + kind + '…'; }
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span>' +
+    (kind === 'form' ? 'forming' : kind) + '…'; }
   try {
     if (kind === 'refresh') await warpRefresh();
     else if (kind === 'start') await warpStart();
-    else await warpHealth();
+    else if (kind === 'form') {
+      // Formation runs in the background (minutes of tunnel restarts);
+      // the endpoint returns immediately, so give the first moves a moment
+      // to land before reloading — the 8s poll picks up the rest.
+      await warpFormNow();
+      await new Promise(r => setTimeout(r, 15000));
+    }
+    else await warpProbeNow();
     delete $('egress-zone').dataset.built;
     await loadEgress();
     await loadTelemetry();
@@ -3114,11 +3247,27 @@ promptBox.addEventListener('keydown', (e) => {
   // Esc from the composer stops an in-flight request without losing focus.
   if (e.key === 'Escape' && state.sending) { e.preventDefault(); stopSending(); }
 });
+// The Stop control promises "(Esc)", but focus is often elsewhere (model
+// picker, a copied chip) by the time a long answer is running. Catch Esc
+// anywhere except while typing in another field.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !state.sending) return;
+  const t = e.target;
+  if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) {
+    if (t !== promptBox) return;   // their own Esc handling wins
+  }
+  e.preventDefault();
+  stopSending();
+});
 $('btn-send').addEventListener('click', () => {
   // One control, two jobs: Stop while in flight, Send otherwise.
   if (state.sending) stopSending(); else send();
 });
 $('btn-wipe').addEventListener('click', () => {
+  // Stop any in-flight turn first. Clearing the array alone left the stream
+  // running, and its captured index then re-grew the emptied array from the
+  // abort unwinding — a ghost answer with no prompt reappeared at completion.
+  if (state.sending) stopSending();
   state.turns = [];
   showConsoleRoute(null);
   renderTape();

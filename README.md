@@ -9,7 +9,7 @@ flowchart LR
         E["Your editor<br/>Cline · Codex · Claude Code"]
         L["Lingling<br/>127.0.0.1:8000"]
     end
-    P["Egress pool<br/>rotating WARP exit IPs"]
+    P["Egress pool<br/>WARP exits + Tor lanes"]
     O["OpenCode<br/>free models"]
     E -->|"OpenAI · Responses · Anthropic"| L
     L --> P
@@ -52,9 +52,9 @@ pip install -r requirements.txt
 python app.py
 ```
 
-`start.bat` does the same thing *and* sets up the WARP egress pool for you. Its
-first run downloads two small tools, so give it a moment; every run after that
-starts immediately.
+`start.bat` does the same thing *and* sets up the egress pool for you. Its
+first run downloads the WARP tools plus a ~25 MB Tor bundle, so give it a few
+minutes; every run after that starts fast.
 
 Lingling asks for an API key by default. If it's just you on your own machine and
 that feels like ceremony, start it with `LINGLING_REQUIRE_KEY=0` and skip the key
@@ -165,9 +165,10 @@ behind your back.
 
 ## Which models you get
 
-Whatever's free right now. There's deliberately no list in this README, because
-any list would be wrong within a month — a model was dropped from the free tier
-while these docs were being written, and nothing on your end needed to change.
+Whatever's free right now. There's deliberately no model table in this README,
+because any list would be wrong within a month. The catalog is fetched from the
+upstream at runtime, while a small configurable retired-model seed prevents known
+dead listings from appearing on a fresh install.
 
 The dashboard's **Catalog** view is the live answer. Everything below is how it
 stays live:
@@ -180,9 +181,11 @@ flowchart LR
     C --> R["lingling-auto<br/>router"]
 ```
 
-No model id, context size, capability, or effort level is hardcoded anywhere. New
-free models simply appear on the next refresh; retired ones drop out. A model that
-vanishes mid-request fails over to another free one.
+Model ids, context sizes, capabilities, and effort levels are discovered from the
+upstream catalog and models.dev metadata. The dispatcher model and retired-model
+seed are configuration defaults, not a frozen catalog. New free models appear on
+the next refresh; retired ones drop out. A model that vanishes mid-request fails
+over to another free one.
 
 ### The retirement cycle
 
@@ -300,8 +303,13 @@ gateway. Skip this section unless something specific needs changing.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `LINGLING_WARP_COUNT` | `10` | How many WARP identities to register |
+| `LINGLING_WARP_COUNT` | `10` | How many WARP identities to register (slots; lanes = distinct exits the PoP offers) |
 | `LINGLING_PROBE_ON_STARTUP` | `1` | Send a real model request through each WARP proxy at startup to detect rate-limited/dead IPs |
+| `LINGLING_PROBE_INTERVAL_S` | `300` | The daemon re-runs the real-model probe + healers on this cadence |
+| `LINGLING_WARP_FORM_ON_STARTUP` | `1` | Assemble distinct exit lanes after the startup probe |
+| `LINGLING_TOR_ENABLED` | `1` | Run Tor egress lanes beside WARP (zero-account exit IPs; first run downloads Tor itself) |
+| `LINGLING_TOR_COUNT` | `3` | How many Tor lanes to run (each is one random exit IP; a restart rotates it) |
+| `LINGLING_WARP_ENDPOINTS` | curated list | Cloudflare edges used for tunnel re-rolls (comma-separated) |
 | `LINGLING_PROBE_MODEL` | *(a free model)* | Model used for the startup probe |
 | `LINGLING_PROBE_TIMEOUT` | `15` | Timeout (s) for each startup probe request |
 
@@ -399,35 +407,80 @@ mid-turn. One where you named a model never will.
 A stream that goes quiet *without* dying is a different failure, and gets cut off
 after `LINGLING_STREAM_IDLE_TIMEOUT` rather than hanging your session forever.
 
-### Keeping the egress pool warm
+### The egress pool: lanes, not lies
 
-Nothing here needs your attention; it's listed so you know what the Egress view is
-showing you.
+Nothing here needs your attention; it's listed so you know what the Egress
+view is showing you. But one fact first, because it's easy to get wrong:
+**a WARP identity is not an exit IP.** Your local Cloudflare PoP owns a small
+set of public exits — on the network this was built on, somewhere between two
+and five depending on the hour — and every tunnel lands on one when it comes
+up. Ten identities can share one address. So Lingling counts what actually
+carries traffic, **lanes**, and assembles them from two free sources that
+need no account:
+
+| Source | Default | Distinct exits | Rotation |
+|---|---|---|---|
+| **WARP** | 10 slots | 2–5 — whatever your Cloudflare PoP offers right now | tunnel re-roll (~4s, no re-registration) |
+| **Tor** | 3 lanes | one per lane, always distinct | restart the lane (~seconds, fresh route) |
+| **Any SOCKS proxy** | — | one per proxy you add | yours |
 
 ```mermaid
 flowchart TD
-    BOOT(["Startup probe:<br/>a real request through every proxy"]) --> J{"how did<br/>each one do?"}
+    BOOT(["Startup probe:<br/>a real request through every lane"]) --> J{"how did<br/>each one do?"}
     J -->|"healthy"| POOL["in the pool"]
-    J -->|"tunnel expired /<br/>IP unreachable"| H1["expired-IP healer<br/><i>regenerate the identity</i>"]
-    J -->|"HTTP 429"| H2["rate-limited healer<br/><i>drop it, register a new one</i>"]
+    J -->|"tunnel dead"| H1["identity healer<br/><i>regenerate (the only<br/>time this happens)</i>"]
+    J -->|"HTTP 429"| H2["exit healer<br/><i>re-roll the tunnel off<br/>the burned IP</i>"]
+    J -->|"Tor lane burned"| H3["rotate<br/><i>restart = fresh route</i>"]
     H1 --> POOL
     H2 --> POOL
-    POOL -->|"health check on a timer"| J
+    H3 --> POOL
+    POOL -->|"tunnel checks every 60s<br/>real probe every 5min"| J
+    POOL --> FORM["lane formation:<br/>duplicates re-rolled onto<br/>exits nobody is using"]
+    FORM --> POOL
 ```
 
-Probe results land in the dashboard's Egress view, plus one summary row in the
-Ledger so you can see what happened at a glance. Both healers replace a bad slot
-rather than shrinking the pool, so a slot is never permanently lost.
+Three mechanics keep the lanes real:
+
+* **A learned edge→exit map.** Which exit a WARP tunnel gets depends on which
+  Cloudflare edge it enters through. Every roll is recorded, so healing and
+  formation aim at known edges instead of re-rolling blind.
+* **Re-roll, don't re-register.** A burned exit heals by re-establishing the
+  tunnel — free and seconds. Cloudflare registrations are only spent when a
+  tunnel is genuinely dead, and OpenCode quota is never spent placing lanes
+  (verification runs through Cloudflare's own endpoint).
+* **Truth on the dashboard.** The Egress view shows each lane's exit IP and a
+  live **exit lanes** count — "5 slots on 1 address" can never masquerade as
+  "5 exits" again. When every lane is burned at once, the healer waits on the
+  upstream's reset window instead of churning, and held requests get SSE
+  keepalives so your client doesn't give up.
+
+Want more lanes? Raise `LINGLING_TOR_COUNT` (each Tor lane is one always-
+distinct exit at ~63 MB RAM), or add any SOCKS5 proxy from the dashboard —
+each is one guaranteed lane.
 
 ## Where things stand
 
-Everything in this README is built and exercised end-to-end — this isn't a roadmap
-document. The test suite covers it: hermetic unit tests plus live integration
-against the real free tier, 143 tests, no failures.
+Everything in this README describes implemented behavior, not a roadmap. The test
+suite currently collects 200 tests, including hermetic unit tests and optional live
+integration checks against the real free tier. The hermetic suite is the repeatable
+deployment gate; live checks require network access and an available upstream tier.
 
-One security note worth stating plainly: the WARP bootstrap and both one-click
-setups download their tools over verified TLS only, and a failed download never
-quietly disables certificate checking process-wide.
+From the repository root, run the repeatable suite from `backend` so the package
+imports resolve correctly:
+
+```text
+cd backend
+python -m pytest tests/ -q
+```
+
+The launcher creates local runtime state under `backend/data/`. That directory is
+ignored by Git and must not be copied into a release: it can contain issued API
+keys, usage history, WARP identity keys, Tor state, and downloaded binaries. A
+fresh download creates an empty state directory on first start.
+
+One security note worth stating plainly: the WARP bootstrap, the Tor download
+and both one-click setups fetch their tools over verified TLS only, and a
+failed download never quietly disables certificate checking process-wide.
 
 ---
 
@@ -450,7 +503,7 @@ flowchart TB
     end
     subgraph out["Transport"]
         PR["providers/<br/><i>keys, proxies, httpx pools</i>"]
-        WA["warp/<br/><i>identities, healers, probe</i>"]
+        WA["warp/<br/><i>exits, lanes, healers</i>"]
     end
     CB --> DI
     AB --> DI
@@ -470,8 +523,12 @@ flowchart TB
 | Effort | `backend/routing/effort.py` | Rank-based effort translation |
 | Codex bridge | `backend/routing/responses_bridge.py` | Responses ↔ chat completions |
 | Claude bridge | `backend/claudecode/` | Anthropic Messages ↔ chat completions |
-| WARP | `backend/warp/` | Identity manager, auto-healing health daemon, kill-on-close job |
-| Probe | `backend/warp/probe.py` | Startup probe + expired/rate-limited healers |
+| WARP | `backend/warp/manager.py` | WARP identity lifecycle + tunnel re-rolls |
+| Tor lanes | `backend/warp/tor_egress.py` | Zero-account Tor exit lanes |
+| Probe + healers | `backend/warp/probe.py` | Real-model probe, exit healer, lane spreading |
+| Egress map | `backend/warp/egress_map.py` | Learned Cloudflare edge → exit map |
+| Lane formation | `backend/warp/formation.py` | Assembles distinct exits on purpose |
+| Health daemon | `backend/warp/health.py` | Periodic checks, healing, probe cadence |
 | Usage | `backend/usage/store.py` | SQLite request ledger |
 | Dashboard | `frontend/` | Single-page app |
 
@@ -492,7 +549,9 @@ flowchart TB
 | GET/POST/DELETE | `/api/keys` | 🔒 | Issue / list / revoke `ll_` keys |
 | GET/POST | `/api/proxies` | 🔒 | Egress pool status / add |
 | GET | `/api/warp` | 🔒 | WARP status |
-| POST | `/api/warp/setup\|start\|refresh\|health` | 🔒 | WARP lifecycle |
+| POST | `/api/warp/setup\|start\|stop\|refresh` | 🔒 | WARP lifecycle |
+| GET/POST | `/api/warp/probe` | 🔒 | Latest real-model probe / run it now |
+| POST | `/api/warp/formation` | 🔒 | Assemble distinct exit lanes now |
 
 ### Auth
 
