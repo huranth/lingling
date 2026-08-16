@@ -1850,6 +1850,7 @@ def _fake_warp(count):
         def __init__(self, n):
             self.instances = [Inst(i + 1, 51001 + i) for i in range(n)]
             self.regenerated = []
+            self.rerolled = []
 
         def regenerate_instance(self, inst, log=None):
             self.regenerated.append(inst.index)
@@ -1857,6 +1858,10 @@ def _fake_warp(count):
 
         def restart_instance(self, inst, log=None):
             return True
+
+        def re_roll_tunnel(self, inst, attempt=0, log=None):
+            self.rerolled.append(inst.index)
+            return "162.159.192.1"
 
     return Warp(count)
 
@@ -1872,17 +1877,14 @@ def _daemon(warp, pool, min_healthy=None):
 def test_unit_a_dumped_identity_rejoins_the_pool_in_the_same_cycle():
     """A recycled exit must be back in the pool before the cycle ends.
 
-    `_check_and_heal` health-checks everything into `results`, then dumps burned
-    identities, then calls `_sync_pool(results)`. Regeneration replaces the
-    identity wholesale, so any entry it touched is stale by the time the sync
-    reads it -- and `_dump_burned_identities` has already removed that proxy from
-    the pool. An exit whose stale entry said "unhealthy" was therefore removed
-    and never re-added, even though the regeneration had just fixed it.
-
-    Nothing else in the cycle covers that: `_ensure_min_healthy` only runs when
-    `healthy_count < min_healthy`, so a pool that still met its floor left the
-    recycled exit stranded outside the routing pool until some later cycle
-    happened to re-measure it.
+    The burn lives on the tunnel's exit IP, not the identity, so the dump
+    re-rolls the tunnel (endpoint rotation + restart) rather than spending a
+    Cloudflare registration. Three things must hold when it fires: the slot's
+    tunnel is re-established, its stale burn counters are zeroed (they
+    describe an address it no longer uses, and would push it straight back
+    over the dump threshold), and the proxy never leaves the pool -- the old
+    remove-then-regenerate handoff could strand a fixed exit outside the
+    routing pool until a later cycle re-measured it.
     """
     from warp import health as health_mod
 
@@ -1898,23 +1900,20 @@ def test_unit_a_dumped_identity_rejoins_the_pool_in_the_same_cycle():
     px = pool.get_by_id("warp-1")
     for _ in range(health_mod.MAX_429_TOTAL):
         pool.mark_failure(px, 429)
+    assert px.total_429 >= health_mod.MAX_429_TOTAL
 
-    # #1 reads unhealthy until something regenerates it -- which is the state a
-    # burned exit is actually in. Healing is stubbed out so the only thing that
-    # can repair it is the dump in step 3, isolating the dump -> sync handoff.
     daemon._heal_instance = lambda inst: None  # noqa: SLF001
-    daemon._health_check = lambda inst: {  # noqa: SLF001
-        "healthy": inst.index != 1 or 1 in warp.regenerated,
-        "index": inst.index,
-    }
+    daemon._health_check = lambda inst: {"healthy": True, "index": inst.index}  # noqa: SLF001
 
     result = daemon.check_and_heal()
 
-    assert 1 in warp.regenerated, warp.regenerated
+    assert 1 in warp.rerolled, warp.rerolled
     assert result["dumped"] == 1, result
-    # The regenerated exit is back in the pool, not stranded outside it.
-    assert pool.get_by_id("warp-1") is not None, \
-        "a dumped-and-regenerated identity never rejoined the pool"
+    # The re-rolled exit stayed in the pool the whole time.
+    after = pool.get_by_id("warp-1")
+    assert after is not None, "a re-rolled exit was dropped from the pool"
+    # Its burn counters were reset with the new exit IP.
+    assert after.total_429 == 0 and after.consecutive_failures == 0
     # And the gauge the dashboard draws agrees with the identity count.
     assert result["pool"]["total"] == 3, result["pool"]
     assert result["pool"]["available"] == 3, result["pool"]
@@ -2203,11 +2202,17 @@ def test_unit_warp_burn_history_survives_a_flapping_exit():
     assert after.total_429 == burned, \
         f"burn history reset across the flap: {burned} -> {after.total_429}"
 
-    # One more 429 crosses the threshold, and the identity is recycled.
+    # One more 429 crosses the threshold, and the tunnel is re-rolled onto a
+    # fresh exit (the burn is on the exit IP, not the identity). The proxy
+    # stays in the pool — only the tunnel behind it changed — and its burn
+    # counters restart from zero because they describe an address it no
+    # longer egresses from.
     pool.mark_failure(after, 429)
     assert daemon._dump_burned_identities() == 1, "a burned identity must be dumped"
-    assert warp.regenerated == [1], warp.regenerated
-    assert pool.get_by_id("warp-1") is None, "a dumped identity leaves the pool"
+    assert warp.rerolled == [1], warp.rerolled
+    recycled = pool.get_by_id("warp-1")
+    assert recycled is not None, "a re-rolled exit must stay in the pool"
+    assert recycled.total_429 == 0 and recycled.consecutive_failures == 0
 
 
 def test_unit_warp_minimum_healthy_never_exceeds_the_identity_count():

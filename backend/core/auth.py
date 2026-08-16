@@ -16,7 +16,7 @@ import secrets
 import time
 from typing import Optional, Tuple
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 
 from core import api_keys
 from core import config
@@ -81,25 +81,6 @@ def identify(request: Request) -> Tuple[bool, str]:
     if api_keys.validate(presented_key(request)):
         return True, "api-key"
     return False, "anonymous"
-
-
-def require(request: Request) -> str:
-    """Authorise a request or raise 401. Returns the actor.
-
-    With ``config.REQUIRE_API_KEY`` off the gate is open (documented single-user
-    local mode); the actor is still reported for logging.
-    """
-    ok, actor = identify(request)
-    if ok:
-        return actor
-    if not config.REQUIRE_API_KEY:
-        return "open"
-    raise HTTPException(
-        401,
-        "Unauthorised. Browser clients: load the dashboard at / to obtain a "
-        "session. API clients: create a key at POST /api/keys and send it as "
-        "'Authorization: Bearer ll_...' (or 'x-api-key: ll_...').",
-    )
 
 
 def allowed_origins() -> list:

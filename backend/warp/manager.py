@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import socket
@@ -26,11 +27,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from core import config
 from warp import job
 
 # Cloudflare WARP WireGuard constants (public, fixed for all WARP peers).
 WARP_PEER_PUBLIC_KEY = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 WARP_ENDPOINT = "engage.cloudflareclient.com:2408"
+WARP_ENDPOINT_PORT = WARP_ENDPOINT.rsplit(":", 1)[1]
 WARP_DNS = "1.1.1.1, 1.0.0.1"
 
 WGCF_REPO = "ViRb3/wgcf"
@@ -705,6 +708,54 @@ class WarpManager:
         except Exception as exc:  # noqa: BLE001
             log(f"[warp] regenerate_instance #{inst.index}: restart after regen failed: {exc}")
             return False
+
+    def re_roll_tunnel(
+        self,
+        inst: WarpInstance,
+        attempt: int = 0,
+        endpoint: Optional[str] = None,
+        log=print,
+    ) -> Optional[str]:
+        """Re-establish the tunnel, rotating the WARP endpoint. No re-registration.
+
+        The public egress IP is assigned when the tunnel comes up — sticky for
+        the tunnel's life, sampled from the colo's small pool, and unrelated to
+        the identity (measured live: 9 of 10 identities shared one exit). A
+        burned exit therefore heals by re-establishing the tunnel, which costs
+        a ~4s restart, not a Cloudflare account registration.
+
+        ``endpoint`` pins a specific edge (aimed rolls from the learned
+        edge->exit map); otherwise the endpoint is picked by (slot index +
+        attempt) so concurrent slots spread across the candidate list instead
+        of stampeding one edge.
+
+        Returns the endpoint pinned for this roll, or None when the tunnel
+        failed to come back up (the caller's dead-tunnel path owns that).
+        """
+        conf = inst.identity_dir / "wireproxy.conf"
+        if not conf.exists():
+            log(f"[warp] re_roll_tunnel #{inst.index}: missing wireproxy.conf")
+            return None
+        endpoints = config.WARP_ENDPOINTS or [WARP_ENDPOINT.rsplit(":", 1)[0]]
+        if endpoint is None:
+            endpoint = endpoints[(inst.index + attempt) % len(endpoints)]
+        try:
+            text = conf.read_text()
+            text, n = re.subn(
+                r"Endpoint\s*=\s*\S+",
+                f"Endpoint = {endpoint}:{WARP_ENDPOINT_PORT}",
+                text,
+            )
+            if n != 1:
+                log(f"[warp] re_roll_tunnel #{inst.index}: no Endpoint line in config")
+                return None
+            conf.write_text(text)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[warp] re_roll_tunnel #{inst.index}: rewrite failed: {exc}")
+            return None
+        if not self.restart_instance(inst, log=log):
+            return None
+        return endpoint
 
     # -- introspection -----------------------------------------------------
     def status(self) -> Dict[str, Any]:

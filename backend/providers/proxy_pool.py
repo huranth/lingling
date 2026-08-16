@@ -353,6 +353,22 @@ class ProxyPool:
                     return px
             return None
 
+    def reset_counters(self, proxy_id: str) -> None:
+        """Zero a proxy's burn counters and cooldown.
+
+        Called when a WARP tunnel re-establishes onto a fresh exit IP: the
+        previous exit's 429 history describes an address this slot no longer
+        uses, and carrying it over would push the slot towards the daemon's
+        dump threshold for nothing.
+        """
+        with self._lock:
+            for px in self.proxies:
+                if px.id == proxy_id:
+                    px.consecutive_failures = 0
+                    px.total_429 = 0
+                    px.cooldown_until = 0.0
+                    break
+
     def get_all_proxies(self) -> List[Proxy]:
         """Thread-safe snapshot of all proxies (returns a copy)."""
         with self._lock:

@@ -47,6 +47,7 @@ from providers.base import extract_assistant_text, extract_usage
 from usage.store import UsageStore
 from warp.manager import WarpManager, _port_is_open
 from warp import health as warp_health
+from warp import formation as warp_formation
 from warp import probe as warp_probe
 
 VERSION = "0.2.0"
@@ -152,6 +153,28 @@ def _startup_sync_warp(*, start_daemon: bool = True) -> None:
         log.warning("startup: usage prune skipped (%s)", exc)
 
 
+def _bootstrap_tor() -> None:
+    """Download Tor once and start the zero-account egress lanes.
+
+    Off the event loop on purpose: the first download is ~25 MB and the first
+    instance's directory fetch can take a minute; everything after that is
+    seconds. Lanes join the proxy pool like any other SOCKS proxy, so the
+    executor, probe and cooldown machinery need no changes to use them.
+    """
+    try:
+        if not tor_manager.ensure_tools(log=log.info):
+            return
+        result = tor_manager.start_all(log=log.info)
+        added = tor_manager.sync_to_pool(proxy_pool, log=log.info)
+        log.info(
+            "bootstrap: Tor lanes ready (%d started, %d failed, %d in pool)",
+            result.get("started", 0), result.get("failed", 0), added,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A failed Tor bootstrap must not affect the gateway or the WARP pool.
+        log.warning("bootstrap: Tor setup failed (%s) - continuing without it", exc)
+
+
 def _bootstrap_warp() -> None:
     """Register and start WARP identities in-process (LINGLING_BOOTSTRAP_WARP=1).
 
@@ -182,11 +205,34 @@ def _bootstrap_warp() -> None:
                 rl_healed = warp_probe.heal_rate_limited(
                     proxy_pool, summary, warp_manager, log=log.info,
                 )
-                if expired_healed or rl_healed:
+                spread_moved = warp_probe.spread_distinct_exits(
+                    proxy_pool, summary, warp_manager, log=log.info,
+                )
+                if expired_healed or rl_healed or spread_moved:
                     log.info(
-                        "probe: healed %d expired + %d rate-limited identities",
-                        expired_healed, rl_healed,
+                        "probe: healed %d expired identities + %d burned exits, "
+                        "spread %d slots onto unused exits",
+                        expired_healed, rl_healed, spread_moved,
                     )
+                # --- exit-lane formation: assemble distinct exits on purpose ---
+                if config.WARP_FORM_ON_STARTUP and len(proxy_pool) > 0:
+                    try:
+                        formed = warp_formation.form_distinct_exits(
+                            proxy_pool, warp_manager, log=log.info,
+                        )
+                        if formed.get("distinct"):
+                            usage_store.log(
+                                "lane-formation", "lane-formation", "probe",
+                                reason=(
+                                    f"{formed['distinct']} distinct exits across "
+                                    f"{formed['slots']} slots "
+                                    f"({formed['rolls']} rolls, {formed['elapsed_s']:.0f}s)"
+                                ),
+                                status="ok",
+                                provider="warp",
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("formation: startup formation failed (%s)", exc)
                 # Log a single summary row so the dashboard shows one entry.
                 try:
                     usage_store.log(
@@ -253,6 +299,10 @@ async def lifespan(_app: FastAPI):
         # Registration can take a minute; run it off the event loop so the
         # server starts answering /api/health immediately.
         threading.Thread(target=_bootstrap_warp, name="warp-bootstrap", daemon=True).start()
+    if config.TOR_ENABLED and tor_manager.count > 0:
+        # Tor lanes bootstrap independently of WARP: first run downloads the
+        # bundle (~25 MB) and fetches the directory; later boots are seconds.
+        threading.Thread(target=_bootstrap_tor, name="tor-bootstrap", daemon=True).start()
     try:
         yield
     finally:
@@ -273,6 +323,10 @@ async def lifespan(_app: FastAPI):
             warp_manager.stop_all()
         except Exception as exc:  # noqa: BLE001
             log.warning("shutdown: warp stop failed (%s)", exc)
+        try:
+            tor_manager.stop_all()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("shutdown: tor stop failed (%s)", exc)
         try:
             usage_store.close()
         except Exception as exc:  # noqa: BLE001
@@ -391,10 +445,22 @@ warp_manager = WarpManager(
     count=getattr(config, "WARP_IDENTITY_COUNT", 10),
 )
 
+# Tor egress lanes -- zero-account exit IPs beside the WARP pool. Each tor.exe
+# is one SOCKS5 lane with a random exit; a restart rotates the exit. Disabled
+# entirely with LINGLING_TOR_ENABLED=0.
+from warp.tor_egress import TorEgressManager  # noqa: E402
+tor_manager = TorEgressManager(
+    root_dir=Path(config.DATA_DIR) / "tor",
+    count=getattr(config, "TOR_LANE_COUNT", 3) if config.TOR_ENABLED else 0,
+)
+
 # Auto-healing WARP health daemon — runs in background, periodically checks
-# every WARP proxy and regenerates dead/burned ones automatically.
+# every WARP proxy and regenerates dead/burned ones automatically. Tor lanes
+# come along for the probe + rotation ride when enabled.
 warp_health_daemon = warp_health.WarpHealthDaemon(
-    warp_manager, proxy_pool, log=log.info,
+    warp_manager, proxy_pool,
+    tor_manager=tor_manager if config.TOR_ENABLED and tor_manager.count > 0 else None,
+    log=log.info,
 )
 
 
@@ -836,17 +902,102 @@ def warp_refresh() -> Dict[str, Any]:
 
 @app.get("/api/warp/probe")
 def warp_probe_results() -> Dict[str, Any]:
-    """Latest startup probe results: per-proxy health status.
+    """Latest real-model probe results: per-proxy health status.
 
-    Shows which WARP exit IPs are healthy, rate-limited, or dead.  The probe
-    runs once at startup after WARP bootstrap; this endpoint exposes the
-    results to the frontend.  The Egress view renders them in the identity
-    rack so the operator can see at a glance which exits are usable.
+    Shows which WARP exit IPs are healthy, rate-limited, or dead. The probe
+    runs at startup, periodically from the health daemon (interval_s below),
+    and on demand via POST to this path. The Egress view renders the results
+    in the identity rack so the operator can see at a glance which exits are
+    usable.
     """
     results = warp_probe.latest_summary()
     if results is None:
-        return {"probed": False, "message": "no probe has run yet"}
-    return {"probed": True, **results}
+        return {
+            "probed": False,
+            "message": "no probe has run yet",
+            "interval_s": config.PROBE_INTERVAL_S,
+            "server_time": time.time(),
+        }
+    return {
+        "probed": True,
+        "interval_s": config.PROBE_INTERVAL_S,
+        "server_time": time.time(),
+        **results,
+    }
+
+
+@app.post("/api/warp/probe")
+def warp_probe_run() -> Dict[str, Any]:
+    """Probe every exit with a real model request now, healing as needed.
+
+    The dashboard's Probe button lands here — not on /api/warp/health, whose
+    SOCKS5 CONNECT check is blind to rate limits (a 429'd exit tunnels fine).
+    Runs the same probe + both healers + verification as the daemon's periodic
+    pass, so what the Egress rack shows afterwards is current.
+    """
+    if not any(p.id.startswith("warp-") for p in proxy_pool.get_all_proxies()):
+        raise HTTPException(
+            409, "the pool has no WARP exits to probe — start WARP first."
+        )
+    summary = warp_health_daemon.probe_now()
+    if summary is None:
+        # Another probe is mid-flight (periodic loop or a second click).
+        return {"busy": True, **(warp_probe.latest_summary() or {})}
+    # Mirror the startup probe's ledger row so the Ledger view shows manual
+    # probe activity too; periodic daemon probes stay console-only so the
+    # ledger doesn't grow a row every interval.
+    try:
+        usage_store.log(
+            "exit-probe", "exit-probe", "probe",
+            reason=(
+                f"{summary.healthy}/{summary.total} healthy, "
+                f"{summary.rate_limited} rate-limited, "
+                f"{summary.dead} dead"
+            ),
+            status="ok" if summary.healthy > 0 else "exhausted",
+            provider="warp",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return {"busy": False, **summary.to_dict()}
+
+
+@app.post("/api/warp/formation")
+def warp_formation_run() -> Dict[str, Any]:
+    """Assemble distinct exit lanes now: one lane per reachable exit IP.
+
+    Rolls slots (aimed by the learned edge->exit map) until duplicates are
+    spread across every unburned exit the PoP offers, verifying placements
+    with Cloudflare's trace endpoint -- no OpenCode quota is spent. Runs in
+    the background (a full assemble can take minutes of tunnel restarts, far
+    beyond a sane HTTP timeout); progress lands in the log, the Ledger, and
+    the Egress view's next poll. Shares the daemon's probe lock, so it cannot
+    race a heal or probe pass.
+    """
+    if not any(p.id.startswith("warp-") for p in proxy_pool.get_all_proxies()):
+        raise HTTPException(
+            409, "the pool has no WARP exits to form — start WARP first."
+        )
+
+    def _run() -> None:
+        result = warp_health_daemon.formation_now()
+        if result and result.get("distinct"):
+            try:
+                usage_store.log(
+                    "lane-formation", "lane-formation", "probe",
+                    reason=(
+                        f"{result['distinct']} distinct exits across "
+                        f"{result['slots']} slots "
+                        f"({result['rolls']} rolls, {result['elapsed_s']:.0f}s)"
+                    ),
+                    status="ok",
+                    provider="warp",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    threading.Thread(target=_run, name="warp-formation", daemon=True).start()
+    return {"started": True}
 
 
 @app.get("/api/usage")

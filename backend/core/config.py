@@ -67,6 +67,44 @@ FAST_MODELS_DIRECT = os.getenv("LINGLING_FAST_MODELS_DIRECT", "0") not in ("0", 
 # Each identity becomes one local SOCKS5 proxy on 127.0.0.1:51001+.
 WARP_IDENTITY_COUNT = int(os.getenv("LINGLING_WARP_COUNT", "10"))
 
+# The public exit IP is assigned when the tunnel is established: sticky for the
+# tunnel's life, sampled from the local Cloudflare colo's small pool, and NOT
+# tied to the identity (measured live: 9 of 10 identities shared one exit).
+# Re-establishing the tunnel re-rolls the exit; rotating the endpoint IP across
+# attempts adds entropy. 162.159.193.x is deliberately absent — those edges
+# refused handshakes on the test network, and a refused handshake is a wasted
+# re-roll. Override for your network via LINGLING_WARP_ENDPOINTS.
+WARP_ENDPOINTS = [
+    e.strip() for e in os.getenv(
+        "LINGLING_WARP_ENDPOINTS",
+        "162.159.192.1,162.159.192.50,162.159.192.100,162.159.192.150,"
+        "162.159.192.200,162.159.192.250,162.159.195.1,188.114.96.1",
+    ).split(",") if e.strip()
+]
+# How many tunnel re-establishments a rate-limit heal may spend hunting for an
+# unburned exit IP, and how long to let a fresh tunnel settle before reading
+# its exit IP (~3s measured for handshake + first SOCKS5 accept).
+WARP_REROLL_MAX_ATTEMPTS = int(os.getenv("LINGLING_WARP_REROLL_MAX_ATTEMPTS", "6"))
+WARP_REROLL_SETTLE_S = float(os.getenv("LINGLING_WARP_REROLL_SETTLE_S", "3"))
+# Exit-lane formation (assembling distinct exits on purpose at launch):
+# outer rounds of duplicate->empty-exit moves, and rolls per move. Placement
+# checks use Cloudflare's trace endpoint only, so rolls cost no OpenCode
+# quota; the budget just bounds wall-clock. Formation runs in the background
+# (startup thread or the formation endpoint), and convergence continues
+# across runs -- the periodic pass keeps improving whatever this run leaves.
+WARP_FORMATION_MAX_ROUNDS = int(os.getenv("LINGLING_WARP_FORMATION_MAX_ROUNDS", "4"))
+WARP_FORMATION_MAX_ROLLS = int(os.getenv("LINGLING_WARP_FORMATION_MAX_ROLLS", "5"))
+# Form the distinct-exit lanes automatically after the startup probe.
+WARP_FORM_ON_STARTUP = os.getenv("LINGLING_WARP_FORM_ON_STARTUP", "1") not in ("0", "false", "False", "")
+
+# --- Tor egress lanes ---
+# Zero-account exit IPs beside WARP: OpenCode answers Tor exits (measured),
+# each tor.exe instance is one SOCKS5 lane with a random exit, and restarting
+# the instance rotates the exit. First run downloads the ~25 MB expert bundle;
+# later instances clone its directory cache and boot in seconds.
+TOR_ENABLED = os.getenv("LINGLING_TOR_ENABLED", "1") not in ("0", "false", "False", "")
+TOR_LANE_COUNT = int(os.getenv("LINGLING_TOR_COUNT", "3"))
+
 COOLDOWN_BASE_MS = int(os.getenv("LINGLING_COOLDOWN_BASE_MS", "2000"))
 COOLDOWN_MAX_MS = int(os.getenv("LINGLING_COOLDOWN_MAX_MS", "30000"))
 
@@ -137,6 +175,12 @@ BOOTSTRAP_WARP = os.getenv("LINGLING_BOOTSTRAP_WARP", "0") not in ("0", "false",
 PROBE_ON_STARTUP = os.getenv("LINGLING_PROBE_ON_STARTUP", "1") not in ("0", "false", "False", "")
 PROBE_MODEL = os.getenv("LINGLING_PROBE_MODEL", "deepseek-v4-flash-free")
 PROBE_TIMEOUT = float(os.getenv("LINGLING_PROBE_TIMEOUT", "15"))
+# The health daemon's SOCKS5 probe only proves the tunnel CONNECTs — an exit
+# IP OpenCode has 429'd passes it happily. Every PROBE_INTERVAL_S seconds the
+# daemon re-runs the real-model probe and both healers, catching rate limits
+# that appear mid-session, then verifies the regenerated exits are clean.
+# 0 disables the periodic probe (startup probe still runs).
+PROBE_INTERVAL_S = float(os.getenv("LINGLING_PROBE_INTERVAL_S", "300"))
 
 # --- Streaming recovery ---
 # A stream that dies after the first chunk cannot fail over at the HTTP level

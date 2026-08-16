@@ -1,10 +1,14 @@
-"""Background health daemon for WARP egress proxies.
+"""Background health daemon for the egress pool.
 
-Periodically: TCP-checks every WARP SOCKS5 port, HTTP-probes working ones to
-verify the tunnel, restarts dead wireproxy processes, regenerates identities
-that can't be revived, removes unhealthy proxies from the pool, keeps a minimum
-number healthy, and dumps identities with too many 429s or consecutive failures
-(recycling burned IPs automatically).
+Every ``check_interval`` seconds: TCP- and HTTP-probe each WARP tunnel,
+restart dead wireproxy processes, regenerate identities that cannot be
+revived, keep the pool in sync with reality, and enforce a healthy minimum.
+Burned identities (too many 429s or consecutive failures) are healed by
+re-rolling their tunnel onto a fresh exit rather than re-registering.
+
+On its own cadence (``probe_interval``) the daemon additionally runs the
+real-model probe plus all healers — the SOCKS5 checks above cannot see
+429s — plus lane spreading and rotation of burned Tor lanes.
 """
 
 from __future__ import annotations
@@ -16,7 +20,9 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from core import config
 from providers.proxy_pool import ProxyPool
+from warp import probe as warp_probe
 from warp.manager import WarpManager, _identity_config_ok, _port_is_open
 
 
@@ -104,11 +110,23 @@ class WarpHealthDaemon:
         proxy_pool: ProxyPool,
         check_interval: int = CHECK_INTERVAL,
         min_healthy: Optional[int] = None,
+        probe_interval: Optional[float] = None,
+        tor_manager: Optional[Any] = None,
         log=None,
     ) -> None:
         self.warp = warp_manager
         self.pool = proxy_pool
+        # Tor lanes share the pool but heal differently: no identity, no
+        # tunnel re-roll — a process restart re-picks their exit route.
+        self.tor = tor_manager
         self.check_interval = check_interval
+        # Real-model probe cadence (seconds). The per-cycle SOCKS5 probe cannot
+        # see rate limits — an exit OpenCode has 429'd still CONNECTs fine — so
+        # the daemon periodically re-runs the startup probe and healers.
+        self.probe_interval = (
+            config.PROBE_INTERVAL_S if probe_interval is None else probe_interval
+        )
+        self._next_probe_at = 0.0  # due as soon as warmup is over
         # Never ask for more healthy exits than exist. With fewer identities than
         # the default floor, _ensure_min_healthy would regenerate every one of
         # them on every cycle and never reach its target.
@@ -120,6 +138,13 @@ class WarpHealthDaemon:
         # proxy id -> (consecutive_failures, total_429, total_requests), kept
         # across a remove/re-add so burn history is not silently reset.
         self._stats: Dict[str, tuple] = {}
+        # Serialises probe+heal runs: the periodic loop and POST /api/warp/probe
+        # share one daemon, and two overlapping runs would race to regenerate
+        # the same identities.
+        self._probe_lock = threading.Lock()
+        # Same for health cycles: a probe's post-heal re-sync must not overlap
+        # the loop's regular cycle, or both could restart the same instance.
+        self._cycle_lock = threading.Lock()
         # First cycle warmup: skip HTTP probes and pool removal so the bootstrap
         # thread has time to register identities and start wireproxy without the
         # daemon's health checks immediately undoing its work.
@@ -130,6 +155,10 @@ class WarpHealthDaemon:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
+        # First periodic probe waits a full interval — when the bootstrap ran
+        # the startup probe moments earlier, an immediate re-probe is a
+        # duplicate cost with no new information.
+        self._next_probe_at = time.time() + self.probe_interval
         self._thread = threading.Thread(
             target=self._run_loop, name="warp-health", daemon=True
         )
@@ -164,10 +193,157 @@ class WarpHealthDaemon:
                 self._check_and_heal()
             except Exception as exc:  # noqa: BLE001
                 self.log("[warp-health] cycle error: %s", exc)
+            # After the warmup cycle, run the real-model probe + healers on
+            # their own cadence. The SOCKS5 check above is blind to 429s, so
+            # without this a rate limit acquired mid-session would sit in the
+            # pool until the next restart.
+            if (
+                self.probe_interval > 0
+                and not self._warmup
+                and time.time() >= self._next_probe_at
+            ):
+                try:
+                    self.probe_now()
+                except Exception as exc:  # noqa: BLE001
+                    self.log("[warp-health] probe cycle error: %s", exc)
+                self._next_probe_at = time.time() + self.probe_interval
             self._stop.wait(self.check_interval)
 
+    def probe_now(self) -> Optional[Any]:
+        """Run one probe+heal+verify pass immediately.
+
+        Returns the ProbeSummary, or None when a pass is already running
+        (another caller holds the probe lock). Both the background loop and
+        the dashboard's Probe button come through here, so healing the same
+        identity twice concurrently is impossible.
+        """
+        if not self._probe_lock.acquire(blocking=False):
+            self.log("[warp-health] probe already running — skipping")
+            return None
+        try:
+            return self._probe_and_heal_burned_exits()
+        finally:
+            self._probe_lock.release()
+
+    def formation_now(self) -> Optional[Dict[str, Any]]:
+        """Assemble distinct exit lanes now. None when the lock is held.
+
+        Shares the probe lock: formation restarts tunnels, and racing a heal
+        or probe pass would fight over the same slots.
+        """
+        from warp import formation
+        if not self._probe_lock.acquire(blocking=False):
+            self.log("[warp-health] probe already running — formation skipped")
+            return None
+        try:
+            result = formation.form_distinct_exits(
+                self.pool, self.warp, log=self.log,
+            )
+            # Lanes changed hands: re-sync the pool right away so routing
+            # sees the new spread immediately.
+            try:
+                self._check_and_heal()
+            except Exception as exc:  # noqa: BLE001
+                self.log("[warp-health] post-formation cycle error: %s", exc)
+            return result
+        finally:
+            self._probe_lock.release()
+
+    def _probe_and_heal_burned_exits(self) -> Optional[Any]:
+        """Real-model probe of every exit, then run both healers on the results.
+
+        Same probe + heal_expired + heal_rate_limited sequence as startup, plus
+        a verification pass: each regenerated identity gets a fresh request to
+        confirm its new exit IP is actually clean before a normal cycle re-syncs
+        the pool. probe_all also refreshes /api/warp/probe for the dashboard.
+        Returns the ProbeSummary, or None when there is nothing to probe.
+        """
+        proxies = self.pool.get_all_proxies()
+        warp_proxies = [p for p in proxies if p.id.startswith("warp-")]
+        if not warp_proxies:
+            return None
+        self.log(
+            "[warp-health] real-model probe: testing %d exits ...",
+            len(warp_proxies),
+        )
+        summary = warp_probe.probe_all(self.pool, log=self.log)
+        healed = warp_probe.heal_rate_limited(
+            self.pool, summary, self.warp, log=self.log,
+        )
+        healed += warp_probe.heal_expired(
+            self.pool, summary, self.warp, log=self.log,
+        )
+        # Spread duplicated slots across the exits nobody is using, so the
+        # pool's capacity is distinct exits rather than one shared lane.
+        moved = warp_probe.spread_distinct_exits(
+            self.pool, summary, self.warp, log=self.log,
+        )
+        rotated = self._rotate_burned_tor_lanes(summary)
+        if healed or moved or rotated:
+            # Re-sync immediately so freshly re-rolled exits rejoin the pool
+            # instead of waiting out the next cycle. (The rate-limit healer
+            # verifies each new exit with a real request as part of its roll
+            # loop, so no separate verification pass is needed here.)
+            try:
+                self._check_and_heal()
+            except Exception as exc:  # noqa: BLE001
+                self.log("[warp-health] post-heal cycle error: %s", exc)
+        return summary
+
+    def _rotate_burned_tor_lanes(self, summary: Any) -> int:
+        """Restart Tor lanes whose exit the probe found rate-limited or dead.
+
+        A tor restart re-picks the route (guard/middle/exit), so the lane
+        comes back on a fresh exit IP within seconds -- the Tor equivalent of
+        a WARP tunnel re-roll, and just as free.
+        """
+        if self.tor is None:
+            return 0
+        by_index = {i.index: i for i in self.tor.instances}
+        rotated = 0
+        for r in summary.results:
+            if not r.proxy_id.startswith("tor-"):
+                continue
+            if r.status not in ("rate_limited", "dead"):
+                continue
+            try:
+                idx = int(r.proxy_id.split("-", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            inst = by_index.get(idx)
+            if inst is None:
+                continue
+            self.log(
+                "[warp-health] tor lane #%d is %s — rotating its exit",
+                idx, r.status,
+            )
+            try:
+                if self.tor.restart_instance(inst, log=self.log):
+                    self.pool.reset_counters(r.proxy_id)
+                    rotated += 1
+            except Exception as exc:  # noqa: BLE001
+                self.log("[warp-health] tor rotate failed for #%d: %s", idx, exc)
+        return rotated
+
     def _check_and_heal(self) -> Dict[str, Any]:
-        """One full health check cycle. Returns a results dict."""
+        """One full health check cycle. Returns a results dict.
+
+        Only one cycle runs at a time: the loop's regular tick, a probe's
+        post-heal re-sync, and an API-triggered check all mutate instances and
+        the pool, and overlapping cycles would restart the same wireproxy or
+        remove/re-add the same proxy concurrently. A contending caller just
+        skips — the next cycle covers whatever it would have done.
+        """
+        if not self._cycle_lock.acquire(blocking=False):
+            self.log("[warp-health] cycle already running — skipping")
+            return {"skipped": True, "pool": self.pool.status()}
+        try:
+            return self._run_cycle()
+        finally:
+            self._cycle_lock.release()
+
+    def _run_cycle(self) -> Dict[str, Any]:
+        """Cycle body; caller holds ``_cycle_lock``."""
         self.log("[warp-health] running health check cycle%s...",
                  " (warmup)" if self._warmup else "")
 
@@ -198,6 +374,11 @@ class WarpHealthDaemon:
                     self.log("[warp-health] instance #%d still unhealthy after heal", inst.index)
             except Exception as exc:  # noqa: BLE001
                 self.log("[warp-health] heal error for #%d: %s", inst.index, exc)
+        if healed:
+            # Step 5 decides on this count; without the recompute a cycle that
+            # healed everyone still logged "only 0 healthy — regenerating more"
+            # and ran a no-op ensure-min pass off the pre-heal snapshot.
+            healthy_count = sum(1 for r in results if r["healthy"])
 
         # 3. Dump burned identities (too many failures/429s). Regeneration
         # replaces the identity wholesale, so the health snapshot taken in step 1
@@ -418,8 +599,12 @@ class WarpHealthDaemon:
     def _dump_burned_identities(self) -> int:
         """Check pool proxies for too many 429s or consecutive failures.
 
-        Dumps burned identities and regenerates fresh ones.
-        Returns the number of identities dumped.
+        The burn lives on the tunnel's exit IP, not the identity, so the fix
+        is to re-roll the tunnel onto a fresh exit (cheap, no re-registration)
+        and zero the counters that no longer describe the new address. Only a
+        tunnel that fails to come back up is removed from the pool, where the
+        dead-tunnel path regenerates it wholesale.
+        Returns the number of identities re-rolled.
         """
         dumped = 0
         # Thread-safe snapshot of proxies
@@ -445,14 +630,15 @@ class WarpHealthDaemon:
                 should_dump = True
 
             if should_dump:
-                self.log("[warp-health] dumping identity #%d (%s) — regenerating...",
+                self.log("[warp-health] #%d burned (%s) — re-rolling its tunnel ...",
                          idx, reason)
-                self.pool.remove(px.id)
-                try:
-                    self.warp.regenerate_instance(inst)
-                    self.log("[warp-health] fresh identity #%d created", idx)
+                if self.warp.re_roll_tunnel(inst, log=self.log) is not None:
+                    self.pool.reset_counters(px.id)
+                    self.log("[warp-health] #%d re-rolled onto a fresh exit", idx)
                     dumped += 1
-                except Exception as exc:  # noqa: BLE001
-                    self.log("[warp-health] regeneration after dump failed for #%d: %s",
-                             idx, exc)
+                else:
+                    # Tunnel would not come back: drop it so the dead-tunnel
+                    # path regenerates the identity wholesale.
+                    self.pool.remove(px.id)
+                    self.log("[warp-health] #%d re-roll failed — removed for regeneration", idx)
         return dumped
