@@ -12,14 +12,27 @@ whose tunnel is genuinely dead, and the rate-limit healer re-rolls tunnels
 off burned exit IPs (re-establishing a tunnel re-rolls its exit; the
 identity stays, so no Cloudflare registration is spent). A third pass,
 ``spread_distinct_exits``, moves duplicate lanes onto exits nobody is using.
+
+Every request through a lane is preceded by a raw SOCKS5 liveness check with
+a hard socket timeout: httpcore's own SOCKS5 handshake reads carry no timeout
+(verifiable in its ``_init_socks5_connection`` — the sync backend turns the
+missing timeout into a blocking ``recv``), so a tunnel that accepts TCP but
+answers slowly or never would park the calling thread for minutes or forever
+inside a request whose timeout was never reached. Lanes are also probed in
+parallel under a per-lane watchdog, so one slow lane cannot serialize the
+whole pass.
 """
 
 from __future__ import annotations
 
+import socket
+import struct
 import threading
 import time
+from concurrent import futures
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -102,9 +115,93 @@ def _store(summary: ProbeSummary) -> None:
 # tunnel's operator (Cloudflare), unlike a third-party IP echo service.
 _EXIT_IP_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 
+# SOCKS5 handshake/reply codes (RFC 1928). Static protocol constants, not
+# tunables -- the actual budgets (handshake, trace fetch, watchdog slack) live
+# in core.config as PROBE_SOCKS_TIMEOUT / PROBE_TRACE_TIMEOUT / PROBE_CAP_SLACK.
+_SOCKS_REPLY_CODES = {
+    1: "general SOCKS server failure",
+    2: "connection not allowed by ruleset",
+    3: "network unreachable",
+    4: "host unreachable",
+    5: "connection refused",
+    6: "TTL expired",
+    7: "command not supported",
+    8: "address type not supported",
+}
 
-def _fetch_exit_ip(proxy_url: str, timeout: float = 8.0) -> str:
-    """Return this tunnel's current public egress IP, or "" if unreachable."""
+
+def socks5_connect_check(
+    proxy_url: str, host: str, port: int = 443,
+    timeout: float = config.PROBE_SOCKS_TIMEOUT,
+) -> str:
+    """Raw SOCKS5 CONNECT through ``proxy_url`` to ``(host, port)`` under a hard timeout.
+
+    Returns "" when the proxy completed the handshake and connected; otherwise
+    a short reason string. This exists because httpx cannot be trusted to
+    bound this exchange: its SOCKS5 handshake reads run with no timeout
+    (httpcore 1.0.9 passes none down, and the sync backend turns that into a
+    blocking ``recv``), so a lane that accepts TCP but never answers would
+    park an httpx request forever no matter what timeout it was given. The
+    socket timeout set here covers connect, handshake and reply alike.
+    """
+    scheme = proxy_url.split("://", 1)[0] if "://" in proxy_url else ""
+    if scheme not in ("socks5", "socks5h"):
+        return "not a socks5:// proxy"
+    rest = proxy_url.split("://", 1)[1]
+    if rest.startswith("["):  # [v6]:port
+        host_part, _, port_part = rest.partition("]")
+        proxy_host = host_part[1:]
+        proxy_port = int(port_part.lstrip(":")) if port_part.startswith(":") else 1080
+    else:
+        proxy_host, sep, port_part = rest.rpartition(":")
+        if not sep or not port_part.isdigit():
+            return "unparseable proxy address"
+        proxy_host, proxy_port = proxy_host, int(port_part)
+    if not proxy_host:
+        return "unparseable proxy address"
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((proxy_host, proxy_port))
+        # SOCKS5 greet: no auth
+        sock.sendall(bytes([0x05, 0x01, 0x00]))
+        resp = sock.recv(2)
+        if len(resp) != 2 or resp[0] != 0x05 or resp[1] != 0x00:
+            return "bad SOCKS5 greeting"
+        # CONNECT request with a domain-name target
+        addr = host.encode("ascii")
+        sock.sendall(
+            bytes([0x05, 0x01, 0x00, 0x03, len(addr)]) + addr + struct.pack("!H", port)
+        )
+        resp = sock.recv(10)
+        if len(resp) < 2 or resp[0] != 0x05:
+            return "bad SOCKS5 reply"
+        if resp[1] != 0x00:
+            return _SOCKS_REPLY_CODES.get(resp[1], f"reply code {resp[1]}")
+        return ""
+    except socket.timeout:
+        return "timed out"
+    except OSError as exc:
+        return f"tcp: {type(exc).__name__}"
+    finally:
+        try:
+            sock.close()
+        except OSError:  # noqa: BLE001
+            pass
+
+
+def _fetch_exit_ip(proxy_url: str, timeout: float = config.PROBE_TRACE_TIMEOUT) -> str:
+    """Return this tunnel's current public egress IP, or "" if unreachable.
+
+    SOCKS5 lanes are pre-checked with the raw handshake first: without it a
+    slow-to-answer tunnel stalls this fetch inside httpx's un-timed SOCKS5
+    handshake for minutes (measured: a startup probe pass stretched to 6.6
+    minutes with every model request itself taking ~2s).
+    """
+    if proxy_url.startswith("socks5"):
+        if socks5_connect_check(proxy_url, urlsplit(_EXIT_IP_URL).hostname, 443, timeout):
+            return ""
     try:
         with httpx.Client(
             proxy=proxy_url, timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
@@ -126,8 +223,26 @@ def _probe_single(
     base_url: str,
     timeout: float,
 ) -> ProbeResult:
-    """Send a minimal chat completion through one SOCKS5 proxy."""
+    """Send a minimal chat completion through one SOCKS5 proxy.
+
+    A raw SOCKS5 liveness check to the upstream runs first: a lane that
+    cannot complete the handshake never reaches httpx (whose SOCKS5
+    handshake cannot be timed out), so a wedged tunnel is reported dead in
+    seconds instead of parking this thread indefinitely.
+    """
     result = ProbeResult(proxy_id=proxy_id)
+    if proxy_url.startswith("socks5"):
+        parts = urlsplit(base_url)
+        upstream_host = parts.hostname or base_url
+        upstream_port = parts.port or (443 if parts.scheme == "https" else 80)
+        reason = socks5_connect_check(
+            proxy_url, upstream_host, upstream_port, config.PROBE_SOCKS_TIMEOUT,
+        )
+        if reason:
+            result.status = "dead"
+            result.error = f"socks5 handshake: {reason}"
+            result.probed_at = time.time()
+            return result
     result.exit_ip = _fetch_exit_ip(proxy_url)
     body = {
         "model": model,
@@ -217,6 +332,13 @@ def probe_all(
 ) -> ProbeSummary:
     """Probe every proxy in the pool with a real model request.
 
+    Lanes run in parallel (``config.PROBE_CONCURRENCY`` at a time) under a
+    per-lane watchdog deadline. The original sequential loop let one lane
+    that was slow to answer stretch a pass to minutes — or, before the raw
+    SOCKS5 pre-check existed, park forever inside httpx's un-timed handshake.
+    A lane the watchdog cuts off is reported dead so the healers restart its
+    tunnel; killing that tunnel's process also unblocks the parked worker's
+    socket, so no thread is stranded for good.
     Runs synchronously (call from a background thread at startup).
     Returns a ProbeSummary and stores it module-level for /api/warp/probe.
     """
@@ -230,19 +352,57 @@ def probe_all(
         _store(summary)
         return summary
 
-    log("probe: testing %d proxies with model %s ...", len(proxies), model)
+    workers = max(1, min(len(proxies), max(1, config.PROBE_CONCURRENCY)))
+    # Absolute worst case for one lane: liveness pre-check + trace fetch +
+    # upstream pre-check + the model request, plus scheduling slack.
+    cap = (
+        timeout + config.PROBE_SOCKS_TIMEOUT
+        + config.PROBE_TRACE_TIMEOUT + config.PROBE_CAP_SLACK
+    )
+    log(
+        "probe: testing %d proxies with model %s (%d at a time) ...",
+        len(proxies), model, workers,
+    )
     started = time.time()
     results: List[ProbeResult] = []
 
-    for px in proxies:
-        r = _probe_single(px.url, px.id, model, base_url, timeout)
-        results.append(r)
-        if r.status == "ok":
-            log("probe: %s -- healthy (%.0fms)", px.id, r.latency_ms)
-        elif r.status == "rate_limited":
-            log("probe: %s -- rate-limited", px.id)
-        else:
-            log("probe: %s -- dead (%s)", px.id, r.error)
+    ex = futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ll-probe")
+    try:
+        pending = [
+            (px, ex.submit(_probe_single, px.url, px.id, model, base_url, timeout))
+            for px in proxies
+        ]
+        for px, fut in pending:
+            try:
+                r = fut.result(timeout=cap)
+            except futures.TimeoutError:
+                r = ProbeResult(
+                    proxy_id=px.id, status="dead",
+                    error=f"no answer in {cap:.0f}s (lane wedged)",
+                    probed_at=time.time(),
+                )
+                log(
+                    "probe: %s -- no answer in %.0fs, cutting it off; "
+                    "the health cycle will restart its tunnel",
+                    px.id, cap,
+                )
+            except Exception as exc:  # noqa: BLE001
+                r = ProbeResult(
+                    proxy_id=px.id, status="dead",
+                    error=f"{type(exc).__name__}: {str(exc)[:150]}",
+                    probed_at=time.time(),
+                )
+            results.append(r)
+            if r.status == "ok":
+                log("probe: %s -- healthy (%.0fms)", px.id, r.latency_ms)
+            elif r.status == "rate_limited":
+                log("probe: %s -- rate-limited", px.id)
+            else:
+                log("probe: %s -- dead (%s)", px.id, r.error)
+    finally:
+        # wait=False: a wedged worker must not hold the whole pass (or server
+        # shutdown) hostage. cancel_futures drops lanes that never started.
+        ex.shutdown(wait=False, cancel_futures=True)
 
     elapsed = (time.time() - started) * 1000.0
     summary = ProbeSummary(

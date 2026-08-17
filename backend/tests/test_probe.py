@@ -80,7 +80,8 @@ def test_probe_summary_to_dict():
 def test_probe_single_200_ok():
     mock_resp = mock.MagicMock()
     mock_resp.status_code = 200
-    with mock.patch("warp.probe.httpx.Client") as MockClient:
+    with mock.patch("warp.probe.socks5_connect_check", return_value=""), \
+         mock.patch("warp.probe.httpx.Client") as MockClient:
         ctx = mock.MagicMock()
         ctx.__enter__ = mock.MagicMock(return_value=ctx)
         ctx.__exit__ = mock.MagicMock(return_value=False)
@@ -98,7 +99,8 @@ def test_probe_single_429():
     mock_resp = mock.MagicMock()
     mock_resp.status_code = 429
     mock_resp.json.return_value = {"error": {"message": "Rate limit exceeded"}}
-    with mock.patch("warp.probe.httpx.Client") as MockClient:
+    with mock.patch("warp.probe.socks5_connect_check", return_value=""), \
+         mock.patch("warp.probe.httpx.Client") as MockClient:
         ctx = mock.MagicMock()
         ctx.__enter__ = mock.MagicMock(return_value=ctx)
         ctx.__exit__ = mock.MagicMock(return_value=False)
@@ -113,7 +115,8 @@ def test_probe_single_429():
 
 
 def test_probe_single_connection_error():
-    with mock.patch("warp.probe.httpx.Client") as MockClient:
+    with mock.patch("warp.probe.socks5_connect_check", return_value=""), \
+         mock.patch("warp.probe.httpx.Client") as MockClient:
         ctx = mock.MagicMock()
         ctx.__enter__ = mock.MagicMock(return_value=ctx)
         ctx.__exit__ = mock.MagicMock(return_value=False)
@@ -129,7 +132,8 @@ def test_probe_single_connection_error():
 
 def test_probe_single_timeout():
     import httpx as _httpx
-    with mock.patch("warp.probe.httpx.Client") as MockClient:
+    with mock.patch("warp.probe.socks5_connect_check", return_value=""), \
+         mock.patch("warp.probe.httpx.Client") as MockClient:
         ctx = mock.MagicMock()
         ctx.__enter__ = mock.MagicMock(return_value=ctx)
         ctx.__exit__ = mock.MagicMock(return_value=False)
@@ -146,7 +150,8 @@ def test_probe_single_timeout():
 def test_probe_single_500():
     mock_resp = mock.MagicMock()
     mock_resp.status_code = 500
-    with mock.patch("warp.probe.httpx.Client") as MockClient:
+    with mock.patch("warp.probe.socks5_connect_check", return_value=""), \
+         mock.patch("warp.probe.httpx.Client") as MockClient:
         ctx = mock.MagicMock()
         ctx.__enter__ = mock.MagicMock(return_value=ctx)
         ctx.__exit__ = mock.MagicMock(return_value=False)
@@ -158,6 +163,142 @@ def test_probe_single_500():
         )
     assert result.status == "dead"
     assert "HTTP 500" in result.error
+
+
+# ---------------------------------------------------------------------------
+# SOCKS5 liveness pre-check -- httpcore's handshake reads carry no timeout,
+# so a silent tunnel used to park the probing thread forever. These tests
+# reproduce that exact wedge with a local server that accepts and never
+# answers.
+# ---------------------------------------------------------------------------
+
+class _SilentSocksServer:
+    """Accepts TCP connections and never speaks -- a wedged wireproxy/tor."""
+
+    def __init__(self):
+        import socket as _socket
+        self._socket = _socket
+        srv = _socket.socket()
+        srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        self._srv = srv
+        self.port = srv.getsockname()[1]
+        self.url = f"socks5://127.0.0.1:{self.port}"
+        self._conns = []
+        import threading as _threading
+        self._stop = _threading.Event()
+
+        def serve():
+            srv.settimeout(0.2)
+            while not self._stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                    self._conns.append(conn)  # hold open, never reply
+                except _socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+        _threading.Thread(target=serve, daemon=True).start()
+
+    def close(self):
+        self._stop.set()
+        for c in self._conns:
+            try:
+                c.close()
+            except OSError:
+                pass
+        self._srv.close()
+
+
+def test_socks5_check_times_out_on_silent_proxy():
+    srv = _SilentSocksServer()
+    try:
+        started = time.time()
+        reason = probe.socks5_connect_check(srv.url, "opencode.ai", 443, timeout=0.5)
+        assert reason == "timed out"
+        assert time.time() - started < 5
+    finally:
+        srv.close()
+
+
+def test_socks5_check_refused_and_non_socks():
+    assert probe.socks5_connect_check("socks5://127.0.0.1:1", "opencode.ai", 443, 0.5)
+    assert probe.socks5_connect_check("http://127.0.0.1:8080", "opencode.ai") == \
+        "not a socks5:// proxy"
+
+
+def test_probe_single_dead_lane_fails_fast_without_httpx():
+    srv = _SilentSocksServer()
+    try:
+        with mock.patch.object(probe.config, "PROBE_SOCKS_TIMEOUT", 0.5), \
+             mock.patch("warp.probe.httpx.Client") as MockClient:
+            started = time.time()
+            result = probe._probe_single(
+                srv.url, "warp-9", "m", "https://opencode.ai/zen/v1", 15,
+            )
+            assert MockClient.call_count == 0  # never reached httpx
+        assert result.status == "dead"
+        assert "socks5 handshake: timed out" in result.error
+        assert time.time() - started < 5
+    finally:
+        srv.close()
+
+
+def test_fetch_exit_ip_gives_up_fast_on_silent_tunnel():
+    srv = _SilentSocksServer()
+    try:
+        started = time.time()
+        assert probe._fetch_exit_ip(srv.url, timeout=0.5) == ""
+        assert time.time() - started < 5
+    finally:
+        srv.close()
+
+
+# ---------------------------------------------------------------------------
+# probe_all: parallel lanes + watchdog
+# ---------------------------------------------------------------------------
+
+def test_probe_all_runs_lanes_in_parallel():
+    pool = _make_pool(6)
+
+    def slow_probe(url, pid, model, base, timeout):
+        time.sleep(0.25)
+        return probe.ProbeResult(proxy_id=pid, status="ok", probed_at=time.time())
+
+    with mock.patch.object(probe.config, "PROBE_CONCURRENCY", 6), \
+         mock.patch("warp.probe._probe_single", side_effect=slow_probe):
+        started = time.time()
+        summary = probe.probe_all(pool, log=lambda *a, **k: None)
+    assert summary.healthy == 6
+    # Sequential would need 6 x 0.25s = 1.5s; parallel one wave of 0.25s.
+    assert time.time() - started < 1.2
+
+
+def test_probe_all_watchdog_cuts_off_wedged_lane():
+    pool = _make_pool(2)
+    import threading as _threading
+    release = _threading.Event()
+
+    def stuck_probe(url, pid, model, base, timeout):
+        release.wait(10)  # simulate a lane parked in an un-timed handshake
+        return probe.ProbeResult(proxy_id=pid, status="ok")
+
+    with mock.patch.object(probe.config, "PROBE_CONCURRENCY", 2), \
+         mock.patch.object(probe.config, "PROBE_SOCKS_TIMEOUT", 0.05), \
+         mock.patch.object(probe.config, "PROBE_TRACE_TIMEOUT", 0.05), \
+         mock.patch.object(probe.config, "PROBE_CAP_SLACK", 0.35), \
+         mock.patch("warp.probe._probe_single", side_effect=stuck_probe):
+        try:
+            started = time.time()
+            summary = probe.probe_all(pool, timeout=0.1, log=lambda *a, **k: None)
+            assert summary.dead == 2
+            assert summary.healthy == 0
+            assert time.time() - started < 5
+            assert all("no answer in" in r.error for r in summary.results)
+        finally:
+            release.set()  # free the parked workers so the executor can rest
 
 
 # ---------------------------------------------------------------------------

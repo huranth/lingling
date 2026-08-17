@@ -175,6 +175,22 @@ BOOTSTRAP_WARP = os.getenv("LINGLING_BOOTSTRAP_WARP", "0") not in ("0", "false",
 PROBE_ON_STARTUP = os.getenv("LINGLING_PROBE_ON_STARTUP", "1") not in ("0", "false", "False", "")
 PROBE_MODEL = os.getenv("LINGLING_PROBE_MODEL", "deepseek-v4-flash-free")
 PROBE_TIMEOUT = float(os.getenv("LINGLING_PROBE_TIMEOUT", "15"))
+# Lanes probed at once. Parallel probing keeps one slow lane from stretching
+# the whole pass by its full timeout (a sequential pass once measured 6.6
+# minutes while every individual request took ~2s); the count stays small
+# because several lanes routinely share one exit IP's rate-limit budget.
+PROBE_CONCURRENCY = int(os.getenv("LINGLING_PROBE_CONCURRENCY", "6"))
+# Budgets for the raw SOCKS5 liveness check that precedes every probe request
+# (httpcore's own SOCKS5 handshake reads carry no timeout, so without this a
+# lane that accepts TCP but never answers would park the probing thread for
+# minutes or forever): the handshake itself, the exit-IP trace fetch through
+# an already-verified lane, and the slack on top of a lane's worst case that
+# forms the per-lane watchdog deadline. All generous against the ~3s a freshly
+# re-rolled tunnel needs for its first SOCKS CONNECT, but firm enough that a
+# wedged lane costs seconds, not minutes.
+PROBE_SOCKS_TIMEOUT = float(os.getenv("LINGLING_PROBE_SOCKS_TIMEOUT", "8"))
+PROBE_TRACE_TIMEOUT = float(os.getenv("LINGLING_PROBE_TRACE_TIMEOUT", "8"))
+PROBE_CAP_SLACK = float(os.getenv("LINGLING_PROBE_CAP_SLACK", "12"))
 # The health daemon's SOCKS5 probe only proves the tunnel CONNECTs — an exit
 # IP OpenCode has 429'd passes it happily. Every PROBE_INTERVAL_S seconds the
 # daemon re-runs the real-model probe and both healers, catching rate limits

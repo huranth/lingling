@@ -312,6 +312,10 @@ gateway. Skip this section unless something specific needs changing.
 | `LINGLING_WARP_ENDPOINTS` | curated list | Cloudflare edges used for tunnel re-rolls (comma-separated) |
 | `LINGLING_PROBE_MODEL` | *(a free model)* | Model used for the startup probe |
 | `LINGLING_PROBE_TIMEOUT` | `15` | Timeout (s) for each startup probe request |
+| `LINGLING_PROBE_CONCURRENCY` | `6` | Lanes probed at once (each lane first passes a raw SOCKS5 liveness check with a hard timeout, so a silent tunnel can't stall the pass) |
+| `LINGLING_PROBE_SOCKS_TIMEOUT` | `8` | Hard budget (s) for the raw SOCKS5 handshake pre-check — httpcore's own handshake can't be timed out by httpx, so this bounds a lane that accepts TCP but never answers |
+| `LINGLING_PROBE_TRACE_TIMEOUT` | `8` | Budget (s) for the exit-IP trace fetch through an already-verified lane |
+| `LINGLING_PROBE_CAP_SLACK` | `12` | Slack (s) on top of a lane's worst case that forms the per-lane watchdog deadline |
 
 **Model availability**
 

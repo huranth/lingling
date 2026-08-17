@@ -14,8 +14,6 @@ real-model probe plus all healers — the SOCKS5 checks above cannot see
 from __future__ import annotations
 
 import logging
-import socket
-import struct
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -46,49 +44,16 @@ def _socks5_http_probe(
     target_port: int = 443,
     timeout: float = HTTP_PROBE_TIMEOUT,
 ) -> bool:
-    """Full HTTP CONNECT through a SOCKS5 proxy to verify the tunnel works.
+    """Full SOCKS5 CONNECT through a proxy to verify the tunnel works.
 
     Uses opencode.ai as the probe target (the actual upstream). If the proxy
     can reach opencode.ai on port 443, it's healthy enough for routing.
-    Returns True only if the SOCKS5 handshake + TCP connect succeed.
+    Delegates to warp.probe.socks5_connect_check — the same raw handshake the
+    probe pre-flight uses, so there is exactly one implementation of it.
     """
-    if not proxy_url.startswith("socks5://"):
-        return False
-    host_port = proxy_url[len("socks5://"):]
-    proxy_host, port_str = host_port.rsplit(":", 1)
-    proxy_port = int(port_str)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
-    try:
-        sock.connect((proxy_host, proxy_port))
-        # SOCKS5 greet: no authentication
-        sock.sendall(bytes([0x05, 0x01, 0x00]))
-        resp = sock.recv(2)
-        if len(resp) != 2 or resp[0] != 0x05 or resp[1] != 0x00:
-            return False
-
-        # CONNECT request with a domain name
-        addr = target_host.encode("ascii")
-        req = (
-            bytes([0x05, 0x01, 0x00, 0x03, len(addr)])
-            + addr
-            + struct.pack("!H", target_port)
-        )
-        sock.sendall(req)
-        resp = sock.recv(10)
-        if len(resp) < 2 or resp[0] != 0x05 or resp[1] != 0x00:
-            return False
-
-        # CONNECT succeeded — the tunnel is working
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-    finally:
-        try:
-            sock.close()
-        except Exception:  # noqa: BLE001
-            pass
+    return warp_probe.socks5_connect_check(
+        proxy_url, target_host, target_port, timeout,
+    ) == ""
 
 
 class WarpHealthDaemon:
