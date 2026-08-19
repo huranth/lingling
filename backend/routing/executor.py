@@ -93,7 +93,7 @@ def execute_nonstream(
         if not prov.requires_key():
             max_proxies = (
                 min(len(proxy_pool), config.PROXY_MAX_ATTEMPTS_PER_REQUEST)
-                if proxy_pool and prov.needs_proxy() and not prov.prefer_direct(model_id)
+                if proxy_pool and len(proxy_pool) > 0 and prov.needs_proxy() and not prov.prefer_direct(model_id)
                 else 1
             )
             for _ in range(max_proxies):
@@ -180,7 +180,7 @@ def execute_stream(
             continue
         max_attempts = (
             min(len(proxy_pool), config.PROXY_MAX_ATTEMPTS_PER_REQUEST)
-            if proxy_pool and prov.needs_proxy() and not prov.prefer_direct(model_id)
+            if proxy_pool and len(proxy_pool) > 0 and prov.needs_proxy() and not prov.prefer_direct(model_id)
             else 1
         )
         for _ in range(max_attempts):

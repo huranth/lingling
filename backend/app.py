@@ -32,6 +32,7 @@ from routing import dispatcher
 from routing import effort
 from routing import executor
 from core import api_keys
+from routing import normalize
 from routing import parking
 from routing import stream_guard
 from routing import stream_idle
@@ -48,6 +49,7 @@ from providers.base import extract_assistant_text, extract_usage
 from usage.store import UsageStore
 from warp.manager import WarpManager, _port_is_open
 from warp import health as warp_health
+from warp.health import _socks5_http_probe
 from warp import formation as warp_formation
 from warp import probe as warp_probe
 
@@ -827,7 +829,7 @@ def warp_health(probe: bool = False) -> Dict[str, Any]:
 
         if probe and port_listening:
             try:
-                http_probe_ok = warp_health._socks5_http_probe(
+                http_probe_ok = _socks5_http_probe(
                     inst.proxy_url, timeout=5.0
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1170,18 +1172,50 @@ def _messages_for_model(
     return messages
 
 
+def _dump_rc_failure(messages: Any, exc: Exception) -> None:
+    """Snapshot a request the upstream rejected over ``reasoning_content``.
+
+    Reasoning models require the field on replayed assistant turns, and clients
+    drop or mangle it in shapes that are hard to reproduce synthetically. The
+    snapshot lets a still-failing request be inspected offline.
+    """
+    text = str(getattr(exc, "last_error", exc))
+    if "reasoning_content" not in text and "invalid json" not in text:
+        return
+    try:
+        snapshot = config.DATA_DIR / "debug_rc_400.json"
+        with open(snapshot, "w", encoding="utf-8") as fh:
+            json.dump({"error": text[:300], "messages": messages}, fh,
+                      ensure_ascii=False, indent=1)
+        log.warning("rc400: upstream rejected reasoning_content; snapshot -> %s", snapshot)
+    except Exception:  # noqa: BLE001 - diagnostics must never break the request
+        pass
+
+
 def _flag_model_retired(exc: Exception, model_id: str) -> bool:
     """Hide a model from the catalog when the upstream retired its free tier.
 
-    OpenCode advertises a ``-free`` model even after it stops serving it, so a
-    request 400s with "unavailable for free". On that failure the model is
-    recorded as retired (persisted, TTL), dropping it from /v1/models, the
-    dashboard, dispatcher candidates and the Codex/Claude listings.
+    OpenCode advertises a ``-free`` model even after it stops serving it, in
+    three shapes (verified live):
+
+    * 400 "unavailable for free" -- the classic retired-tier answer;
+    * 401 "Model <id> is not supported" -- dropped from the model list;
+    * 403 with a bare ``{"model": "<id>"}`` body -- gated behind a paid tier.
+
+    On that failure the model is recorded as retired (persisted, TTL), dropping
+    it from /v1/models, the dashboard, dispatcher candidates and the
+    Codex/Claude listings.
     """
     err = getattr(exc, "last_error", None)
-    if err is None or getattr(err, "status_code", None) != 400:
-        return False
-    if "unavailable" not in str(getattr(err, "detail", "")).lower():
+    detail = str(getattr(err, "detail", ""))
+    code = getattr(err, "status_code", None)
+    if code == 400 and "unavailable" in detail.lower():
+        pass
+    elif code == 401 and "not supported" in detail.lower():
+        pass
+    elif code == 403 and detail.strip().startswith("{") and f'"{model_id}"' in detail:
+        pass
+    else:
         return False
     try:
         catalog.mark_unavailable(model_id)
@@ -1210,6 +1244,7 @@ async def _execute_with_egress_wait(fn, *args, **kwargs):
         # upstream retired its free tier, stop offering the model.
         if len(args) > 1 and isinstance(args[1], str):
             _flag_model_retired(exc, args[1])
+        _dump_rc_failure(args[0] if args else [], exc)
         waited = await parking.wait_for_egress(pool, config.EGRESS_WAIT_BUDGET, log)
         if not waited:
             raise
@@ -1280,6 +1315,7 @@ async def chat_completions(request: Request):
     target_lm = catalog.by_id(target)
     if target_lm is not None and not target_lm.vision:
         messages = vision_bridge.strip_images_for_text_model(messages)
+    messages = normalize.normalize_reasoning_content(messages)
 
     params = _passthrough_params(body)
     original_effort = params.get("reasoning_effort")
@@ -1584,6 +1620,7 @@ async def responses(request: Request):
     target_lm = catalog.by_id(target)
     if target_lm is not None and not target_lm.vision:
         messages = vision_bridge.strip_images_for_text_model(messages)
+    messages = normalize.normalize_reasoning_content(messages)
     _resolve_effort(params, target)
     original_effort = params.get("reasoning_effort")
 
@@ -1779,6 +1816,7 @@ async def messages(request: Request):
     target_lm = catalog.by_id(target)
     if target_lm is not None and not target_lm.vision:
         messages_in = vision_bridge.strip_images_for_text_model(messages_in)
+    messages_in = normalize.normalize_reasoning_content(messages_in)
 
     original_effort = params.get("reasoning_effort")
     # Clamp the depth label to what this model actually publishes. Must happen

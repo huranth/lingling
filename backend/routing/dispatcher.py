@@ -218,6 +218,12 @@ def _distill_messages(
     flattened: List[Dict[str, Any]] = []
     for message in messages or []:
         role = message.get("role", "user")
+        # Tool outputs carry no caller context that matters to a text-only
+        # classifier, and the tool_call_id they bind to is dropped here --
+        # OpenAI-compatible upstreams reject tool messages without the matching
+        # assistant turn. Skip them, same for empty assistant frames.
+        if role == "tool":
+            continue
         content = message.get("content")
         if isinstance(content, str):
             text = content
@@ -233,6 +239,8 @@ def _distill_messages(
             text = "\n".join(chunks)
         else:
             text = "" if content is None else str(content)
+        if role == "assistant" and not text and not message.get("tool_calls"):
+            continue
         flattened.append({"role": role, "content": text})
 
     system = [m for m in flattened if m["role"] == "system"]

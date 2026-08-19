@@ -70,14 +70,38 @@ def request_to_chat(body: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]], Di
         messages.append({"role": "user", "content": input_items})
     elif isinstance(input_items, list):
         pending_tool_calls: List[Dict[str, Any]] = []
+        pending_reasoning: List[str] = []
+
+        def _flush_assistant() -> None:
+            """Emit the pending assistant turn, attaching any stray reasoning.
+
+            Codex sends ``type=reasoning`` items with its past thinking; some
+            models (deepseek) are fine with that text on the turn, others
+            (big-pickle) would reject the role. Keeping it off the dedicated
+            turn and gluing it onto the preceding tool-call turn preserves the
+            chain without corrupting the message list.
+            """
+            reasoning_text = "\n".join(pending_reasoning).strip()
+            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": ""}
+            if pending_tool_calls:
+                assistant_msg["tool_calls"] = pending_tool_calls[:]
+            if reasoning_text:
+                assistant_msg["reasoning_content"] = reasoning_text
+            messages.append(assistant_msg)
+            pending_tool_calls.clear()
+            pending_reasoning.clear()
+
         for item in input_items:
             if not isinstance(item, dict):
                 continue
             itype = item.get("type")
-            if itype == "message":
+            if itype == "reasoning":
+                for part in item.get("summary") or []:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        pending_reasoning.append(part["text"])
+            elif itype == "message":
                 if pending_tool_calls:
-                    messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
-                    pending_tool_calls = []
+                    _flush_assistant()
                 role = item.get("role") or "user"
                 content = _content_from_parts(item.get("content"))
                 if content or role in ("system", "developer"):
@@ -96,8 +120,7 @@ def request_to_chat(body: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]], Di
                 })
             elif itype == "function_call_output":
                 if pending_tool_calls:
-                    messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
-                    pending_tool_calls = []
+                    _flush_assistant()
                 output = item.get("output")
                 messages.append({
                     "role": "tool",
@@ -105,7 +128,7 @@ def request_to_chat(body: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]], Di
                     "content": output if isinstance(output, str) else json.dumps(output),
                 })
         if pending_tool_calls:
-            messages.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+            _flush_assistant()
     else:
         raise ValueError("Missing or invalid 'input' field.")
 
