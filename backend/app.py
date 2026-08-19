@@ -9,6 +9,7 @@ all prompting; Lingling only routes. See the README for the endpoint list.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import logging
 import threading
@@ -205,14 +206,23 @@ def _bootstrap_warp() -> None:
                 rl_healed = warp_probe.heal_rate_limited(
                     proxy_pool, summary, warp_manager, log=log.info,
                 )
+                # Tor lanes have no identity to re-roll -- their healer is a
+                # restart, which re-picks guard/middle/exit for a fresh exit
+                # IP. Called here, not from heal_rate_limited (which skips
+                # non-WARP lanes by design), so a burned Tor lane does not
+                # sit unhealed until the daemon's first periodic probe runs
+                # PROBE_INTERVAL_S seconds later.
+                tor_rotated = warp_probe.rotate_burned_tor_lanes(
+                    proxy_pool, tor_manager, summary, log=log.info,
+                )
                 spread_moved = warp_probe.spread_distinct_exits(
                     proxy_pool, summary, warp_manager, log=log.info,
                 )
-                if expired_healed or rl_healed or spread_moved:
+                if expired_healed or rl_healed or tor_rotated or spread_moved:
                     log.info(
                         "probe: healed %d expired identities + %d burned exits, "
-                        "spread %d slots onto unused exits",
-                        expired_healed, rl_healed, spread_moved,
+                        "rotated %d Tor lanes, spread %d slots onto unused exits",
+                        expired_healed, rl_healed, tor_rotated, spread_moved,
                     )
                 # --- exit-lane formation: assemble distinct exits on purpose ---
                 if config.WARP_FORM_ON_STARTUP and len(proxy_pool) > 0:
@@ -1938,6 +1948,52 @@ if FRONTEND_DIR.exists():
         return resp
 
 
+class _QuietPollFilter(logging.Filter):
+    """Drop successful dashboard polls from the terminal access log.
+
+    The frontend polls a handful of read-only endpoints every 1-8s, and each
+    request is a 200 that floods the backend terminal -- probe verdicts,
+    heals and bootstrap lines get buried under a wall of access lines nobody
+    can read. This filter drops those high-frequency GETs while leaving the
+    log honest: errors (any 4xx/5xx) and real API calls (POST completions,
+    the manual Probe button, ...) still surface.
+    """
+
+    # Exact paths that poll on a beat -- suppress only when GET succeeds.
+    _QUIET_EXACT = {"", "/", "/api/warp", "/api/proxies",
+                    "/api/health", "/api/models"}
+    # Path prefixes whose variants all poll (e.g. /api/usage/since/100).
+    _QUIET_PREFIX = ("/api/warp/probe", "/api/usage", "/static/")
+
+    def filter(self, record):  # noqa: A003 -- logging's own API name
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+        # uvicorn.access args: (client_addr, method, path, http_version, status).
+        try:
+            status = int(args[4])
+        except (TypeError, ValueError):
+            return True
+        if not (200 <= status < 400):
+            return True  # never hide an error
+        if str(args[1]) != "GET":
+            return True  # chat completions, manual Probe (POST), ...
+        path = str(args[2])
+        if path in self._QUIET_EXACT or path.startswith(self._QUIET_PREFIX):
+            return False
+        return True
+
+
+def _build_log_config() -> Dict[str, Any]:
+    """Uvicorn's default LOGGING_CONFIG + the quiet-poll filter on access."""
+    from uvicorn.config import LOGGING_CONFIG
+
+    cfg = copy.deepcopy(LOGGING_CONFIG)
+    cfg.setdefault("filters", {})["quiet_poll"] = {"()": _QuietPollFilter}
+    cfg["handlers"]["access"]["filters"] = ["quiet_poll"]
+    return cfg
+
+
 if __name__ == "__main__":
     """Run the gateway directly: `python app.py`.
 
@@ -1953,4 +2009,5 @@ if __name__ == "__main__":
         host=os.getenv("LINGLING_HOST", "127.0.0.1"),
         port=int(os.getenv("LINGLING_PORT", "8000")),
         log_level=os.getenv("LINGLING_LOG_LEVEL", "info"),
+        log_config=_build_log_config(),
     )

@@ -258,37 +258,14 @@ class WarpHealthDaemon:
     def _rotate_burned_tor_lanes(self, summary: Any) -> int:
         """Restart Tor lanes whose exit the probe found rate-limited or dead.
 
-        A tor restart re-picks the route (guard/middle/exit), so the lane
-        comes back on a fresh exit IP within seconds -- the Tor equivalent of
-        a WARP tunnel re-roll, and just as free.
+        Thin wrapper around :func:`warp.probe.rotate_burned_tor_lanes` so the
+        daemon's call site (and existing tests) keep working; the real logic
+        lives next to ``heal_expired`` / ``heal_rate_limited`` so the startup
+        path can share it without depending on a constructed daemon.
         """
-        if self.tor is None:
-            return 0
-        by_index = {i.index: i for i in self.tor.instances}
-        rotated = 0
-        for r in summary.results:
-            if not r.proxy_id.startswith("tor-"):
-                continue
-            if r.status not in ("rate_limited", "dead"):
-                continue
-            try:
-                idx = int(r.proxy_id.split("-", 1)[1])
-            except (ValueError, IndexError):
-                continue
-            inst = by_index.get(idx)
-            if inst is None:
-                continue
-            self.log(
-                "[warp-health] tor lane #%d is %s — rotating its exit",
-                idx, r.status,
-            )
-            try:
-                if self.tor.restart_instance(inst, log=self.log):
-                    self.pool.reset_counters(r.proxy_id)
-                    rotated += 1
-            except Exception as exc:  # noqa: BLE001
-                self.log("[warp-health] tor rotate failed for #%d: %s", idx, exc)
-        return rotated
+        return warp_probe.rotate_burned_tor_lanes(
+            self.pool, self.tor, summary, log=self.log,
+        )
 
     def _check_and_heal(self) -> Dict[str, Any]:
         """One full health check cycle. Returns a results dict.

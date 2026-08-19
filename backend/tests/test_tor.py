@@ -205,3 +205,150 @@ def test_daemon_rotates_burned_tor_lanes():
     # The rotation reset the lane's burn counters (fresh exit, fresh slate).
     after = daemon.pool.get_by_id("tor-1")
     assert after.consecutive_failures == 0 and after.total_429 == 0
+
+
+def _fake_tor(indexes):
+    """Minimal TorEgressManager stand-in: records which lanes got restarted."""
+    class FakeTorManager:
+        def __init__(self):
+            self.instances = [type("I", (), {"index": i})() for i in indexes]
+            self.restarts = []
+
+        def restart_instance(self, inst, log=None):
+            self.restarts.append(inst.index)
+            return True
+
+    return FakeTorManager()
+
+
+def test_rotate_burned_tor_lanes_function_restarts_burned_only():
+    """The module-level rotator restarts lanes marked rate_limited/dead and
+    leaves healthy ones alone -- the same contract the daemon method had."""
+    from providers.proxy_pool import ProxyPool
+    from warp import probe
+
+    tor = _fake_tor([1, 2, 3])
+    pool = ProxyPool()
+    for i in (1, 2, 3):
+        pool.add(f"socks5://127.0.0.1:{52000 + i}", proxy_id=f"tor-{i}", label=f"Tor #{i}")
+    # Burn two of them so we can confirm the third is left untouched.
+    pool.mark_failure(pool.get_by_id("tor-1"), 429)
+    pool.mark_failure(pool.get_by_id("tor-3"), 429)
+
+    summary = probe.ProbeSummary(total=3, rate_limited=1, dead=1, results=[
+        probe.ProbeResult(proxy_id="tor-1", status="rate_limited"),
+        probe.ProbeResult(proxy_id="tor-2", status="ok"),
+        probe.ProbeResult(proxy_id="tor-3", status="dead"),
+    ])
+    rotated = probe.rotate_burned_tor_lanes(
+        pool, tor, summary, log=lambda *a, **k: None,
+    )
+    assert rotated == 2
+    assert tor.restarts == [1, 3]                       # healthy tor-2 left alone
+    for pid in ("tor-1", "tor-3"):
+        after = pool.get_by_id(pid)
+        assert after.consecutive_failures == 0
+        assert after.total_429 == 0
+    # The stored summary must reflect the heals immediately -- the dashboard
+    # reads it, and without this the lanes keep their stale rate-limited/dead
+    # verdicts (red chips) until the next probe pass verifies the fresh exits.
+    assert summary.rate_limited == 0 and summary.dead == 0
+    by_id = {r.proxy_id: r for r in summary.results}
+    assert by_id["tor-1"].status == "healed" and by_id["tor-1"].exit_ip == ""
+    assert by_id["tor-3"].status == "healed"
+    assert by_id["tor-2"].status == "ok"               # untouched
+
+
+def test_rotate_burned_tor_lanes_noop_when_tor_disabled():
+    """Callers (startup, daemon, dashboard) must be able to invoke the
+    rotator unconditionally -- it returns 0 silently when Tor is off."""
+    from providers.proxy_pool import ProxyPool
+    from warp import probe
+
+    pool = ProxyPool()
+    summary = probe.ProbeSummary(total=0, results=[])
+
+    # None tor_manager (the path the daemon takes when LINGLING_TOR_ENABLED=0).
+    assert probe.rotate_burned_tor_lanes(pool, None, summary, log=lambda *a, **k: None) == 0
+
+    # A manager with zero instances (the path startup takes with TOR_COUNT=0).
+    class Empty:
+        instances = []
+
+    assert probe.rotate_burned_tor_lanes(pool, Empty(), summary, log=lambda *a, **k: None) == 0
+
+
+def test_rotate_burned_tor_lanes_never_touches_warp_or_unknown_ids():
+    """WARP lanes and user proxies are not the Tor rotator's job; the WARP
+    healers own them, and an unknown id must not cause a restart."""
+    from providers.proxy_pool import ProxyPool
+    from warp import probe
+
+    tor = _fake_tor([1])
+    pool = ProxyPool()
+    pool.add("socks5://127.0.0.1:51001", proxy_id="warp-1", label="WARP #1")
+    pool.add("socks5://127.0.0.1:53099", proxy_id="custom-proxy", label="user")
+    pool.mark_failure(pool.get_by_id("warp-1"), 429)
+
+    summary = probe.ProbeSummary(total=2, rate_limited=1, dead=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="rate_limited"),
+        probe.ProbeResult(proxy_id="custom-proxy", status="dead"),
+    ])
+    assert probe.rotate_burned_tor_lanes(pool, tor, summary, log=lambda *a, **k: None) == 0
+    assert tor.restarts == []
+    # The burned WARP lane's counters are intact -- the Tor healer did nothing.
+    assert pool.get_by_id("warp-1").total_429 == 1
+
+
+def test_bootstrap_warp_rotates_burned_tor_lanes():
+    """Startup must run the Tor rotator alongside the WARP healers.
+
+    Previously ``_bootstrap_warp`` called only ``heal_expired`` +
+    ``heal_rate_limited`` + ``spread_distinct_exits`` -- all three skip
+    non-WARP lanes by design ("the daemon rotates them through their own
+    manager instead"). That left a Tor lane the startup probe already saw
+    429'd sitting unhealed until the daemon's first periodic probe fired
+    ``PROBE_INTERVAL_S`` seconds later. This pins the wiring so it cannot
+    regress: startup invokes ``rotate_burned_tor_lanes`` directly with the
+    startup probe summary, and with the same pool+tor_manager the WARP
+    healers saw.
+    """
+    import app
+    from warp import probe
+
+    summary = probe.ProbeSummary(total=2, rate_limited=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="ok"),
+        probe.ProbeResult(proxy_id="tor-3", status="rate_limited",
+                          exit_ip="45.66.35.27"),
+    ])
+
+    fake_tor = mock.MagicMock(spec=[])
+    fake_pool = mock.MagicMock()
+    fake_pool.__len__.return_value = 1
+    fake_pool.status.return_value = {"total": 2, "available": 2, "healthy": 2}
+    fake_warp = mock.MagicMock()
+    fake_warp.count = 10
+    fake_warp.status.return_value = {
+        "identities_registered": 10, "proxies_running": 0,
+    }
+
+    with mock.patch.object(app, "warp_manager", fake_warp), \
+         mock.patch.object(app, "proxy_pool", fake_pool), \
+         mock.patch.object(app, "tor_manager", fake_tor), \
+         mock.patch("app._start_warp_at_startup"), \
+         mock.patch("warp.probe.probe_all", return_value=summary), \
+         mock.patch("warp.probe.heal_expired", return_value=0), \
+         mock.patch("warp.probe.heal_rate_limited", return_value=0), \
+         mock.patch("warp.probe.rotate_burned_tor_lanes", return_value=0) as h_tor, \
+         mock.patch("warp.probe.spread_distinct_exits", return_value=0), \
+         mock.patch.object(app.config, "PROBE_ON_STARTUP", True), \
+         mock.patch.object(app.config, "WARP_FORM_ON_STARTUP", False), \
+         mock.patch.object(app.usage_store, "log"), \
+         mock.patch.object(app.warp_health_daemon, "start"):
+        app._bootstrap_warp()
+
+    h_tor.assert_called_once()
+    args, _kwargs = h_tor.call_args
+    assert args[0] is fake_pool                       # proxy_pool, ...
+    assert args[1] is fake_tor                         # tor_manager, ...
+    assert args[2] is summary                          # summary

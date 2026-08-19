@@ -12,6 +12,9 @@ whose tunnel is genuinely dead, and the rate-limit healer re-rolls tunnels
 off burned exit IPs (re-establishing a tunnel re-rolls its exit; the
 identity stays, so no Cloudflare registration is spent). A third pass,
 ``spread_distinct_exits``, moves duplicate lanes onto exits nobody is using.
+A fourth, ``rotate_burned_tor_lanes``, restarts Tor lanes the probe found
+rate-limited or dead -- Tor has no identity to re-roll, so it gets its own
+healer, called from startup and the daemon alike.
 
 Every request through a lane is preceded by a raw SOCKS5 liveness check with
 a hard socket timeout: httpcore's own SOCKS5 handshake reads carry no timeout
@@ -48,7 +51,7 @@ class ProbeResult:
     """Outcome of probing a single proxy."""
 
     proxy_id: str
-    status: str = "pending"       # "ok" | "rate_limited" | "dead" | "pending"
+    status: str = "pending"       # "ok" | "rate_limited" | "dead" | "healed" | "pending"
     latency_ms: float = 0.0
     error: str = ""
     probed_at: float = 0.0
@@ -446,6 +449,46 @@ def _find_instance(warp_manager: Any, index: int):
     return None
 
 
+def _recount(summary: ProbeSummary, old_status: str, new_status: str) -> None:
+    """Move a summary counter after a healer rewrites a result.
+
+    The counters are computed once at probe time; a heal flips a result's
+    status in place, so the matching counter must move too or the aggregate
+    panel (driven by the counters) would keep reporting pre-heal verdicts
+    while the per-slot chips already show the healed state. ``healed`` is
+    transient and unverified, so it is deliberately counted nowhere.
+    """
+    if old_status == "ok":
+        summary.healthy = max(0, summary.healthy - 1)
+    elif old_status == "rate_limited":
+        summary.rate_limited = max(0, summary.rate_limited - 1)
+    elif old_status == "dead":
+        summary.dead = max(0, summary.dead - 1)
+    if new_status == "ok":
+        summary.healthy += 1
+    elif new_status == "rate_limited":
+        summary.rate_limited += 1
+    elif new_status == "dead":
+        summary.dead += 1
+
+
+def _mark_healed(summary: ProbeSummary, r: ProbeResult) -> None:
+    """Flip a probe result to the transient ``healed`` state.
+
+    The healer acted (identity regenerated, Tor lane restarted) but the new
+    exit has not been verified yet. Rewriting the stored summary in place is
+    what lets the dashboard reflect the heal immediately instead of holding
+    the stale ``rate_limited``/``dead`` verdict until the next probe pass.
+    """
+    old = r.status
+    r.status = "healed"
+    r.exit_ip = ""
+    r.latency_ms = 0.0
+    r.error = ""
+    r.probed_at = time.time()
+    _recount(summary, old, "healed")
+
+
 def heal_expired(
     proxy_pool: Any,
     summary: ProbeSummary,
@@ -456,7 +499,9 @@ def heal_expired(
 
     The expired-IP healer: removes identities whose WARP tunnel has expired
     or whose exit IP is unreachable, then regenerates a fresh identity so
-    the slot is not permanently lost.
+    the slot is not permanently lost. A successful regeneration rewrites the
+    probe result to ``healed`` (see ``_mark_healed``) so the dashboard drops
+    the stale ``dead`` verdict right away.
     """
     healed = 0
     for r in summary.results:
@@ -479,6 +524,7 @@ def heal_expired(
                 if inst is not None:
                     warp_manager.regenerate_instance(inst)
                     healed += 1
+                    _mark_healed(summary, r)
                     log("heal-expired: regenerated identity #%d", idx)
         except Exception as exc:
             log("heal-expired: regeneration failed for %s: %s", r.proxy_id, exc)
@@ -544,7 +590,7 @@ def heal_rate_limited(
         try:
             if _reroll_until_clean(
                 proxy_pool, warp_manager, inst, px, r.proxy_id, burned, log,
-                max_attempts=max_attempts,
+                max_attempts=max_attempts, result=r, summary=summary,
             ):
                 healed += 1
         except Exception as exc:  # noqa: BLE001
@@ -561,6 +607,8 @@ def _reroll_until_clean(
     burned: set,
     log: Callable[..., Any] = lambda *a, **k: None,
     max_attempts: Optional[int] = None,
+    result: Optional[ProbeResult] = None,
+    summary: Optional[ProbeSummary] = None,
 ) -> bool:
     """Re-establish one tunnel until its exit IP is unburned; verify for real.
 
@@ -572,6 +620,11 @@ def _reroll_until_clean(
     Returns True once a real model request through the new exit succeeds.
     A newly reached IP that turns out to be limited too joins the burned set,
     so no later slot wastes rolls landing on it.
+
+    When ``result`` is given, a successful verify rewrites it in place to
+    ``status="ok"`` with the new exit IP and latency, so the stored probe
+    summary reflects the heal immediately (the dashboard polls it, not the
+    logs).
     """
     from warp import egress_map
 
@@ -607,6 +660,15 @@ def _reroll_until_clean(
                 "heal-rate-limit: #%d now exits via %s (endpoint %s, %.0fms) — clean",
                 inst.index, ip, pinned, check.latency_ms,
             )
+            if result is not None:
+                old = result.status
+                result.status = "ok"
+                result.exit_ip = ip
+                result.latency_ms = check.latency_ms
+                result.error = ""
+                result.probed_at = check.probed_at
+                if summary is not None:
+                    _recount(summary, old, "ok")
             return True
         if check.status == "rate_limited":
             # The exit was unburned a moment ago but is limited now (another
@@ -628,6 +690,58 @@ def _reroll_until_clean(
     return False
 
 
+def rotate_burned_tor_lanes(
+    proxy_pool: Any,
+    tor_manager: Any,
+    summary: ProbeSummary,
+    log: Callable[..., Any] = lambda *a, **k: None,
+) -> int:
+    """Restart Tor lanes whose exit the probe found rate-limited or dead.
+
+    A tor restart re-picks the route (guard/middle/exit), so the lane comes
+    back on a fresh exit IP within seconds -- the Tor equivalent of a WARP
+    tunnel re-roll, and just as free. This is the only healer that touches
+    ``tor-*`` lanes: ``heal_expired`` and ``heal_rate_limited`` deliberately
+    skip non-WARP lanes (an identity re-roll is a WARP-only concept), so
+    without this call Tor lanes the startup probe found burned stay burned
+    until the daemon's first periodic probe runs ``PROBE_INTERVAL_S`` later.
+
+    Returns 0 silently when ``tor_manager`` is None or carries no instances,
+    so startup, the daemon and the API can all invoke it unconditionally
+    regardless of whether Tor is enabled -- the call site does not need its
+    own ``LINGLING_TOR_ENABLED`` branch.
+
+    A successful restart rewrites the probe result to ``healed`` so the
+    dashboard stops showing the lane as rate-limited/dead before the next
+    probe verifies its fresh exit.
+    """
+    if tor_manager is None or not getattr(tor_manager, "instances", None):
+        return 0
+    by_index = {i.index: i for i in tor_manager.instances}
+    rotated = 0
+    for r in summary.results:
+        if not r.proxy_id.startswith("tor-"):
+            continue
+        if r.status not in ("rate_limited", "dead"):
+            continue
+        try:
+            idx = int(r.proxy_id.split("-", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        inst = by_index.get(idx)
+        if inst is None:
+            continue
+        log("[tor] lane #%d is %s -- rotating its exit", idx, r.status)
+        try:
+            if tor_manager.restart_instance(inst, log=log):
+                proxy_pool.reset_counters(r.proxy_id)
+                _mark_healed(summary, r)
+                rotated += 1
+        except Exception as exc:  # noqa: BLE001
+            log("[tor] rotate failed for #%d: %s", idx, exc)
+    return rotated
+
+
 def spread_distinct_exits(
     proxy_pool: Any,
     summary: ProbeSummary,
@@ -645,6 +759,7 @@ def spread_distinct_exits(
     """
     from warp import egress_map
 
+    by_id = {res.proxy_id: res for res in summary.results}
     burned = {r.exit_ip for r in summary.results
               if r.status == "rate_limited" and r.exit_ip}
     occ: Dict[str, List[str]] = {}
@@ -697,6 +812,15 @@ def spread_distinct_exits(
                 proxy_pool.reset_counters(proxy_id)
                 moved += 1
                 log("spread: %s -> %s via %s — verified", proxy_id, got, pinned)
+                moved_result = by_id.get(proxy_id)
+                if moved_result is not None:
+                    old = moved_result.status
+                    moved_result.status = "ok"
+                    moved_result.exit_ip = got
+                    moved_result.latency_ms = check.latency_ms
+                    moved_result.error = ""
+                    moved_result.probed_at = check.probed_at
+                    _recount(summary, old, "ok")
             else:
                 log("spread: %s reached %s but the probe said %s",
                     proxy_id, got, check.status)

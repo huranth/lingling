@@ -2974,14 +2974,15 @@ function slotRow(s, probeById, laneOf){
   const load = Number(s.window_load || 0);
   const loadPct = clamp(Math.round(load / 6 * 100), 0, 100);
   // Cooldown and probe state drive the chip. A probe result (rate-limited /
-  // dead) takes precedence because it reflects a real request outcome; a
-  // cooling badge or up/down state is shown only when no probe flag applies.
-  // Latency, exit IP and any upstream error live in the tooltip — the chip
-  // stays one short word so it never grows over its column. The lane chip
-  // names the grouping outright (L1, L2, ...).
+  // dead / healed) takes precedence because it reflects a real request
+  // outcome; a cooling badge or up/down state is shown only when no probe
+  // flag applies. Latency, exit IP and any upstream error live in the
+  // tooltip — the chip stays one short word so it never grows over its
+  // column. The lane chip names the grouping outright (L1, L2, ...).
   const tipBits = [];
   if (probeResult && probeResult.exit_ip) tipBits.push('exit ' + probeResult.exit_ip);
   if (probeStatus === 'ok' && probeLat) tipBits.push(probeLat + 'ms');
+  if (probeStatus === 'healed') tipBits.push('exit refreshed — next probe verifies it');
   if (probeResult && probeResult.error) tipBits.push(probeResult.error);
   const chipTitle = tipBits.length ? ' title="' + esc(tipBits.join(' · ')) + '"' : '';
   const lane = probeResult && probeResult.exit_ip ? laneOf[probeResult.exit_ip] : '';
@@ -2992,7 +2993,9 @@ function slotRow(s, probeById, laneOf){
     ? '<span class="chip bad"><span class="dot"></span>rate-limited</span>'
     : (probeStatus === 'dead'
       ? '<span class="chip bad"><span class="dot"></span>dead</span>'
-      : '');
+      : (probeStatus === 'healed'
+        ? '<span class="chip warn"><span class="dot"></span>healed</span>'
+        : ''));
   const chip = probeChip || (cooling
     ? '<span class="chip warn"><span class="dot"></span>cooling ' + Number(s.cooldown_remaining_s || 0).toFixed(0) + 's</span>'
     : (up

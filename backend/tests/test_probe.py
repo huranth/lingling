@@ -349,6 +349,76 @@ def test_heal_expired_removes_dead_and_regenerates():
     assert pool.get_by_id("warp-2") is None
 
 
+def test_heal_expired_marks_summary_healed():
+    """A regenerated identity flips its probe result to ``healed`` right away.
+
+    The dashboard reads the stored summary, not the logs; without this the
+    slot would keep its stale ``dead`` verdict (red chip) until the next
+    probe pass even though the lane was already regenerated.
+    """
+    pool = _make_pool(2)
+    wm = FakeWarpManager(count=2)
+    summary = probe.ProbeSummary(total=2, healthy=1, dead=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="ok"),
+        probe.ProbeResult(proxy_id="warp-2", status="dead", error="timeout",
+                          exit_ip="104.28.231.142"),
+    ])
+    healed = probe.heal_expired(pool, summary, wm, log=lambda *a, **k: None)
+    assert healed == 1
+    r = summary.results[1]
+    assert r.status == "healed"
+    assert r.exit_ip == "" and r.error == "" and r.latency_ms == 0.0
+    # The aggregate counters move with the verdicts.
+    assert summary.healthy == 1 and summary.dead == 0
+
+
+def test_heal_rate_limited_updates_summary_to_ok():
+    """A successful re-roll rewrites the probe result to ``ok`` with the
+    fresh exit IP and latency.
+
+    The stored summary is what the dashboard renders; a slot that just
+    escaped its burned exit must show as up (on its new lane) instead of
+    keeping the rate-limited chip until the next probe.
+    """
+    pool = _make_pool(1)
+    wm = FakeWarpManager(count=1)
+    summary = probe.ProbeSummary(total=1, rate_limited=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="rate_limited",
+                          exit_ip="104.28.231.142"),
+    ])
+    exits = iter(["104.28.231.145"])
+    checks = iter([probe.ProbeResult(proxy_id="warp-1", status="ok", latency_ms=777)])
+    with mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
+         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid: next(checks)), \
+         mock.patch("warp.probe.time.sleep"):
+        healed = probe.heal_rate_limited(pool, summary, wm, log=lambda *a, **k: None)
+    assert healed == 1
+    r = summary.results[0]
+    assert r.status == "ok"
+    assert r.exit_ip == "104.28.231.145"
+    assert r.latency_ms == 777
+    assert summary.rate_limited == 0 and summary.healthy == 1
+
+
+def test_heal_rate_limited_failed_roll_keeps_summary_intact():
+    """A slot that cannot escape the burned exits keeps its verdict -- the
+    chip must keep showing rate-limited, not flip to something optimistic."""
+    pool = _make_pool(1)
+    wm = FakeWarpManager(count=1)
+    summary = probe.ProbeSummary(total=1, rate_limited=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="rate_limited",
+                          exit_ip="104.28.231.142"),
+    ])
+    with mock.patch("warp.probe._fetch_exit_ip",
+                    return_value="104.28.231.142"), \
+         mock.patch("warp.probe.time.sleep"):
+        healed = probe.heal_rate_limited(pool, summary, wm, log=lambda *a, **k: None)
+    assert healed == 0
+    r = summary.results[0]
+    assert r.status == "rate_limited" and r.exit_ip == "104.28.231.142"
+    assert summary.rate_limited == 1 and summary.healthy == 0
+
+
 def test_heal_rate_limited_rerolls_until_clean_exit():
     """A burned slot re-establishes its tunnel until its exit IP is unburned.
 
@@ -507,6 +577,37 @@ def test_spread_moves_duplicates_onto_free_exits():
     assert moved == 1
     assert aimed == ["edge-free"]     # the roll was aimed at the known edge
     assert rolled == [2]              # the duplicate moved, not the singleton
+
+
+def test_spread_updates_summary_with_new_exit():
+    """A moved slot's probe result follows it to its new exit lane.
+
+    The dashboard groups slots by the exit IP in the probe result; a spread
+    that verified a new exit must rewrite it or the rack keeps showing the
+    slot on its old lane (and the exit-lane count stays one short).
+    """
+    from warp import egress_map
+
+    egress_map.observe("9.9.9.9", "edge-free")
+    pool = _make_pool(3)
+    wm = FakeWarpManager(count=3)
+    summary = probe.ProbeSummary(total=3, healthy=3, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="ok", exit_ip="3.3.3.3"),
+        probe.ProbeResult(proxy_id="warp-2", status="ok", exit_ip="3.3.3.3"),
+        probe.ProbeResult(proxy_id="warp-3", status="ok", exit_ip="4.4.4.4"),
+    ])
+    exits = iter(["9.9.9.9"])
+    checks = iter([probe.ProbeResult(proxy_id="warp-2", status="ok", latency_ms=555)])
+    with mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
+         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid: next(checks)), \
+         mock.patch("warp.probe.time.sleep"):
+        moved = probe.spread_distinct_exits(pool, summary, wm, log=lambda *a, **k: None)
+    assert moved == 1
+    by_id = {r.proxy_id: r for r in summary.results}
+    assert by_id["warp-2"].status == "ok"
+    assert by_id["warp-2"].exit_ip == "9.9.9.9"
+    assert by_id["warp-2"].latency_ms == 555
+    assert summary.healthy == 3       # ok -> ok is a no-op for the counters
 
 
 def test_spread_no_free_targets_is_a_noop():
