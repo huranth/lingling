@@ -49,7 +49,7 @@ def seconds_to_wait(proxy_pool: Any, budget_s: float, log: Any) -> float:
         return 0.0
     if remaining > budget_s:
         log.warning(
-            "egress: every exit is cooling and the soonest needs %.1fs, over the %.0fs budget",
+            "egress: every exit is cooling and the soonest needs %.1fs, over the %.0fs budget — bailing",
             remaining, budget_s,
         )
         return 0.0
@@ -72,7 +72,7 @@ async def wait_for_egress(
     if not remaining:
         return 0.0
 
-    log.warning("egress: every exit is cooling; holding the request %.1fs for the next one", remaining)
+    log.warning("egress: every exit is cooling — parking the request %.1fs for the next one", remaining)
     await sleep(remaining)
     # The slept duration, not a measured one: a caller that injects its own
     # sleep (the tests do) still gets a truthful "this is what it waited for".
@@ -105,7 +105,7 @@ def hold_stream_for_egress(
         return
 
     log.warning(
-        "egress: every exit is cooling; holding the broken stream %.1fs for the next one",
+        "egress: every exit is cooling — parking the broken stream %.1fs for the next one",
         remaining,
     )
     while remaining > 0:

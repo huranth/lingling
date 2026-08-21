@@ -9,11 +9,12 @@ provider whose stream yields a chunk (mid-stream failover lives in stream_guard)
 from __future__ import annotations
 
 from itertools import chain
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Generator, List, Optional, Tuple
 
 from core import config
 from providers.base import Provider, UpstreamError  # noqa: F401
 from providers.proxy_pool import ProxyPool
+from routing import sampler
 
 # Statuses worth retrying on a different proxy/key: rate-limit, auth, and
 # transient server errors.
@@ -33,8 +34,23 @@ class AllFailedError(Exception):
         self.attempts = attempts
 
 
+def _sampler_applies(prov: Provider) -> bool:
+    """Whether the post-heal sampler's verdict can steer this provider.
+
+    The sampler probed OpenCode's free-tier endpoint, so a per-(model, exit)
+    verdict describes *that* upstream. A different-upstream provider (a direct
+    OpenAI key, etc.) is untouched: an OpenCode-side "cooked" verdict says
+    nothing about whether OpenAI will serve the model.
+    """
+    if getattr(prov, "id", "") == "opencode":
+        return True
+    base = getattr(prov, "base_url", "")
+    return bool(base) and str(base).rstrip("/") == str(config.OPENCODE_BASE_URL).rstrip("/")
+
+
 def _pick_proxy(
     prov: Provider, proxy_pool: Optional[ProxyPool], session_id: str, model_id: str,
+    ok_set: Optional[FrozenSet[str]] = None,
 ) -> Optional[Any]:
     """Pick an egress proxy for this provider attempt, or None if not applicable.
 
@@ -43,11 +59,18 @@ def _pick_proxy(
     Sticky sessions (default) pin a conversation to one proxy via the
     session id; otherwise round-robin. Returns None when the pool is empty --
     callers then connect directly (backward compatible).
+
+    ``ok_set`` (from the post-heal sampler) routes a model onto the subset of
+    exits the sampler proved serve it (per-IP burn avoidance). None = no fresh
+    sampler data -> normal selection; empty set = cooked -> the caller's
+    fail-fast cap governs, and the single attempt picks normally.
     """
     if proxy_pool is None or len(proxy_pool) == 0:
         return None
     if not prov.needs_proxy() or prov.prefer_direct(model_id):
         return None
+    if ok_set:
+        return proxy_pool.pick_from(ok_set, session_id=session_id)
     if config.PROXY_STICKY_SESSIONS and session_id:
         return proxy_pool.pick_sticky(session_id)
     return proxy_pool.pick()
@@ -82,6 +105,16 @@ def execute_nonstream(
     attempts: List[Dict[str, Any]] = []
     last_error: Optional[UpstreamError] = None
 
+    # Post-heal sampler: route a model onto the exits the sampler proved serve
+    # it (per-IP burn avoidance) and fail fast when it proved an OpenCode-side
+    # outage, so retrying IPs cannot help and the per-model fallback fires
+    # instead of churning the whole pool. The verdict is upstream-specific (see
+    # ``_sampler_applies``); ``None`` = no fresh sampler data -> the executor
+    # behaves exactly as before.
+    ok_set = sampler.ok_exits(model_id)
+    cooked = ok_set is not None and not ok_set
+    fail_fast = max(1, config.SAMPLER_FAIL_FAST_ATTEMPTS)
+
     for prov in providers:
         if not prov.is_configured():
             attempts.append({"provider": prov.id, "key": None, "status": "not_configured"})
@@ -96,8 +129,13 @@ def execute_nonstream(
                 if proxy_pool and prov.needs_proxy() and not prov.prefer_direct(model_id)
                 else 1
             )
+            if cooked and _sampler_applies(prov) and max_proxies > fail_fast:
+                max_proxies = fail_fast
             for _ in range(max_proxies):
-                proxy = _pick_proxy(prov, proxy_pool, session_id, model_id)
+                proxy = _pick_proxy(
+                    prov, proxy_pool, session_id, model_id,
+                    ok_set=ok_set if _sampler_applies(prov) else None,
+                )
                 proxy_url = proxy.url if proxy else None
                 try:
                     resp = prov.chat_completions(messages, model_id, "", proxy_url=proxy_url, timeout=timeout, proxy_id=proxy.id if proxy else None, **params)
@@ -118,6 +156,9 @@ def execute_nonstream(
             continue
         tried: set = set()
         max_keys = max(1, len(prov.keys))
+        if cooked and _sampler_applies(prov) and max_keys > fail_fast:
+            max_keys = fail_fast
+        key_ok_set = ok_set if _sampler_applies(prov) else None
         for _ in range(max_keys):
             key = prov.keys.pick()
             if key is None:
@@ -125,7 +166,9 @@ def execute_nonstream(
             if key.id in tried and len(tried) >= len(prov.keys):
                 break
             tried.add(key.id)
-            proxy = _pick_proxy(prov, proxy_pool, session_id, model_id)
+            proxy = _pick_proxy(
+                prov, proxy_pool, session_id, model_id, ok_set=key_ok_set,
+            )
             proxy_url = proxy.url if proxy else None
             try:
                 resp = prov.chat_completions(messages, model_id, key.secret, proxy_url=proxy_url, timeout=timeout, proxy_id=proxy.id if proxy else None, **params)
@@ -174,6 +217,9 @@ def execute_stream(
 
     attempts: List[Dict[str, Any]] = []
     last_error: Optional[UpstreamError] = None
+    ok_set = sampler.ok_exits(model_id)
+    cooked = ok_set is not None and not ok_set
+    fail_fast = max(1, config.SAMPLER_FAIL_FAST_ATTEMPTS)
     for prov in providers:
         if not prov.is_configured():
             attempts.append({"provider": prov.id, "key": None, "status": "not_configured"})
@@ -183,8 +229,13 @@ def execute_stream(
             if proxy_pool and prov.needs_proxy() and not prov.prefer_direct(model_id)
             else 1
         )
+        if cooked and _sampler_applies(prov) and max_attempts > fail_fast:
+            max_attempts = fail_fast
+        stream_ok_set = ok_set if _sampler_applies(prov) else None
         for _ in range(max_attempts):
-            proxy = _pick_proxy(prov, proxy_pool, session_id, model_id)
+            proxy = _pick_proxy(
+                prov, proxy_pool, session_id, model_id, ok_set=stream_ok_set,
+            )
             proxy_url = proxy.url if proxy else None
             key = None if not prov.requires_key() else prov.keys.pick()
             if prov.requires_key() and key is None:

@@ -24,19 +24,28 @@ cd /d "%~dp0"
 
 echo.
 echo ============================================================
-echo   Lingling + WARP one-click starter
+echo   Lingling + WARP -- one click, and we're off.
 echo ============================================================
 echo.
 
-echo [1/2] Starting Lingling backend on http://localhost:8000 ...
+echo [1/2] Waking Lingling up on http://localhost:8000 ...
 REM Use the `py` launcher, not `python`: PATH's `python` resolves to Python 3.12
 REM here, which has no fastapi, so the backend would crash on import. `py -3`
 REM runs the default 3.x (3.14 on this machine), where the requirements live.
-start "Lingling Backend" /MIN cmd /c "cd /d %~dp0 && set LINGLING_BOOTSTRAP_WARP=1 && py -3 app.py"
+REM
+REM Lingling logs itself to data\backend.log from inside the app (a FileHandler
+REM wired in app._build_log_config), so this launcher does NOT redirect stdout.
+REM The minimized window shows the live (minimal, WARP-verbose-off) output
+REM instead of a blank pane. It stays open on a crash (cmd /k, not /c), so even
+REM an import-time stack trace -- before the file handler attaches -- is still
+REM readable there; runtime traces also land in data\backend.log. Clear the
+REM file by deleting it.
+if not exist "%~dp0data" mkdir "%~dp0data"
+start "Lingling Backend" /MIN cmd /k "cd /d %~dp0 && set LINGLING_BOOTSTRAP_WARP=1 && py -3 app.py"
 
 REM Wait for the backend to report healthy. /api/health is deliberately keyless,
 REM so a liveness check like this one needs no credential.
-echo [1/2] Waiting for Lingling backend to be ready ...
+echo [1/2] Poking Lingling until it answers on :8000 ...
 set "retries=30"
 :wait_loop
 curl -s -f -o nul http://127.0.0.1:8000/api/health
@@ -47,24 +56,25 @@ if %retries% gtr 0 goto wait_loop
 echo Backend did not start in time. Check the "Lingling Backend" window.
 exit /b 1
 :backend_ready
-echo Backend ready.
+echo Backend ready. Lingling's awake and mildly annoyed.
 
 REM WARP registration runs on a background thread inside the server, so the pool
 REM fills in shortly after this point. The first run downloads wgcf + wireproxy
 REM and registers 10 identities, which takes a minute or two; later runs reuse
-REM them and are near-instant. Watch the backend window, or the Egress view.
-echo [2/2] WARP pool registering in the background (first run: 1-2 min) ...
+REM them and are near-instant. Watch data\backend.log (or the Egress view).
+echo [2/2] WARP pool registering in the background (first run: 1-2 min) -- opencode won't know what hit it.
 
 echo.
 echo ============================================================
-echo   DONE. Lingling is live.
+echo   DONE. Lingling is live and taking requests.
 echo   Dashboard : http://localhost:8000
 echo   Chat API  : http://localhost:8000/v1/chat/completions
 echo   Egress    : http://localhost:8000/#egress
+echo   Backend log: data\backend.log (crash traces kept here)
 echo ============================================================
 echo.
 echo   API clients (Cline, Claude Code, Jan) need a key:
-echo     open the dashboard, go to Keys, create one.
+echo     open the dashboard, go to Keys, create one -- yes, even you.
 echo   The dashboard itself uses a session cookie -- no key required.
 echo.
 echo   To STOP everything later:

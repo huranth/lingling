@@ -18,6 +18,7 @@ import time
 from typing import Any, Callable, Dict, List
 
 from core import config
+from providers import active_streams
 from warp import egress_map
 from warp.probe import _fetch_exit_ip, _find_instance, _instance_index, latest_summary
 
@@ -79,6 +80,9 @@ def _roll_to(
     restart and a trace -- never OpenCode quota.
     """
     inst, px = slot["instance"], slot["proxy"]
+    if config.DEFER_REROLL_WHEN_BUSY and active_streams.active(px.id) > 0:
+        log("formation: %s re-roll deferred -- stream in flight", px.id)
+        return slot["exit_ip"]
     for attempt in range(config.WARP_FORMATION_MAX_ROLLS):
         endpoint = order[attempt % len(order)] if order else None
         pinned = warp_manager.re_roll_tunnel(
@@ -179,7 +183,7 @@ def form_distinct_exits(
     usable = {ip: ids for ip, ids in lanes.items() if ip not in burned}
     distinct = len(usable)
     log(
-        "formation: %d usable lanes across %d slots (%d rolls, %.0fs)",
+        "formation: %d usable lanes across %d slots (%d rolls, %.0fs) — that's the spread",
         distinct, len(slots), rolls, time.time() - started,
     )
     return {

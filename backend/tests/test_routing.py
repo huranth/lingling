@@ -664,6 +664,250 @@ def test_unit_stream_guard_no_retry_after_completion():
     assert outcome.error is None
 
 
+def test_unit_stream_guard_opencode_usage_frame_is_terminal():
+    """OpenCode's free stream (MuseSpark) ends without finish_reason or [DONE]:
+    content chunks carry finish_reason:null, then a `choices:[]`+`usage` frame
+    and a trailing `cost` frame, then a clean close. That completion must be
+    recognized so the stream is NOT misread as a mid-flight break and retried
+    (which would emit a reset frame and regenerate the entire answer, doubling
+    request/egress spend and delivering garbled doubled content to the client).
+    """
+    from routing import stream_guard
+
+    calls = []
+
+    def opencode():
+        # cushion/preamble frame, no content, no usage, no finish_reason:
+        yield b'data: {"choices":[]}'
+        # content, finish_reason:null as on the live wire:
+        yield b'data: {"choices":[{"delta":{"content":"Hi there"},"finish_reason":null}]}'
+        yield b'data: {"choices":[{"delta":{"content":"!"},"finish_reason":null}]}'
+        # OpenCode's terminal usage frame, then its trailing cost frame:
+        yield b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4}}'
+        yield b'data: {"choices":[],"cost":"0"}'
+
+    def should_not_run():
+        calls.append(1)
+        yield b"data: [DONE]"
+
+    seen = []
+    outcome = stream_guard.StreamOutcome()
+    frames = list(stream_guard.guarded_stream(
+        open_stream=should_not_run, first=opencode(), outcome=outcome,
+        on_chunk=seen.append, log=_QuietLog(),
+    ))
+    assert calls == [], "a completed OpenCode stream must not be retried"
+    assert outcome.completed is True
+    assert outcome.attempts == 1
+    assert outcome.recovered is False
+    assert outcome.error is None
+    assert not any(b"lingling_reset" in f for f in frames), "no reset on completion"
+    # Content reached the client (split across two finish_reason:null frames,
+    # so check the pieces); usage/cost trailing frames forwarded verbatim.
+    body = b"".join(frames)
+    assert b'"content":"Hi there"' in body and b'"content":"!"' in body
+    assert b'"usage":' in body and b'"cost":"0"' in body
+    assert all(s in seen for s in (
+        b'data: {"choices":[]}',
+        b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4}}',
+    ))
+
+
+def test_unit_stream_guard_cushion_frame_alone_is_not_terminal():
+    """An empty-choices cushion frame on its own (the preamble OpenCode sends
+    before content) is NOT terminal: a stream that only yields it then dies has
+    not finished, and must still retry. Guards against over-triggering
+    completion on the preamble."""
+    from routing import stream_guard
+
+    # The function names usage/cost/finish_reason as terminal, never a bare
+    # empty-choices array (OpenCode sends several as a preamble before content).
+    assert stream_guard.chunk_is_terminal({"choices": []}) is False
+    assert stream_guard.chunk_is_terminal({"choices": [{"finish_reason": None}]}) is False
+    assert stream_guard.chunk_is_terminal({
+        "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+    }) is True
+    assert stream_guard.chunk_is_terminal({"choices": [], "cost": "0"}) is True
+    assert stream_guard.chunk_is_terminal({
+        "choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}]
+    }) is True
+
+
+def test_unit_stream_guard_chunk_reasons_helper():
+    """chunk_reasons recognizes reasoning/thinking tokens in any of the shapes
+    gateways ship (reasoning_content, reasoning, thinking -- str or dict), and
+    ignores a bare false/empty value. This helper is how a hidden-reasoning
+    model gets *learned* from its wire behaviour so it self-adapts."""
+    from routing import stream_guard as sg
+    assert sg.chunk_reasons({"choices": [{"delta": {"reasoning_content": "hmm"}}]}) is True
+    assert sg.chunk_reasons({"choices": [{"delta": {"reasoning": "thinking..."}}]}) is True
+    assert sg.chunk_reasons({"choices": [{"delta": {"thinking": {"text": "x"}}}]}) is True
+    assert sg.chunk_reasons({"choices": [{"message": {"reasoning_content": "hmm"}}]}) is True
+    # Not reasoning-in-progress:
+    assert sg.chunk_reasons({"choices": [{"delta": {"reasoning": False}}]}) is False
+    assert sg.chunk_reasons({"choices": [{"delta": {"reasoning": {}}}]}) is False
+    assert sg.chunk_reasons({"choices": [{"delta": {"content": "answer"}}]}) is False
+    assert sg.chunk_reasons({"choices": []}) is False
+    assert sg.chunk_reasons({}) is False
+
+
+def test_unit_stream_guard_marks_pacing_on_reasoning_chunk():
+    """A stream emitting reasoning tokens learns the model as reasoning, so the
+    next turn grants it thinking patience even when its listing does not
+    advertise reasoning (the dynamic-adapt path for a future MuseSpark-class
+    model). model_id carries the resolved target."""
+    from routing import stream_guard, pacing_memory
+
+    pacing_memory.reset_for_test()
+    target = "future-hidden-reasoning-free"
+
+    def streams():
+        yield b'data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}'
+        yield b'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}'
+
+    outcome = stream_guard.StreamOutcome()
+    list(stream_guard.guarded_stream(
+        open_stream=lambda: iter([b"data: [DONE]"]), first=streams(),
+        outcome=outcome, on_chunk=lambda raw: None, log=_QuietLog(),
+        model_id=target,
+    ))
+    assert outcome.completed is True
+    assert outcome.attempts == 1
+    assert pacing_memory.is_reasoning(target) is True
+
+
+def test_unit_stream_guard_marks_pacing_on_stall_before_content():
+    """A stream that trips the idle watchdog before emitting any visible content
+    is the signature of a hidden-reasoning model thinking through its first
+    token. It is learned *before* the retry re-derives pacing, so the retry gets
+    the thinking patience and can wait the silence out."""
+    from routing import stream_guard, stream_idle, pacing_memory
+
+    pacing_memory.reset_for_test()
+    target = "silent-thinker-free"
+
+    def stalls():
+        # Preamble only (no visible content), then the watchdog fires.
+        yield b'data: {"choices":[]}'
+        raise stream_idle.StreamStalled(seconds=90.0, frames=1)
+
+    def completes():
+        yield b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}'
+
+    outcome = stream_guard.StreamOutcome()
+    list(stream_guard.guarded_stream(
+        open_stream=completes, first=stalls(),
+        outcome=outcome, on_chunk=lambda raw: None, log=_QuietLog(),
+        model_id=target,
+    ))
+    assert outcome.completed is True
+    assert outcome.attempts == 2
+    assert outcome.recovered is True
+    assert pacing_memory.is_reasoning(target) is True
+
+
+def test_unit_stream_guard_no_mark_on_stall_after_content():
+    """A stall mid-content (the model already spoke) is NOT hidden-thinking, so
+    it must not be learned -- otherwise a one-time mid-stream stall would loosen
+    that model's first-token failover for nothing. text_chars>0 is the gate."""
+    from routing import stream_guard, stream_idle, pacing_memory
+
+    pacing_memory.reset_for_test()
+    target = "ordinary-model"
+
+    def stalls():
+        yield b'data: {"choices":[{"delta":{"content":"partial answer"}}]}'
+        raise stream_idle.StreamStalled(seconds=90.0, frames=1)
+
+    def completes():
+        yield b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}'
+
+    outcome = stream_guard.StreamOutcome()
+    list(stream_guard.guarded_stream(
+        open_stream=completes, first=stalls(),
+        outcome=outcome, on_chunk=lambda raw: None, log=_QuietLog(),
+        model_id=target,
+    ))
+    assert outcome.completed is True
+    assert outcome.recovered is True
+    assert pacing_memory.is_reasoning(target) is False, \
+        "mid-content stall must not learn the model as reasoning"
+
+
+def test_unit_stream_guard_no_mark_without_model_id():
+    """Without a model_id there is nothing to learn; reasoning tokens are
+    observed but dropped (a direct/passthrough stream has no model to mark)."""
+    from routing import stream_guard, pacing_memory
+
+    pacing_memory.reset_for_test()
+
+    def streams():
+        yield b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}'
+        yield b'data: {"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}]}'
+
+    outcome = stream_guard.StreamOutcome()
+    list(stream_guard.guarded_stream(
+        open_stream=lambda: iter([b"data: [DONE]"]), first=streams(),
+        outcome=outcome, on_chunk=lambda raw: None, log=_QuietLog(),
+        # model_id omitted on purpose
+    ))
+    assert outcome.completed is True
+    assert pacing_memory.snapshot() == []
+
+
+def test_unit_stream_guard_no_mark_on_clean_completion():
+    """A plain non-reasoning completion teaches nothing -- the registry is fed
+    only by observed reasoning, not by every stream that finishes."""
+    from routing import stream_guard, pacing_memory
+
+    pacing_memory.reset_for_test()
+    target = "plain-model"
+
+    def streams():
+        yield b'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}'
+
+    outcome = stream_guard.StreamOutcome()
+    list(stream_guard.guarded_stream(
+        open_stream=lambda: iter([b"data: [DONE]"]), first=streams(),
+        outcome=outcome, on_chunk=lambda raw: None, log=_QuietLog(),
+        model_id=target,
+    ))
+    assert outcome.completed is True
+    assert pacing_memory.is_reasoning(target) is False
+
+
+def test_unit_stream_pacing_body_asks_reasoning():
+    """_stream_pacing grants patience and LEARNS a model when the request body
+    asks for reasoning -- the fallback for a hidden-reasoning model whose
+    listing does not advertise it and whose client never sends reasoning tokens
+    but does ask for thinking. Covers the OpenAI/Codex/Anthropic vocabularies.
+    """
+    from app import _stream_pacing, _body_asks_reasoning
+    from routing import pacing_memory
+
+    pacing_memory.reset_for_test()
+    target = "soon-learned-free"
+    # Confirm helper detects every vocabulary:
+    assert _body_asks_reasoning({"reasoning_effort": "high"}) is True
+    assert _body_asks_reasoning({"reasoning": {"effort": "high"}}) is True
+    assert _body_asks_reasoning({"reasoning": True}) is True
+    assert _body_asks_reasoning({"thinking": {"type": "enabled"}}) is True
+    assert _body_asks_reasoning({"thinking": {"type": "adaptive"}}) is True
+    assert _body_asks_reasoning({"thinking": {"budget_tokens": 1024}}) is True
+    assert _body_asks_reasoning({}) is False
+    assert _body_asks_reasoning({"thinking": {"type": "disabled"}}) is False
+    # Pre-mark: not in override/catalog, empty registry, no body -> default.
+    idle_no_body, read_no_body = _stream_pacing(target, body=None)
+    assert pacing_memory.is_reasoning(target) is False
+    # With a reasoning body: patient now AND learned for next time.
+    idle_body, read_body = _stream_pacing(target, body={"reasoning_effort": "high"})
+    assert read_body > read_no_body  # the thinking patience raised the read timeout
+    assert pacing_memory.is_reasoning(target) is True
+    # Next turn, even without the body, the learned entry grants patience:
+    idle_next, read_next = _stream_pacing(target, body=None)
+    assert read_next == read_body
+
+
 def test_unit_stream_guard_gives_up_after_one_retry():
     """Two failures in a row end the stream; no infinite retry loop."""
     from routing import stream_guard
@@ -3311,15 +3555,11 @@ if __name__ == "__main__":
     main()
 
 
-def test_unit_a_retired_model_is_hidden_until_ttl(tmp_path, monkeypatch):
-    """Advertised-`-free` models that 400 "unavailable for free" are removed from
-    the catalog, stay gone across refreshes, and are persisted so the Codex
-    generator (a separate process) agrees. After the TTL they are re-offered,
-    in case OpenCode restores the free tier."""
-    from models.catalog import UnifiedCatalog
+def _fetch_provider_factory():
+    """Build a controllable FetchProvider + helpers for catalog self-heal tests."""
+    from models.catalog import UnifiedCatalog  # noqa: F401 (-imported by callers)
     from providers.base import Provider, ProviderModel
     from providers.key_pool import KeyPool
-    from core import config as core_config
 
     class FetchProvider(Provider):
         id = "opencode"
@@ -3329,11 +3569,15 @@ def test_unit_a_retired_model_is_hidden_until_ttl(tmp_path, monkeypatch):
         def __init__(self):
             super().__init__(KeyPool([]))
             self._ids = []
+            self._fail_next = False     # set True to make the next fetch raise
 
         def requires_key(self):
             return False
 
         def fetch_model_ids(self):
+            if self._fail_next:
+                self._fail_next = False
+                raise RuntimeError("upstream /models blip")
             return self._ids
 
         def is_model_free(self, model_id, meta):
@@ -3345,71 +3589,238 @@ def test_unit_a_retired_model_is_hidden_until_ttl(tmp_path, monkeypatch):
                 vision=False, reasoning=True, context_length=1000, max_output=100,
             )
 
+    return FetchProvider, UnifiedCatalog
+
+
+def test_unit_a_retired_model_self_heals_when_opencode_re_lists_it(tmp_path, monkeypatch):
+    """The auto-recycle must not lock out a model OpenCode still offers free.
+
+    A ``-free`` model retired at runtime was absent from /models when it 400'd;
+    if a later refresh sees it back in the free section the outage was transient
+    upstream overload (OpenCode pulls a genuinely-dropped model from the free
+    section outright -- it doesn't answer "unavailable" for one it removed), so
+    the catalog resurrects it immediately instead of hiding it for the full TTL.
+    Only a model genuinely gone from the free section stays retired. This is the
+    behavior that keeps deepseek-v4-flash-free routable during huge-traffic
+    overload instead of recycling it for a week."""
+    from core import config as core_config
+
+    FetchProvider, UnifiedCatalog = _fetch_provider_factory()
+
     monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
+    monkeypatch.setattr(core_config, "RETIRED_MODELS_SEED", "")
     monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
 
     prov = FetchProvider()
     cat = UnifiedCatalog({"opencode": prov})
+
+    # Live free section lists both; retire one via the runtime path
+    # (mark_unavailable is what _flag_model_retired calls after a 400 once a
+    # refresh confirms the model is gone).
     prov._ids = ["good-free", "dead-free"]
     cat.refresh(force=True)
     assert sorted(m.id for m in cat.free()) == ["dead-free", "good-free"]
-
-    # A request to the dead model fails -> mark it retired.
     cat.mark_unavailable("dead-free")
-
     assert "dead-free" not in [m.id for m in cat.free()]
-    assert "dead-free" not in [m.id for m in cat.vision_free()]
     assert cat.by_id("dead-free") is None
     assert cat.is_unavailable("dead-free") is True
     assert "dead-free" in cat.meta()["retired_models"]
-    assert cat.meta()["free"] == 1
 
-    # It must stay gone after a refresh re-advertises it.
+    # Genuinely removed (OpenCode dropped it from the free section): absent from
+    # the next live fetch -> stays retired, NOT resurrected.
+    prov._ids = ["good-free"]
     cat.refresh(force=True)
     assert "dead-free" not in [m.id for m in cat.free()]
+    assert cat.is_unavailable("dead-free") is True
 
-    # Persisted: a fresh catalog (as the Codex generator builds) also hides it.
+    # OpenCode re-lists it (transient overload cleared): a live, non-stale
+    # refresh resurrects it automatically -- no manual un-seed, no 7-day TTL wait.
+    prov._ids = ["good-free", "dead-free"]
+    cat.refresh(force=True)
+    assert "dead-free" in [m.id for m in cat.free()]
+    assert cat.is_unavailable("dead-free") is False
+    assert cat.by_id("dead-free") is not None
+
+    # The resurrection is persisted, so a freshly-built catalog (the Codex
+    # generator is a separate process) no longer hides it either.
     prov2 = FetchProvider()
     prov2._ids = ["good-free", "dead-free"]
     cat2 = UnifiedCatalog({"opencode": prov2})
     cat2.refresh(force=True)
-    assert "dead-free" not in [m.id for m in cat2.free()]
-
-    # After the TTL passes it is offered again (OpenCode may restore it).
-    monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 0)
-    prov3 = FetchProvider()
-    prov3._ids = ["good-free", "dead-free"]
-    cat3 = UnifiedCatalog({"opencode": prov3})
-    cat3.refresh(force=True)
-    assert "dead-free" in [m.id for m in cat3.free()]
+    assert "dead-free" in [m.id for m in cat2.free()]
 
 
-def test_unit_app_flags_a_model_retired_when_the_400_says_unavailable(monkeypatch):
-    """The 400 "unavailable for free" retires the model; other 400s do not."""
+def test_unit_runtime_retirement_not_resurrected_from_stale_fetch(tmp_path, monkeypatch):
+    """A live fetch is authoritative for resurrection; a stale-fallback
+    appearance is the cached last-good list, not OpenCode actually serving the
+    model again, so it must NOT resurrect a retired id. Otherwise a transient
+    /models outage (falling back to a cache that still lists the model) would
+    falsely un-retire a model the upstream genuinely stopped offering."""
+    from core import config as core_config
+
+    FetchProvider, UnifiedCatalog = _fetch_provider_factory()
+
+    monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
+    monkeypatch.setattr(core_config, "RETIRED_MODELS_SEED", "")
+    monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
+
+    prov = FetchProvider()
+    cat = UnifiedCatalog({"opencode": prov})
+
+    # Prime the last-good cache with a list that includes dead-free, then retire.
+    prov._ids = ["good-free", "dead-free"]
+    cat.refresh(force=True)
+    cat.mark_unavailable("dead-free")
+    assert cat.is_unavailable("dead-free") is True
+
+    # The next fetch FAILS: the catalog falls back to last-good (which still
+    # lists dead-free) under stale=True. That appearance is the cache, not a
+    # live confirmation, so dead-free must stay retired.
+    prov._fail_next = True
+    cat.refresh(force=True)
+    assert "dead-free" not in [m.id for m in cat.free()]
+    assert cat.is_unavailable("dead-free") is True
+
+
+def test_unit_seeded_retirement_survives_re_listing(tmp_path, monkeypatch):
+    """An operator-curated seed is honored verbatim: the seed exists precisely
+    because /models keeps advertising a model the operator knows is dead, so a
+    live re-appearance is NOT authoritative for a seeded id -- it stays hidden
+    until the operator un-seeds it (LINGLING_RETIRED_MODELS='')."""
+    from core import config as core_config
+
+    FetchProvider, UnifiedCatalog = _fetch_provider_factory()
+
+    monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
+    monkeypatch.setattr(core_config, "RETIRED_MODELS_SEED", "seeded-free")
+    monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
+
+    prov = FetchProvider()
+    prov._ids = ["good-free", "seeded-free"]
+    cat = UnifiedCatalog({"opencode": prov})
+    cat.refresh(force=True)
+
+    # Seeded id is hidden straight away, even though /models lists it free.
+    assert "seeded-free" not in [m.id for m in cat.free()]
+    assert cat.is_unavailable("seeded-free") is True
+    # The self-heal leaves seeded ids alone across a live refresh.
+    cat.refresh(force=True)
+    assert "seeded-free" not in [m.id for m in cat.free()]
+    assert cat.is_unavailable("seeded-free") is True
+
+
+def test_unit_app_flags_a_model_retired_only_when_gone_from_free_section(monkeypatch):
+    """Retirement is reserved for a model OpenCode actually dropped from the
+    free section. A "-free" model that 400s "unavailable" while *still listed*
+    is transient overload -- it stays routable. So _flag_model_retired forces a
+    refresh and retires ONLY when by_id comes back None. Other 400s and 429s do
+    not even refresh (no retirement, and no /models hammering on a non-match)."""
     import app as app_mod
     from providers.base import UpstreamError
     from routing import executor as exec_mod
 
-    marked = []
+    # Reset the per-model recheck cooldown so this test starts clean.
+    monkeypatch.setattr(app_mod, "_retire_recheck_at", {})
 
     class FakeCat:
-        def mark_unavailable(self, mid):
-            marked.append(mid)
+        def __init__(self):
+            self.marked = []
+            self.refresh_calls = 0
+            self._gone = set()      # ids by_id reports as None (dropped from free)
 
-    monkeypatch.setattr(app_mod, "catalog", FakeCat())
+        def refresh(self, force=False):
+            self.refresh_calls += 1
+            return self
+
+        def by_id(self, mid):
+            return None if mid in self._gone else object()  # truthy = still listed
+
+        def mark_unavailable(self, mid):
+            self.marked.append(mid)
+
+        def is_unavailable(self, mid):
+            return mid in self.marked
+
+    cat = FakeCat()
+    monkeypatch.setattr(app_mod, "catalog", cat)
+
+    def unavail(detail):
+        return exec_mod.AllFailedError(UpstreamError(400, detail), [])
+
+    # Still listed -> transient overload -> NOT retired; refresh was consulted.
+    assert app_mod._flag_model_retired(
+        unavail("This model is unavailable for free. use inclusionai/ling-3.0-flash"),
+        "ling-3.0-flash-free",
+    ) is False
+    assert cat.marked == []
+    assert cat.refresh_calls == 1
+
+    # Same model, now genuinely dropped from the free section -> retired.
+    cat._gone.add("ling-3.0-flash-free")
+    # The previous call stamped the recheck clock; clear it so this iteration
+    # is allowed to recheck (the cooldown is exercised in its own test below).
+    app_mod._retire_recheck_at.clear()
+    assert app_mod._flag_model_retired(
+        unavail("This model is unavailable for free."),
+        "ling-3.0-flash-free",
+    ) is True
+    assert cat.marked == ["ling-3.0-flash-free"]
+    assert cat.refresh_calls == 2
+
+    # A non-retirement 400 must not retire AND must not even refresh.
+    before = cat.refresh_calls
+    assert app_mod._flag_model_retired(
+        exec_mod.AllFailedError(UpstreamError(400, "bad request shape"), []),
+        "x-free",
+    ) is False
+    assert cat.refresh_calls == before              # no /models refresh on a non-match
+    assert cat.marked == ["ling-3.0-flash-free"]
+
+    # A 429 is not retirement either -- and also does not refresh.
+    assert app_mod._flag_model_retired(
+        exec_mod.AllFailedError(UpstreamError(429, "rate limited"), []),
+        "x-free",
+    ) is False
+    assert cat.refresh_calls == before
+
+
+def test_unit_app_flags_model_retired_recheck_cooldown(monkeypatch):
+    """A transient "unavailable" burst (huge upstream traffic) fires the
+    free-section recheck on many concurrent requests at once. The per-model
+    cooldown bounds it to one refresh per window: a second call for the same
+    model within the cooldown returns False WITHOUT refreshing again, so a burst
+    can't hammer /models."""
+    import app as app_mod
+    from providers.base import UpstreamError
+    from routing import executor as exec_mod
+
+    monkeypatch.setattr(app_mod, "_retire_recheck_at", {})
+
+    class FakeCat:
+        def __init__(self):
+            self.refresh_calls = 0
+
+        def refresh(self, force=False):
+            self.refresh_calls += 1
+            return self
+
+        def by_id(self, mid):
+            return object()        # always still listed -> never retired here
+
+        def mark_unavailable(self, mid):
+            pass
+
+        def is_unavailable(self, mid):
+            return False
+
+    cat = FakeCat()
+    monkeypatch.setattr(app_mod, "catalog", cat)
 
     exc = exec_mod.AllFailedError(
-        UpstreamError(400, "This model is unavailable for free. use inclusionai/ling-3.0-flash"),
-        [],
+        UpstreamError(400, "This model is unavailable for free"), []
     )
-    assert app_mod._flag_model_retired(exc, "ling-3.0-flash-free") is True
-    assert marked == ["ling-3.0-flash-free"]
-
-    # A non-retirement 400 must not retire the model.
-    exc2 = exec_mod.AllFailedError(UpstreamError(400, "bad request shape"), [])
-    assert app_mod._flag_model_retired(exc2, "x-free") is False
-    assert marked == ["ling-3.0-flash-free"]
-
-    # A 429 is not retirement either.
-    exc3 = exec_mod.AllFailedError(UpstreamError(429, "rate limited"), [])
-    assert app_mod._flag_model_retired(exc3, "x-free") is False
+    assert app_mod._flag_model_retired(exc, "muse-free") is False
+    assert cat.refresh_calls == 1
+    # Immediate second call -> cooldown skips the recheck entirely.
+    assert app_mod._flag_model_retired(exc, "muse-free") is False
+    assert cat.refresh_calls == 1

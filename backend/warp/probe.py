@@ -16,6 +16,12 @@ A fourth, ``rotate_burned_tor_lanes``, restarts Tor lanes the probe found
 rate-limited or dead -- Tor has no identity to re-roll, so it gets its own
 healer, called from startup and the daemon alike.
 
+A probe that reaches OpenCode but is answered with a 4xx (the probe model was
+rejected or gated, e.g. 401) is tagged ``probe_error`` rather than ``dead``:
+it proves the tunnel is up and not rate-limited, and re-generating its
+identity cannot fix an upstream model gate. The healers skip it so a stale
+probe model never regenerates the pool of good tunnels for nothing.
+
 Every request through a lane is preceded by a raw SOCKS5 liveness check with
 a hard socket timeout: httpcore's own SOCKS5 handshake reads carry no timeout
 (verifiable in its ``_init_socks5_connection`` — the sync backend turns the
@@ -40,6 +46,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from core import config
+from providers import active_streams
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +58,7 @@ class ProbeResult:
     """Outcome of probing a single proxy."""
 
     proxy_id: str
-    status: str = "pending"       # "ok" | "rate_limited" | "dead" | "healed" | "pending"
+    status: str = "pending"       # "ok" | "rate_limited" | "probe_error" | "dead" | "healed" | "pending"
     latency_ms: float = 0.0
     error: str = ""
     probed_at: float = 0.0
@@ -74,6 +81,11 @@ class ProbeSummary:
     healthy: int = 0
     rate_limited: int = 0
     dead: int = 0
+    # Lanes the probe reached OpenCode through but whose probe model was
+    # rejected (4xx other than 429). The tunnel is up and not rate-limited, so
+    # this is neither healthy nor dead -- it is unverified by the probe. Kept
+    # separate so the healers leave it alone (see the module docstring).
+    probe_error: int = 0
     duration_ms: float = 0.0
     results: List[ProbeResult] = field(default_factory=list)
     completed_at: float = 0.0
@@ -84,6 +96,7 @@ class ProbeSummary:
             "healthy": self.healthy,
             "rate_limited": self.rate_limited,
             "dead": self.dead,
+            "probe_error": self.probe_error,
             "duration_ms": round(self.duration_ms, 1),
             "completed_at": self.completed_at,
             "results": [r.to_dict() for r in self.results],
@@ -96,6 +109,10 @@ class ProbeSummary:
 
 _lock = threading.Lock()
 _latest: Optional[ProbeSummary] = None
+# Serializes probe_all's resolve+sweep+converge across callers, so concurrent
+# startup probes (the WARP pool probe and the Tor-join snapshot probe) don't
+# interleave mid-sweep or double up on OpenCode. See probe_all.
+_probe_lock = threading.Lock()
 
 
 def latest_summary() -> Optional[Dict[str, Any]]:
@@ -225,6 +242,7 @@ def _probe_single(
     model: str,
     base_url: str,
     timeout: float,
+    max_tokens: int = 5,
 ) -> ProbeResult:
     """Send a minimal chat completion through one SOCKS5 proxy.
 
@@ -250,7 +268,7 @@ def _probe_single(
     body = {
         "model": model,
         "messages": [{"role": "user", "content": "hi"}],
-        "max_tokens": 5,
+        "max_tokens": max_tokens,
         "stream": False,
     }
     url = f"{base_url}/chat/completions"
@@ -286,6 +304,42 @@ def _probe_single(
                 result.error = str(detail.get("error", {}).get("message", ""))[:200]
             except Exception:
                 result.error = "rate limited (429)"
+        elif 400 <= resp.status_code < 500:
+            # OpenCode answered -- the tunnel reached the upstream. A 4xx here
+            # (401/400/403/404) is a model/auth rejection, not a dead tunnel:
+            # the probe model may have been gated behind a key, renamed or
+            # pulled from the free tier. Regenerating the identity cannot fix
+            # an upstream model gate, and re-rolling a healthy exit only wastes
+            # a good rate-limit budget, so tag it ``probe_error`` and let the
+            # healers skip it. Treating this as "dead" once regressed live:
+            # every freshly registered identity was healed/regenerated on the
+            # next probe because the probe model had been gated behind a key.
+            result.status = "probe_error"
+            # Surface *why* the upstream objected instead of a bare "HTTP 400":
+            # a per-lane log line that says "probe-error (HTTP 400: This model
+            # is unavailable for free)" tells the operator the egress is fine and
+            # the model is the problem, where "HTTP 400" alone forces a manual
+            # reproduction to learn the cause. OpenCode's rejections are JSON
+            # ({error:{message}}); fall back to a trimmed body for anything else.
+            detail = ""
+            try:
+                err = resp.json()
+            except Exception:  # noqa: BLE001
+                err = None
+            if isinstance(err, dict):
+                detail = str(
+                    (err.get("error") or {}).get("message", "")
+                    or err.get("message", "")
+                    or err.get("detail", "")
+                )
+            if not detail:
+                try:
+                    detail = (resp.text or "").strip()
+                except Exception:  # noqa: BLE001
+                    detail = ""
+            result.error = f"HTTP {resp.status_code}" + (
+                f": {detail.strip().replace(chr(10), ' ')[:160]}" if detail.strip() else ""
+            )
         else:
             result.status = "dead"
             result.error = f"HTTP {resp.status_code}"
@@ -309,6 +363,83 @@ def _probe_single(
 # Probe all proxies
 # ---------------------------------------------------------------------------
 
+def resolve_probe_model(
+    free_models: Optional[List[Any]] = None,
+    exclude: Optional[frozenset] = None,
+) -> str:
+    """Pick a probe model id that is likely to be currently serving.
+
+    The probe's job is to verify each exit with a real chat request, so it needs
+    a model OpenCode actually serves -- not one it merely advertises. A hardcoded
+    pin (``config.PROBE_MODEL``) rots the moment OpenCode pulls it behind a key,
+    and then every lane comes back ``probe_error`` and the whole pool reads as
+    unverified even though the egress is fine (the "all probe?" symptom).
+
+    Prefer a *free, non-reasoning* model from the live catalog: it answers the
+    5-token probe immediately and the least likely to burn the probe's timeout
+    thinking. If no non-reasoning free model is advertised (OpenCode's free tier
+    is currently ENTIRELY reasoning models), fall back to a reasoning free model
+    in catalog order -- still a model OpenCode is actually serving, which beats
+    the hardcoded pin (which may be gated and would make every lane read
+    ``probe_error``). The configured pin is the last resort, when the catalog has
+    no free model at all, and the explicit escape hatch (set
+    ``LINGLING_PROBE_MODEL``) when a specific model is meant to be probed.
+
+    ``exclude`` skips ids already tried this probe pass (or otherwise kept out
+    of the rotation for this pass) so convergence can advance to a *different*
+    model without retiring the rejected one -- a ``-free`` model that 400s while
+    still listed is transient overload and stays routable, so the probe merely
+    borrows another model for the rest of the pass instead of dropping it.
+    """
+    exclude = exclude or frozenset()
+    if free_models:
+        # Prefer a free, non-reasoning model: it answers the 5-token probe
+        # immediately and is the least likely to burn the probe's timeout
+        # thinking. Reasoning models are skipped *when* a non-reasoning free
+        # model exists.
+        for lm in free_models:
+            if getattr(lm, "reasoning", False):
+                continue
+            mid = getattr(lm, "id", None)
+            if mid and mid not in exclude:
+                return mid
+        # No non-reasoning free model -- use a reasoning one in catalog order
+        # before the pin. A live catalog model is one OpenCode is actually
+        # serving; the pin may be gated, which is exactly the "every lane
+        # probe_error" trap convergence exists to escape. The probe's per-lane
+        # watchdog bounds a model that thinks before its first token.
+        for lm in free_models:
+            mid = getattr(lm, "id", None)
+            if mid and mid not in exclude:
+                return mid
+    return config.PROBE_MODEL
+
+
+def _probe_timeout_for(
+    model_id: str, catalog: Optional[Any], base: float,
+) -> float:
+    """Per-lane probe timeout, extended for a reasoning probe model.
+
+    A model that thinks before its first token can stretch the trivial "hi"
+    probe past ``PROBE_TIMEOUT``, which reads as a "dead" lane and churns the
+    healers (regenerating identities) for lanes that were merely thinking -- the
+    same false-dead churn the 4xx-as-probe_error guard exists to prevent. When
+    the probe is on a reasoning model (per the live catalog, or
+    ``LONG_THINKING_MODELS``) and the extended budget is larger than the base,
+    use the extended budget. ``PROBE_REASONING_TIMEOUT`` of 0 / <= base disables
+    the extension. The per-lane watchdog cap scales with the timeout, so a
+    wedged lane is only slower-to-cut while the probe is on a reasoning model.
+    """
+    extended = config.PROBE_REASONING_TIMEOUT
+    if not extended or extended <= base:
+        return base
+    reasoning = model_id in config.LONG_THINKING_MODELS
+    if not reasoning and catalog is not None:
+        lm = catalog.by_id(model_id)
+        reasoning = lm is not None and bool(getattr(lm, "reasoning", False))
+    return extended if reasoning else base
+
+
 def probe_proxy(
     proxy_url: str,
     proxy_id: str,
@@ -326,29 +457,17 @@ def probe_proxy(
         timeout or config.PROBE_TIMEOUT,
     )
 
-def probe_all(
+def _sweep_pool(
     proxy_pool: Any,
-    model: Optional[str] = None,
-    base_url: Optional[str] = None,
-    timeout: Optional[float] = None,
-    log: Callable[..., Any] = lambda *a, **k: None,
+    model: str,
+    base_url: str,
+    timeout: float,
+    log: Callable[..., Any],
 ) -> ProbeSummary:
-    """Probe every proxy in the pool with a real model request.
-
-    Lanes run in parallel (``config.PROBE_CONCURRENCY`` at a time) under a
-    per-lane watchdog deadline. The original sequential loop let one lane
-    that was slow to answer stretch a pass to minutes — or, before the raw
-    SOCKS5 pre-check existed, park forever inside httpx's un-timed handshake.
-    A lane the watchdog cuts off is reported dead so the healers restart its
-    tunnel; killing that tunnel's process also unblocks the parked worker's
-    socket, so no thread is stranded for good.
-    Runs synchronously (call from a background thread at startup).
-    Returns a ProbeSummary and stores it module-level for /api/warp/probe.
-    """
-    model = model or config.PROBE_MODEL
-    base_url = (base_url or config.OPENCODE_BASE_URL).rstrip("/")
-    timeout = timeout or config.PROBE_TIMEOUT
-
+    """One parallel pass of the pool with one fixed model. The body of the old
+    ``probe_all``; ``probe_all`` now wraps this with probe-model convergence so a
+    model OpenCode rejects (advertised but not served) is retried with a
+    different free model rather than 400-ing every lane."""
     proxies = proxy_pool.get_all_proxies()
     if not proxies:
         summary = ProbeSummary(total=0, completed_at=time.time())
@@ -363,7 +482,7 @@ def probe_all(
         + config.PROBE_TRACE_TIMEOUT + config.PROBE_CAP_SLACK
     )
     log(
-        "probe: testing %d proxies with model %s (%d at a time) ...",
+        "probe: poking %d exits with the canary %s (%d at a time) ...",
         len(proxies), model, workers,
     )
     started = time.time()
@@ -396,12 +515,20 @@ def probe_all(
                     probed_at=time.time(),
                 )
             results.append(r)
-            if r.status == "ok":
-                log("probe: %s -- healthy (%.0fms)", px.id, r.latency_ms)
-            elif r.status == "rate_limited":
-                log("probe: %s -- rate-limited", px.id)
-            else:
-                log("probe: %s -- dead (%s)", px.id, r.error)
+            if config.WARP_VERBOSE:
+                if r.status == "ok":
+                    log("probe: %s -- healthy (%.0fms)", px.id, r.latency_ms)
+                elif r.status == "rate_limited":
+                    log("probe: %s -- rate-limited", px.id)
+                elif r.status == "probe_error":
+                    # Aligns with the summary line, which counts this as probe-error
+                    # not dead. Logging it as "dead" made the per-lane lines and the
+                    # aggregate disagree (every lane "dead" while summary said 10
+                    # probe-error) -- and a dead tunnel regenerates an identity,
+                    # while a probe_error is left alone.
+                    log("probe: %s -- probe-error (%s)", px.id, r.error)
+                else:
+                    log("probe: %s -- dead (%s)", px.id, r.error)
     finally:
         # wait=False: a wedged worker must not hold the whole pass (or server
         # shutdown) hostage. cancel_futures drops lanes that never started.
@@ -413,6 +540,7 @@ def probe_all(
         healthy=sum(1 for r in results if r.status == "ok"),
         rate_limited=sum(1 for r in results if r.status == "rate_limited"),
         dead=sum(1 for r in results if r.status == "dead"),
+        probe_error=sum(1 for r in results if r.status == "probe_error"),
         duration_ms=round(elapsed, 1),
         results=results,
         completed_at=time.time(),
@@ -420,10 +548,143 @@ def probe_all(
     _store(summary)
 
     log(
-        "probe: complete -- %d/%d healthy, %d rate-limited, %d dead (%.0fms)",
+        "probe: done — %d/%d healthy, %d rate-limited, %d dead, %d told-us-no (%.0fms)",
         summary.healthy, summary.total, summary.rate_limited,
-        summary.dead, summary.duration_ms,
+        summary.dead, summary.probe_error, summary.duration_ms,
     )
+    return summary
+
+
+def probe_all(
+    proxy_pool: Any,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: Optional[float] = None,
+    log: Callable[..., Any] = lambda *a, **k: None,
+    catalog: Optional[Any] = None,
+    max_model_attempts: int = 4,
+) -> ProbeSummary:
+    """Probe every proxy in the pool with a real model request.
+
+    Lanes run in parallel (``config.PROBE_CONCURRENCY`` at a time) under a
+    per-lane watchdog deadline (see :func:`_sweep_pool`). The original sequential
+    loop let one lane that was slow to answer stretch a pass to minutes — or,
+    before the raw SOCKS5 pre-check existed, park forever inside httpx's
+    un-timed handshake. A lane the watchdog cuts off is reported dead so the
+    healers restart its tunnel; killing that tunnel's process also unblocks the
+    parked worker's socket, so no thread is stranded for good.
+
+    Probe-model convergence: OpenCode keeps advertising free models it is
+    temporarily not serving (the `/models` list says ``deepseek-v4-flash-free``
+    is free, but using it answers ``400: ... Model is unavailable`` under heavy
+    load). A probe pinned to such a model therefore reports *every* lane as
+    ``probe_error`` and the pool looks dead while the egress is fine — exactly
+    the "all probe?" symptom. When a pass comes back ``probe_error`` on every
+    lane (zero healthy, zero rate-limited, zero dead), the model -- not the
+    lanes -- is the problem. The model is NOT retired here: a ``-free`` model
+    that 400s while still listed is transient upstream overload, not removal —
+    OpenCode pulls a genuinely-dropped model from the free section outright, and
+    retiring a still-listed one would hide it from routing/dispatcher for the
+    full TTL just because the upstream was busy. The probe just borrows the next
+    free non-reasoning model for this pass so lane health is still reported;
+    genuine removal is detected separately per-request (see
+    ``_flag_model_retired`` in app.py, on a fresh catalog refresh that no longer
+    lists the model). Bounded by ``max_model_attempts`` so a long outage cannot
+    loop. Requires a ``catalog``; without one the pin is swept once (the legacy
+    behaviour).
+
+    Runs synchronously (call from a background thread at startup).
+    Returns a ProbeSummary and stores it module-level for /api/warp/probe.
+    """
+    base_url = (base_url or config.OPENCODE_BASE_URL).rstrip("/")
+    base_timeout = timeout or config.PROBE_TIMEOUT
+
+    # Serialize the resolve+sweep across callers. The WARP startup probe and
+    # the Tor-join snapshot probe run concurrently in their own bootstrap
+    # threads; running them serially keeps the per-lane verdicts and the stored
+    # summary consistent (no interleaved sweeps, no burst of simultaneous probe
+    # traffic hitting OpenCode) and lets the second probe reuse any progress
+    # the first made. The dashboard's Probe button and the daemon's periodic
+    # probe also come through here, so nothing overlaps a sweep.
+    with _probe_lock:
+        # Resolve the first model: an explicit pin wins, else the catalog's
+        # first free non-reasoning model, else the configured pin.
+        chosen = model if model is not None else resolve_probe_model(
+            catalog.free() if catalog is not None else None
+        )
+
+        tried: set = set()
+        summary: Optional[ProbeSummary] = None
+        for _ in range(max(1, max_model_attempts)):
+            if not chosen:
+                break
+            # A caller may hand us a model that became unavailable since it
+            # resolved it (seeded, or genuinely removed by a concurrent request
+            # via _flag_model_retired). resolve_probe_model already excludes
+            # unavailable ids, so this normally advances at most once; failing
+            # that there is nothing sweepable left, so stop without 400-ing the
+            # whole pool again.
+            if catalog is not None and catalog.is_unavailable(chosen):
+                nxt = resolve_probe_model(catalog.free(), exclude=tried)
+                if not nxt or catalog.is_unavailable(nxt):
+                    break
+                chosen = nxt
+                continue
+            sweep_timeout = _probe_timeout_for(chosen, catalog, base_timeout)
+            summary = _sweep_pool(proxy_pool, chosen, base_url, sweep_timeout, log)
+            # Retry with a different model ONLY when the chosen model was
+            # rejected on every lane: every probe_error, and nothing healthy,
+            # rate-limited, or dead. Any healthy/rate-limited lane means the
+            # model WAS served; any dead lane means the pool is genuinely mixed
+            # and a model swap would mask it. This signature is "the egress is
+            # up, the model is gated".
+            converged = (
+                catalog is not None
+                and summary.total > 0
+                and summary.healthy == 0
+                and summary.rate_limited == 0
+                and summary.dead == 0
+                and summary.probe_error == summary.total
+            )
+            if not converged:
+                break
+            # A "-free" model rejected on every lane while *still listed* is
+            # transient overload on OpenCode's side (huge traffic), not removal:
+            # when OpenCode actually drops a model it pulls it from the free
+            # section outright. The model is NOT retired here -- retiring it
+            # would hide a still-offered model from routing and the dispatcher
+            # for the full TTL (7 days) just because the upstream was busy. The
+            # probe just borrows a different free model for this pass so lane
+            # health is still reported; the busy model stays routable. Genuine
+            # removal is detected separately per-request (see _flag_model_retired
+            # in app.py), on a fresh catalog refresh that no longer lists it.
+            log(
+                "probe: %s rejected on every lane (%d probe-error); re-probing "
+                "with another free model (not retiring -- still in the free "
+                "section, likely transient overload)",
+                chosen, summary.probe_error,
+            )
+            # Borrow another free model for the rest of this pass. ``tried``
+            # skips the rejected id (and any earlier ones) so convergence
+            # actually advances instead of re-picking the same rejected model
+            # -- without dropping it from the catalog.
+            tried.add(chosen)
+            nxt = resolve_probe_model(catalog.free(), exclude=tried)
+            if not nxt or nxt in tried or catalog.is_unavailable(nxt):
+                # nothing else to borrow, or resolve fell back to a pin we
+                # already tried / that is itself retired -- stop rather than
+                # sweep another known-rejected model.
+                break
+            chosen = nxt
+
+        if summary is None:
+            # chosen was empty from the start (no model resolved and none
+            # pinned): still produce a summary over the configured pin so
+            # callers and the dashboard get a row rather than an exception.
+            fallback = _probe_timeout_for(config.PROBE_MODEL, catalog, base_timeout)
+            summary = _sweep_pool(
+                proxy_pool, config.PROBE_MODEL, base_url, fallback, log,
+            )
     return summary
 
 
@@ -515,6 +776,10 @@ def heal_expired(
         px = proxy_pool.get_by_id(r.proxy_id)
         if px is None:
             continue
+        if config.DEFER_REROLL_WHEN_BUSY and active_streams.active(r.proxy_id) > 0:
+            log("heal-expired: %s re-roll deferred -- stream in flight "
+                "(re-checked next pass)", r.proxy_id)
+            continue
         log("heal-expired: removing dead proxy %s (%s)", r.proxy_id, r.error)
         proxy_pool.remove(r.proxy_id)
         try:
@@ -587,6 +852,9 @@ def heal_rate_limited(
             log("heal-rate-limit: no instance behind %s — removing from pool", r.proxy_id)
             proxy_pool.remove(r.proxy_id)
             continue
+        if config.DEFER_REROLL_WHEN_BUSY and active_streams.active(r.proxy_id) > 0:
+            log("heal-rate-limit: %s re-roll deferred -- stream in flight", r.proxy_id)
+            continue
         try:
             if _reroll_until_clean(
                 proxy_pool, warp_manager, inst, px, r.proxy_id, burned, log,
@@ -647,10 +915,11 @@ def _reroll_until_clean(
         if ip:
             egress_map.observe(ip, pinned)
         if not ip or ip in burned:
-            log(
-                "heal-rate-limit: #%d rolled onto %s — re-rolling",
-                inst.index, ip or "an unknown exit",
-            )
+            if config.WARP_VERBOSE:
+                log(
+                    "heal-rate-limit: #%d rolled onto %s — re-rolling",
+                    inst.index, ip or "an unknown exit",
+                )
             continue
         check = probe_proxy(px.url, proxy_id)
         if check.status == "ok":
@@ -731,6 +1000,9 @@ def rotate_burned_tor_lanes(
         inst = by_index.get(idx)
         if inst is None:
             continue
+        if config.DEFER_REROLL_WHEN_BUSY and active_streams.active(r.proxy_id) > 0:
+            log("[tor] lane #%d re-roll deferred -- stream in flight", idx)
+            continue
         log("[tor] lane #%d is %s -- rotating its exit", idx, r.status)
         try:
             if tor_manager.restart_instance(inst, log=log):
@@ -786,6 +1058,9 @@ def spread_distinct_exits(
             inst = _find_instance(warp_manager, idx) if idx is not None else None
             if px is None or inst is None:
                 continue
+            if config.DEFER_REROLL_WHEN_BUSY and active_streams.active(proxy_id) > 0:
+                log("spread: %s re-roll deferred -- stream in flight", proxy_id)
+                continue
             known = egress_map.edges_for(target)
             try:
                 pinned = warp_manager.re_roll_tunnel(
@@ -801,17 +1076,18 @@ def spread_distinct_exits(
             if got:
                 egress_map.observe(got, pinned)
             if got != target:
-                log(
-                    "spread: %s rolled onto %s (aimed at %s) — next pass retries",
-                    proxy_id, got or "an unknown exit", target,
-                )
+                if config.WARP_VERBOSE:
+                    log(
+                        "spread: %s rolled onto %s (aimed at %s) — next pass retries",
+                        proxy_id, got or "an unknown exit", target,
+                    )
                 continue
             check = probe_proxy(px.url, proxy_id)
             if check.status == "ok":
                 proxy_pool.mark_success(px)
                 proxy_pool.reset_counters(proxy_id)
                 moved += 1
-                log("spread: %s -> %s via %s — verified", proxy_id, got, pinned)
+                log("spread: %s -> %s (via %s) — locked in", proxy_id, got, pinned)
                 moved_result = by_id.get(proxy_id)
                 if moved_result is not None:
                     old = moved_result.status

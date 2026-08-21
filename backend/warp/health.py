@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional
 
 from core import config
 from providers.proxy_pool import ProxyPool
+from providers import active_streams
+from routing import sampler
 from warp import probe as warp_probe
 from warp.manager import WarpManager, _identity_config_ok, _port_is_open
 
@@ -77,6 +79,7 @@ class WarpHealthDaemon:
         min_healthy: Optional[int] = None,
         probe_interval: Optional[float] = None,
         tor_manager: Optional[Any] = None,
+        catalog: Optional[Any] = None,
         log=None,
     ) -> None:
         self.warp = warp_manager
@@ -84,6 +87,12 @@ class WarpHealthDaemon:
         # Tor lanes share the pool but heal differently: no identity, no
         # tunnel re-roll — a process restart re-picks their exit route.
         self.tor = tor_manager
+        # Catalog (the live model list) picks the real-model probe target.
+        # Without it the probe pins one model id; when OpenCode gates that id
+        # behind a key every lane reads probe_error and the whole pool looks
+        # sick while actually fine. resolve_probe_model prefers a currently-
+        # free non-reasoning model over the configured pin.
+        self.catalog = catalog
         self.check_interval = check_interval
         # Real-model probe cadence (seconds). The per-cycle SOCKS5 probe cannot
         # see rate limits — an exit OpenCode has 429'd still CONNECTs fine — so
@@ -129,7 +138,7 @@ class WarpHealthDaemon:
         )
         self._thread.start()
         self.log(
-            "[warp-health] daemon started (check every %ds, min %d healthy, probe target opencode.ai:443)",
+            "[warp-health] daemon up — checking every %ds, keeping %d healthy, poking opencode.ai:443",
             self.check_interval, self.min_healthy,
         )
 
@@ -231,7 +240,14 @@ class WarpHealthDaemon:
             "[warp-health] real-model probe: testing %d exits ...",
             len(warp_proxies),
         )
-        summary = warp_probe.probe_all(self.pool, log=self.log)
+        # Hand the catalog to probe_all so it both resolves a currently-serving
+        # free model (not the hardcoded pin, which can 400 when OpenCode gates it)
+        # AND converges: a model rejected on every lane is retired and the pass
+        # is retried with the next free model, instead of leaving every lane read
+        # probe_error while the egress is fine.
+        summary = warp_probe.probe_all(
+            self.pool, catalog=self.catalog, log=self.log,
+        )
         healed = warp_probe.heal_rate_limited(
             self.pool, summary, self.warp, log=self.log,
         )
@@ -253,6 +269,18 @@ class WarpHealthDaemon:
                 self._check_and_heal()
             except Exception as exc:  # noqa: BLE001
                 self.log("[warp-health] post-heal cycle error: %s", exc)
+        # Post-heal sampler: re-sample the good models across the freshly-healed
+        # green pool so per-(model, exit) routing stays current between startups.
+        # Reuses this cycle's canary summary (no second canary probe) and is
+        # gated by SAMPLER_INTERVAL_S so a fast heal cadence does not re-sample
+        # OpenCode every cycle.
+        if sampler.should_run():
+            try:
+                sampler.sample_models(
+                    self.pool, self.catalog, summary, log=self.log,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.log("[warp-health] sampler pass failed: %s", exc)
         return summary
 
     def _rotate_burned_tor_lanes(self, summary: Any) -> int:
@@ -286,7 +314,7 @@ class WarpHealthDaemon:
 
     def _run_cycle(self) -> Dict[str, Any]:
         """Cycle body; caller holds ``_cycle_lock``."""
-        self.log("[warp-health] running health check cycle%s...",
+        self.log("[warp-health] poking the exits (cycle%s)...",
                  " (warmup)" if self._warmup else "")
 
         # 1. Health-check every instance
@@ -296,7 +324,7 @@ class WarpHealthDaemon:
             results.append(result)
 
         healthy_count = sum(1 for r in results if r["healthy"])
-        self.log("[warp-health] cycle: %d/%d instances healthy",
+        self.log("[warp-health] cycle: %d/%d instances breathing",
                  healthy_count, len(results))
 
         # 2. Heal unhealthy instances
@@ -340,7 +368,7 @@ class WarpHealthDaemon:
         # 5. Ensure minimum healthy count
         regenerated = 0
         if healthy_count < self.min_healthy:
-            self.log("[warp-health] only %d healthy, need %d — regenerating more",
+            self.log("[warp-health] only %d healthy, need %d — time to mint some more",
                      healthy_count, self.min_healthy)
             regenerated = self._ensure_min_healthy(results)
             # Re-check the regenerated ones
@@ -353,7 +381,7 @@ class WarpHealthDaemon:
         pool_status = self.pool.status()
         self.log(
             "[warp-health] cycle done: %d healthy, %d healed, %d dumped, "
-            "%d regenerated, pool: %d/%d available",
+            "%d regenerated, pool %d/%d — breathing on their own.",
             healthy_count, healed, dumped, regenerated,
             pool_status.get("available", 0), pool_status.get("total", 0),
         )
@@ -434,6 +462,13 @@ class WarpHealthDaemon:
     # ------------------------------------------------------------------
     def _heal_instance(self, inst: Any) -> None:
         """Attempt to heal a broken instance — restart wireproxy, then regenerate if needed."""
+        # A live httpx stream rides the wireproxy's SOCKS5 listener; restarting
+        # the process sends a graceful FIN that reads as "upstream closed before
+        # completing" once the stream is past its first byte (see stream_guard).
+        # Defer until the stream drains instead of killing it under the request.
+        if config.DEFER_REROLL_WHEN_BUSY and active_streams.active(f"warp-{inst.index}") > 0:
+            self.log("[warp-health] #%d re-roll deferred -- stream in flight", inst.index)
+            return
         # Step 1: Try restarting wireproxy
         self.log("[warp-health] restarting wireproxy for #%d (port %d)...",
                  inst.index, inst.port)
@@ -527,6 +562,10 @@ class WarpHealthDaemon:
             if need <= 0:
                 break
             if not results[i]["healthy"]:
+                if config.DEFER_REROLL_WHEN_BUSY and active_streams.active(f"warp-{inst.index}") > 0:
+                    self.log("[warp-health] ensure-min: #%d regeneration deferred -- stream in flight",
+                             inst.index)
+                    continue
                 try:
                     self.log("[warp-health] ensure-min: regenerating #%d ...", inst.index)
                     self.warp.regenerate_instance(inst)
@@ -572,6 +611,10 @@ class WarpHealthDaemon:
                 should_dump = True
 
             if should_dump:
+                if config.DEFER_REROLL_WHEN_BUSY and active_streams.active(px.id) > 0:
+                    self.log("[warp-health] #%d burned (%s) -- re-roll deferred, stream in flight",
+                             idx, reason)
+                    continue
                 self.log("[warp-health] #%d burned (%s) — re-rolling its tunnel ...",
                          idx, reason)
                 if self.warp.re_roll_tunnel(inst, log=self.log) is not None:

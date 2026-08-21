@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from core import config
 
-TOR_VERSION = "15.0.19"
+TOR_VERSION = "15.0.20"
 TOR_DIST = "https://dist.torproject.org/torbrowser"
 TOR_BASE_PORT = 52001  # WARP owns 51001+; Tor lanes live one block above
 
@@ -89,24 +89,80 @@ class TorEgressManager:
     def tools_ready(self) -> bool:
         return self._tor_path().exists()
 
+    def _latest_stable_version(self, log: Callable[..., Any] = print) -> Optional[str]:
+        """Newest stable Tor version advertised under TOR_DIST/, or None.
+
+        The listing also carries alpha tags (e.g. 16.0a9) whose Windows expert
+        bundle may not ship for every platform, so match a strict
+        major.minor.patch and take the max. Used so a stale ``TOR_VERSION`` pin
+        can never 404 the download: the previous hard-coded version rotted the
+        moment Tor shipped the next one. The pin is only the fallback when the
+        listing itself is unreachable.
+        """
+        import re
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                f"{TOR_DIST}/", headers={"User-Agent": "lingling"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                html = resp.read().decode("utf-8", "replace")
+            found = re.findall(r'href="(\d+)\.(\d+)\.(\d+)/"', html)
+            if not found:
+                return None
+            mx = max((int(a), int(b), int(c)) for a, b, c in found)
+            return f"{mx[0]}.{mx[1]}.{mx[2]}"
+        except Exception as exc:  # noqa: BLE001
+            log(f"[tor] could not read the version listing ({exc})")
+            return None
+
+    def _bundle_url(self, version: str) -> str:
+        # Verified live: the Windows expert bundle is a .tar.gz at this path
+        # (the .zip name 404s), extracting a top-level tor/ directory.
+        return f"{TOR_DIST}/{version}/tor-expert-bundle-windows-x86_64-{version}.tar.gz"
+
     def ensure_tools(self, log: Callable[..., Any] = print) -> bool:
-        """Download and extract the Tor expert bundle once."""
+        """Download and extract the Tor expert bundle once.
+
+        Resolves the newest stable version from the dist listing first, with
+        ``TOR_VERSION`` as the fallback only when the listing is unreachable,
+        so a superseded pin can never 404 the download (which is how Tor lanes
+        silently went missing one release). Each candidate is tried in turn;
+        an HTTP error moves on to the next rather than aborting the lane pool.
+        """
         if self.tools_ready():
             return True
         import urllib.request
+        import urllib.error
 
         tor = self._tor_path()
         tor.parent.mkdir(parents=True, exist_ok=True)
-        # Verified live: the Windows expert bundle is a .tar.gz at this path
-        # (the .zip name 404s), extracting a top-level tor/ directory.
-        url = f"{TOR_DIST}/{TOR_VERSION}/tor-expert-bundle-windows-x86_64-{TOR_VERSION}.tar.gz"
         archive = self.root / "tools" / "tor-expert-bundle.tar.gz"
-        log("[tor] downloading Tor expert bundle (first run only) ...")
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "lingling"})
-            with urllib.request.urlopen(req, timeout=120) as resp, \
-                    open(archive, "wb") as out:
-                shutil.copyfileobj(resp, out)
+        # Newest stable first; the pinned default covers a listing outage and
+        # is tried even when discovery already returned it (idempotent).
+        discovered = self._latest_stable_version(log)
+        candidates: List[str] = []
+        if discovered and discovered != TOR_VERSION:
+            candidates.append(discovered)
+        candidates.append(TOR_VERSION)
+
+        log("[tor] grabbing the Tor expert bundle (first run only) ...")
+        last = "no download attempted"
+        for version in candidates:
+            url = self._bundle_url(version)
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "lingling"})
+                with urllib.request.urlopen(req, timeout=120) as resp, \
+                        open(archive, "wb") as out:
+                    shutil.copyfileobj(resp, out)
+            except urllib.error.HTTPError as exc:
+                last = f"v{version}: HTTP {exc.code}"
+                log(f"[tor] v{version} download HTTP {exc.code}; trying next candidate")
+                continue
+            except Exception as exc:  # noqa: BLE001
+                last = f"v{version}: {exc}"
+                log(f"[tor] v{version} download failed ({exc})")
+                continue
             import tarfile
             with tarfile.open(archive, "r:gz") as tf:
                 tf.extractall(self.root / "tools")
@@ -114,11 +170,10 @@ class TorEgressManager:
                 log(f"[tor] extraction did not produce {tor}")
                 return False
             archive.unlink(missing_ok=True)
-            log("[tor] tools ready")
+            log(f"[tor] tools ready (v{version}) — dressed and out the door")
             return True
-        except Exception as exc:  # noqa: BLE001
-            log(f"[tor] download failed ({exc}) — continuing without Tor lanes")
-            return False
+        log(f"[tor] download failed ({last}) — continuing without Tor lanes")
+        return False
 
     # -- instance lifecycle ----------------------------------------------
     def _torrc(self, inst: TorInstance) -> str:
@@ -285,7 +340,7 @@ class TorEgressManager:
                 )
                 added += 1
         if added:
-            log("[tor] %d lanes added to the proxy pool", added)
+            log("[tor] %d lanes folded into the proxy pool", added)
         return added
 
     def status(self) -> Dict[str, Any]:

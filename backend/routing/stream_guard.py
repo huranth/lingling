@@ -18,6 +18,8 @@ import json
 from json import JSONDecodeError
 from typing import Any, Callable, Dict, Generator, Optional
 
+from routing import pacing_memory, stream_idle
+
 # A frame carrying this key tells a client to discard everything rendered so far.
 RESET_KEY = "lingling_reset"
 
@@ -43,13 +45,31 @@ def chunk_is_terminal(obj: Dict[str, Any]) -> bool:
     ``tool_calls``, ...). Its presence is the signal that a later disconnect is
     harmless: the answer was already complete, so retrying would only burn a
     request and rewrite text the user has correctly received.
+
+    OpenCode's free stream (and several other OpenAI-compatible gateways) never
+    sets ``finish_reason`` and never sends ``[DONE]``: the response ends with a
+    frame carrying ``usage`` (and a trailing ``cost``) and then a clean close.
+    Without recognizing that frame here, every such *completed* stream is
+    misread as a mid-flight break and retried once -- delivering the answer to
+    the client twice (separated by a reset marker), doubling request/egress
+    spend, and logging "broke mid-flight / unrecoverable" on every reply. An
+    empty-``choices`` cushion frame by itself is NOT terminal (OpenCode sends
+    several as a preamble before any content); the terminal signal is the
+    end-of-stream usage/cost frame.
     """
     choices = obj.get("choices")
-    if not isinstance(choices, list):
-        return False
-    for ch in choices:
-        if isinstance(ch, dict) and ch.get("finish_reason"):
-            return True
+    if isinstance(choices, list):
+        for ch in choices:
+            if isinstance(ch, dict) and ch.get("finish_reason"):
+                return True
+    # The final usage report (OpenAI streaming's `choices:[]`+`usage` frame, or
+    # OpenCode's same frame without finish_reason) marks the completion the
+    # ``finish_reason`` path would have caught; the trailing ``cost`` frame is
+    # OpenCode-specific metadata that always follows it.
+    if isinstance(obj.get("usage"), dict):
+        return True
+    if "cost" in obj:
+        return True
     return False
 
 
@@ -72,6 +92,36 @@ def chunk_text_len(obj: Dict[str, Any]) -> int:
             if isinstance(holder, dict) and isinstance(holder.get("content"), str):
                 total += len(holder["content"])
     return total
+
+
+def chunk_reasons(obj: Dict[str, Any]) -> bool:
+    """A streamed chunk that carries reasoning/thinking tokens.
+
+    OpenAI streaming surfaces thinking as ``delta.reasoning_content``; some
+    gateways nest it under ``reasoning`` or ``thinking`` (a string or a non-empty
+    dict). Its presence is definitive: the model reasons. The catalog flag and a
+    client's reasoning param can both miss a model whose reasoning is hidden, so
+    observing it on the wire is the way a hidden-reasoning model gets learned
+    (see :mod:`routing.pacing_memory`) -- without that, a future model of the
+    same kind would stall on every turn until an operator edits the override.
+
+    Only a truthy value counts: a bare ``"reasoning": false`` or empty dict is
+    not reasoning-in-progress.
+    """
+    choices = obj.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for ch in choices:
+        if not isinstance(ch, dict):
+            continue
+        holder = ch.get("delta") if isinstance(ch.get("delta"), dict) else ch.get("message")
+        if not isinstance(holder, dict):
+            continue
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            val = holder.get(key)
+            if (isinstance(val, str) and val) or (isinstance(val, dict) and val):
+                return True
+    return False
 
 
 def reset_frame(reason: str, attempt: int, model: Optional[str] = None) -> bytes:
@@ -113,6 +163,7 @@ def guarded_stream(
     enabled: bool = True,
     hold: Optional[Callable[[], Generator[bytes, None, None]]] = None,
     retry_model: Optional[Callable[[], Optional[str]]] = None,
+    model_id: Optional[str] = None,
 ) -> Generator[bytes, None, None]:
     """Yield an upstream stream, retrying once if it dies before completing.
 
@@ -154,6 +205,15 @@ def guarded_stream(
                     outcome.text_chars += chunk_text_len(obj)
                     if chunk_is_terminal(obj):
                         outcome.completed = True
+                    # A chunk carrying reasoning tokens is definitive evidence the
+                    # model reasons. The catalog/override/body check can all miss
+                    # a model whose reasoning is hidden, so learning it here lets a
+                    # future such model self-adapt after its first turn instead of
+                    # stalling every time. Idempotent on the hot path (see
+                    # pacing_memory.mark_reasoning), so every reasoning chunk is
+                    # safe to observe.
+                    if model_id and chunk_reasons(obj):
+                        pacing_memory.mark_reasoning(model_id)
                 on_chunk(raw)
                 yield raw + b"\n\n"
         except Exception as exc:  # noqa: BLE001 - any transport failure is a break
@@ -161,6 +221,13 @@ def guarded_stream(
 
         if outcome.completed:
             # The model finished. A disconnect after this point is harmless.
+            # "recovered" means the retry actually produced a complete answer,
+            # not merely that a retry was attempted -- so it is set here (only
+            # when a retry happened, attempt > 1) rather than optimistically at
+            # retry start. The earlier optimistic write logged "recovered" and
+            # flagged ok_recovered even when the retry also broke.
+            if attempt > 1:
+                outcome.recovered = True
             if broke is not None:
                 log.info(
                     "stream: upstream dropped after completion (%s) - not retrying", broke
@@ -168,15 +235,28 @@ def guarded_stream(
             return
 
         reason = str(broke) if broke is not None else "upstream closed before completing"
+        # A stream that went silent before emitting any visible content is the
+        # signature of a hidden-reasoning model thinking through its first token:
+        # the watchdog saw bytes stop for the whole budget without the model ever
+        # speaking, which a model that displays its reasoning never does. Learn it
+        # now -- before the retry re-derives pacing, so the retry gets the thinking
+        # patience and can wait the silence out instead of stalling a second time.
+        # (guarded_stream is the chat path; the messages/responses entrypoints have
+        # no mid-flight retry, but the learned entry still helps their next request
+        # via _stream_pacing.) Gated on text_chars==0 so a model that genuinely
+        # stalls mid-content -- it already spoke, so it is not hidden-thinking --
+        # is not mis-learned and does not get its first-token failover loosened.
+        if model_id and isinstance(broke, stream_idle.StreamStalled) and outcome.text_chars == 0:
+            pacing_memory.mark_reasoning(model_id)
         if not enabled or attempt >= 2:
             outcome.error = reason
             log.warning(
-                "stream: unrecoverable after %d attempt(s) - %s", attempt, reason
+                "stream: gave up after %d attempt(s) — %s", attempt, reason
             )
             return
 
         # Retry once, on a fresh stream and therefore a fresh exit IP.
-        log.warning("stream: broke mid-flight (%s) - retrying once", reason)
+        log.warning("stream: broke mid-flight (%s) — rerolling once", reason)
         # When every exit is cooling, reopening now would spend the single retry
         # on an exit that must refuse. Wait for one first, keeping the client's
         # connection alive while we do.
@@ -186,12 +266,11 @@ def guarded_stream(
             source = open_stream()
         except Exception as exc:  # noqa: BLE001
             outcome.error = f"{reason}; retry could not start: {exc}"
-            log.warning("stream: retry could not start - %s", exc)
+            log.warning("stream: reroll could not start — %s", exc)
             return
 
         attempt += 1
         outcome.attempts = attempt
-        outcome.recovered = True
         outcome.text_chars = 0
         # Tell the client to discard the partial answer before the new one lands.
         moved = retry_model() if retry_model is not None else None

@@ -270,19 +270,29 @@ class OpenAICompatibleProvider(Provider):
         elif proxy_id is None:
             proxy_id = "_direct_"
 
-        with pool.get_client(proxy_id, proxy_url, timeout_val) as client:
-            try:
-                with client.stream(
-                    "POST", self._url(), json=body, headers=self.auth_headers(secret)
-                ) as resp:
-                    if resp.status_code >= 400:
-                        detail = resp.read().decode("utf-8", "replace")
-                        raise UpstreamError(resp.status_code, detail, self.id)
-                    for line in resp.iter_lines():
-                        if line:
-                            yield line.encode("utf-8") if isinstance(line, str) else line
-            except httpx.HTTPError as exc:
-                raise UpstreamError(504, str(exc), self.id) from exc
+        from providers import active_streams
+        # Only proxied requests ride a re-rollable egress (a wireproxy/tor
+        # process the healers can tear down); a direct request has no egress to
+        # protect, so it is excluded from the registry entirely -- inc/dec are
+        # no-ops for a falsy id, and dashboards never see a phantom _direct_.
+        egress_id = proxy_id if proxy_url else None
+        active_streams.inc(egress_id)
+        try:
+            with pool.get_client(proxy_id, proxy_url, timeout_val) as client:
+                try:
+                    with client.stream(
+                        "POST", self._url(), json=body, headers=self.auth_headers(secret)
+                    ) as resp:
+                        if resp.status_code >= 400:
+                            detail = resp.read().decode("utf-8", "replace")
+                            raise UpstreamError(resp.status_code, detail, self.id)
+                        for line in resp.iter_lines():
+                            if line:
+                                yield line.encode("utf-8") if isinstance(line, str) else line
+                except httpx.HTTPError as exc:
+                    raise UpstreamError(504, str(exc), self.id) from exc
+        finally:
+            active_streams.dec(egress_id)
 
     def _models_secret(self) -> Optional[str]:
         """Credential used to read the model list, if the endpoint needs one.

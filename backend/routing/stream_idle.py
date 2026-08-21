@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import queue
 import threading
-from typing import Any, Generator, Iterable
+from typing import Any, Generator, Iterable, Tuple
+
+from core import config
 
 
 class StreamStalled(Exception):
@@ -34,6 +36,29 @@ class StreamStalled(Exception):
 
 # A sentinel distinguishable from any real frame.
 _DONE = object()
+
+
+def pacing_for(reasoning: bool) -> Tuple[float, float]:
+    """Idle-watchdog budget and httpx read timeout for one outbound stream.
+
+    A reasoning model that hides its thinking tokens stays silent on the wire
+    while it reasons; the default watchdog and httpx read budgets would both
+    fire on that silence and ``stream_guard`` would retry the model to death --
+    while it was merely thinking. Reasoning models therefore get a longer
+    "thinking patience": the watchdog budget is :data:`config.STREAM_THINKING_TIMEOUT`
+    and the httpx read timeout sits a first-token budget above it, so the
+    watchdog's :class:`StreamStalled` (informative, one retry via stream_guard)
+    governs a silent pause rather than a bare httpx ``ReadTimeout``. Non-reasoning
+    models keep the tight defaults -- they never legitimately go quiet, so the
+    watchdog still catches a real stall and first-token failover stays fast.
+
+    ``STREAM_THINKING_TIMEOUT <= 0`` disables the extension (reasoning models
+    fall back to the default budgets); it is not the watchdog-disable sentinel,
+    which is ``STREAM_IDLE_TIMEOUT <= 0``.
+    """
+    if reasoning and config.STREAM_THINKING_TIMEOUT > 0:
+        return config.STREAM_THINKING_TIMEOUT, config.STREAM_THINKING_TIMEOUT + config.STREAM_FIRST_TOKEN_TIMEOUT
+    return config.STREAM_IDLE_TIMEOUT, config.STREAM_FIRST_TOKEN_TIMEOUT
 
 
 def with_idle_timeout(

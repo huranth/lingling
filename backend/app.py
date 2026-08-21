@@ -17,7 +17,7 @@ import shutil
 import time
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,6 +35,8 @@ from core import api_keys
 from routing import parking
 from routing import stream_guard
 from routing import stream_idle
+from routing import pacing_memory
+from routing import sampler
 from routing import responses_bridge
 from claudecode import messages_bridge
 from claudecode import messages_response
@@ -126,11 +128,11 @@ def _startup_sync_warp(*, start_daemon: bool = True) -> None:
     try:
         added = _sync_warp_to_pool()
         if added:
-            log.info("startup: synced %d running WARP proxies into the pool", added)
+            log.info("startup: %d WARP proxies were already up — synced them into the pool", added)
         elif warp_manager.status()["proxies_running"] > 0:
-            log.info("startup: WARP proxies already in pool (%d running)", warp_manager.status()["proxies_running"])
+            log.info("startup: %d WARP proxies already lounging in the pool", warp_manager.status()["proxies_running"])
         else:
-            log.info("startup: no running WARP proxies found to sync")
+            log.info("startup: no running WARP proxies to sync — we'll bootstrap some")
     except Exception as exc:  # noqa: BLE001
         log.warning("startup: WARP sync skipped (%s)", exc)
 
@@ -168,9 +170,35 @@ def _bootstrap_tor() -> None:
         result = tor_manager.start_all(log=log.info)
         added = tor_manager.sync_to_pool(proxy_pool, log=log.info)
         log.info(
-            "bootstrap: Tor lanes ready (%d started, %d failed, %d in pool)",
+            "bootstrap: Tor lanes up — %d started, %d failed, %d in pool",
             result.get("started", 0), result.get("failed", 0), added,
         )
+        # Tor lanes joined the pool *after* the WARP startup probe snapshotted
+        # it, so that cached ProbeSummary says "10 lanes" while the live pool
+        # now holds 13 -- and the dashboard showed both at once ("across 10
+        # slots" beside a 13/13 gauge). Re-probe the now-full pool here so the
+        # cached snapshot catches up, and rotate any Tor lane the probe finds
+        # burned (its healer is a restart, which re-picks a fresh exit route)
+        # rather than waiting PROBE_INTERVAL_S for the daemon's first tick.
+        if added > 0 and config.PROBE_ON_STARTUP and len(proxy_pool) > 0:
+            try:
+                # probe_all resolves+converges on a model the catalog still
+                # serves, so the refreshed snapshot reflects the full pool with a
+                # model that actually answers instead of 400-ing every Tor lane.
+                tor_summary = warp_probe.probe_all(
+                    proxy_pool, catalog=catalog, log=log.info,
+                )
+                tor_rotated = warp_probe.rotate_burned_tor_lanes(
+                    proxy_pool, tor_manager, tor_summary, log=log.info,
+                )
+                if tor_rotated:
+                    log.info(
+                        "probe: Tor join refreshed snapshot to %d lanes, "
+                        "rotated %d burned Tor lanes",
+                        tor_summary.total, tor_rotated,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("probe: Tor-join snapshot refresh failed (%s)", exc)
     except Exception as exc:  # noqa: BLE001
         # A failed Tor bootstrap must not affect the gateway or the WARP pool.
         log.warning("bootstrap: Tor setup failed (%s) - continuing without it", exc)
@@ -186,18 +214,25 @@ def _bootstrap_warp() -> None:
     try:
         status = warp_manager.status()
         if status["identities_registered"] < warp_manager.count:
-            log.info("bootstrap: registering WARP identities (one-time, slow)")
+            log.info("bootstrap: minting WARP identities (one-time, slow)")
             warp_manager.setup_identities(log=log.info)
         _start_warp_at_startup()
         log.info(
-            "bootstrap: WARP ready (%d in pool)",
+            "bootstrap: WARP up — %d exits wrangled. opencode's free tier did not pre-game for this.",
             proxy_pool.status().get("total", 0),
         )
         # --- startup probe: test every proxy with a real model request ---
         if config.PROBE_ON_STARTUP and len(proxy_pool) > 0:
             try:
+                # probe_all resolves the target from the live catalog (not the
+                # hardcoded pin, which 400-s when OpenCode gates it behind a key)
+                # and converges: a model rejected on every lane is retried with
+                # another free model, so a stale-but-advertised id no longer
+                # makes the whole pool read probe_error. (It is NOT retired --
+                # "unavailable" while still listed is transient overload, not
+                # removal.)
                 summary = warp_probe.probe_all(
-                    proxy_pool, log=log.info,
+                    proxy_pool, catalog=catalog, log=log.info,
                 )
                 # Heal dead (expired) and rate-limited proxies.
                 expired_healed = warp_probe.heal_expired(
@@ -220,8 +255,8 @@ def _bootstrap_warp() -> None:
                 )
                 if expired_healed or rl_healed or tor_rotated or spread_moved:
                     log.info(
-                        "probe: healed %d expired identities + %d burned exits, "
-                        "rotated %d Tor lanes, spread %d slots onto unused exits",
+                        "probe: fixed up — healed %d expired identities, "
+                        "%d burned exits, rotated %d Tor lanes, spread %d slots onto unused exits",
                         expired_healed, rl_healed, tor_rotated, spread_moved,
                     )
                 # --- exit-lane formation: assemble distinct exits on purpose ---
@@ -243,6 +278,19 @@ def _bootstrap_warp() -> None:
                             )
                     except Exception as exc:  # noqa: BLE001
                         log.warning("formation: startup formation failed (%s)", exc)
+                # --- post-heal multi-model sampler ---
+                # The heal's canary summary is the "which exits are alive"
+                # baseline; hand it to the sampler so per-(model, exit) health
+                # (and the request path's per-model routing / fail-fast) is
+                # populated immediately after the pool is fixed up, without
+                # re-probing the canary. Enabled/configured via LINGLING_SAMPLER_*.
+                if config.SAMPLER_ENABLED:
+                    try:
+                        sampler.sample_models(
+                            proxy_pool, catalog, summary, log=log.info,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("sampler: startup pass failed (%s)", exc)
                 # Log a single summary row so the dashboard shows one entry.
                 try:
                     usage_store.log(
@@ -251,8 +299,16 @@ def _bootstrap_warp() -> None:
                             f"{summary.healthy}/{summary.total} healthy, "
                             f"{summary.rate_limited} rate-limited, "
                             f"{summary.dead} dead"
+                            + (f", {summary.probe_error} probe-error" if summary.probe_error else "")
                         ),
-                        status="ok" if summary.healthy > 0 else "exhausted",
+                        # probe_error lanes reached OpenCode but were answered
+                        # with a model-rejecting 4xx: the egress layer is up,
+                        # so they are not "exhausted" -- the probe model just
+                        # could not verify them.
+                        status="ok" if (
+                            summary.healthy > 0
+                            or (summary.probe_error > 0 and summary.dead == 0)
+                        ) else "exhausted",
                         provider="warp",
                     )
                 except Exception:  # noqa: BLE001
@@ -282,7 +338,7 @@ async def lifespan(_app: FastAPI):
         import anyio
         limiter = anyio.to_thread.current_default_thread_limiter()
         limiter.total_tokens = config.THREADPOOL_MAX
-        log.info("threadpool: raised sync executor ceiling to %d", config.THREADPOOL_MAX)
+        log.info("threadpool: lifted the sync executor ceiling to %d", config.THREADPOOL_MAX)
     except Exception as exc:  # noqa: BLE001
         log.warning("threadpool: could not raise limiter (%s)", exc)
 
@@ -313,6 +369,7 @@ async def lifespan(_app: FastAPI):
         # Tor lanes bootstrap independently of WARP: first run downloads the
         # bundle (~25 MB) and fetches the directory; later boots are seconds.
         threading.Thread(target=_bootstrap_tor, name="tor-bootstrap", daemon=True).start()
+    log.info("LINGLING UP — opencode's free tier is about to have a day.")
     try:
         yield
     finally:
@@ -470,6 +527,7 @@ tor_manager = TorEgressManager(
 warp_health_daemon = warp_health.WarpHealthDaemon(
     warp_manager, proxy_pool,
     tor_manager=tor_manager if config.TOR_ENABLED and tor_manager.count > 0 else None,
+    catalog=catalog,
     log=log.info,
 )
 
@@ -963,13 +1021,34 @@ def warp_probe_run() -> Dict[str, Any]:
                 f"{summary.healthy}/{summary.total} healthy, "
                 f"{summary.rate_limited} rate-limited, "
                 f"{summary.dead} dead"
+                + (f", {summary.probe_error} probe-error" if summary.probe_error else "")
             ),
-            status="ok" if summary.healthy > 0 else "exhausted",
+            status="ok" if (
+                summary.healthy > 0
+                or (summary.probe_error > 0 and summary.dead == 0)
+            ) else "exhausted",
             provider="warp",
         )
     except Exception:  # noqa: BLE001
         pass
     return {"busy": False, **summary.to_dict()}
+
+
+@app.get("/api/sampler")
+def sampler_status() -> Dict[str, Any]:
+    """Post-heal multi-model sampler state for the dashboard.
+
+    The latest per-(model, exit) pass, or an empty disabled envelope when the
+    sampler has not run. The request path reads the same state via
+    ``routing.sampler.ok_exits`` to route a model onto its sampler-green exits
+    and fail fast on an OpenCode-side outage; this endpoint is its read-only
+    mirror for the UI.
+    """
+    snap = sampler.latest()
+    return snap or {
+        "enabled": config.SAMPLER_ENABLED, "models": [], "canary_ok_exits": [],
+        "skipped_reason": "disabled" if not config.SAMPLER_ENABLED else "pending",
+    }
 
 
 @app.post("/api/warp/formation")
@@ -1153,6 +1232,72 @@ def _resolve_effort(
     return resolved
 
 
+def _stream_pacing(
+    model_id: str, body: Optional[Dict[str, Any]] = None,
+) -> Tuple[float, float]:
+    """Idle-watchdog budget and httpx read timeout for a stream on ``model_id``.
+
+    A hidden-reasoning model is silent on the wire while it thinks, so the
+    default budgets cut that off as a broken stream and stream_guard retries it
+    to death. Reasoning models get the longer "thinking patience" from
+    :func:`stream_idle.pacing_for`. The output is not touched: only how long a
+    silent pause is tolerated changes. See that helper and
+    ``config.STREAM_THINKING_TIMEOUT`` for the tradeoff.
+
+    "Reasoning" is decided in four layers so a *future* hidden-reasoning model
+    needs no per-model fix: (1) an operator override
+    (``config.LONG_THINKING_MODELS``), (2) the live catalog flag
+    (``LogicalModel.reasoning``), (3) a model learned from its wire behaviour
+    (:mod:`routing.pacing_memory` -- reasoning tokens in a chunk, or a stall
+    before any visible content), (4) the request body asking for reasoning this
+    turn (``reasoning_effort`` / ``thinking`` / ``reasoning``). Layer (4) also
+    *learns* the model, so a hidden-reasoning model whose listing does not
+    advertise reasoning self-heals after its first requested-thinking turn.
+    """
+    reasoning = model_id in config.LONG_THINKING_MODELS
+    if not reasoning:
+        lm = catalog.by_id(model_id)
+        reasoning = lm is not None and bool(getattr(lm, "reasoning", False))
+    if not reasoning:
+        reasoning = pacing_memory.is_reasoning(model_id)
+    if not reasoning and _body_asks_reasoning(body):
+        # The client asked the model to reason -- it supports it for this turn
+        # and will stay silent while it thinks. Grant patience now and learn the
+        # model, so turns without the param (the common case for a model whose
+        # reasoning is hidden) are patient too instead of stalling every time.
+        pacing_memory.mark_reasoning(model_id)
+        reasoning = True
+    return stream_idle.pacing_for(reasoning)
+
+
+def _body_asks_reasoning(body: Optional[Dict[str, Any]]) -> bool:
+    """The request asks the model to reason under any of the common vocabularies.
+
+    Covers the OpenAI/Chat skill (``reasoning_effort``), the Codex Responses
+    shape (``reasoning: {effort: ...}`` or a truthy flag), and the Anthropic /
+    Claude Code thinking toggle (``thinking: {type: "enabled"|"adaptive"}`` or a
+    budget). A model the client asks to reason goes silent while it thinks, so
+    this both grants patience for the turn and -- on first sight -- learns the
+    model for turns that arrive without the param.
+    """
+    if not isinstance(body, dict):
+        return False
+    if body.get("reasoning_effort"):
+        return True
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        return True
+    if reasoning in (True, "true", "yes", 1, "1"):
+        return True
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and (
+        thinking.get("type") in ("enabled", "adaptive")
+        or thinking.get("budget_tokens")
+    ):
+        return True
+    return False
+
+
 def _messages_for_model(
     messages: List[Dict[str, Any]], model_id: str, has_images: bool,
 ) -> List[Dict[str, Any]]:
@@ -1170,24 +1315,61 @@ def _messages_for_model(
     return messages
 
 
-def _flag_model_retired(exc: Exception, model_id: str) -> bool:
-    """Hide a model from the catalog when the upstream retired its free tier.
+# Per-model last "is this model actually gone from the free section?" recheck,
+# used to gate _flag_model_retired below. A transient "Model is unavailable"
+# burst (huge upstream traffic) fires that recheck on many concurrent requests
+# at once; without a cooldown each would force a catalog refresh.
+_retire_recheck_at: Dict[str, float] = {}
 
-    OpenCode advertises a ``-free`` model even after it stops serving it, so a
-    request 400s with "unavailable for free". On that failure the model is
-    recorded as retired (persisted, TTL), dropping it from /v1/models, the
-    dashboard, dispatcher candidates and the Codex/Claude listings.
+
+def _flag_model_retired(exc: Exception, model_id: str) -> bool:
+    """Hide a model from the catalog only when OpenCode actually dropped it.
+
+    A ``-free`` model that 400s with "unavailable" while *still listed* in the
+    free section is transient overload (huge upstream traffic), not removal:
+    OpenCode pulls a genuinely-dropped model from the free section outright, it
+    doesn't answer "unavailable" for one it deleted. Retiring a still-listed
+    model here would hide it from routing/dispatcher for the full TTL (7 days)
+    just because the upstream was busy -- exactly the break MuseSpark and
+    deepseek kept hitting. So a refresh is forced and the model is retired ONLY
+    when it is no longer in the catalog's free list. A per-model cooldown keeps
+    a burst of "unavailable" 400s from forcing more than one refresh per window.
     """
     err = getattr(exc, "last_error", None)
     if err is None or getattr(err, "status_code", None) != 400:
         return False
     if "unavailable" not in str(getattr(err, "detail", "")).lower():
         return False
+
+    now = time.time()
+    last = _retire_recheck_at.get(model_id, 0.0)
+    if now - last < config.RETIRE_RECHECK_COOLDOWN_S:
+        # Checked recently and it was still listed (else it would have been
+        # retired); don't hammer /models on every concurrent 400 in this burst.
+        return False
+    _retire_recheck_at[model_id] = now
+
+    # Authoritative answer: force a refresh and see whether the model is still
+    # offered free. refresh() falls back to the last good list on a fetch
+    # failure, so a transient /models outage can't make us retire a model that
+    # is still listed.
+    try:
+        catalog.refresh(force=True)
+    except Exception:  # noqa: BLE001
+        return False
+    if catalog.by_id(model_id) is not None:
+        # Still in the free section -> genuinely transient, not removed. Leave
+        # it routable; the request's own 400 already propagates to failover.
+        return False
     try:
         catalog.mark_unavailable(model_id)
     except Exception:  # noqa: BLE001
         return False
-    log.info("catalog: retired model %s (upstream no longer serves it free)", model_id)
+    log.info(
+        "catalog: retired model %s (no longer in the free section; the "
+        "'unavailable' 400 was OpenCode dropping it, not a transient outage)",
+        model_id,
+    )
     return True
 
 
@@ -1306,7 +1488,7 @@ async def chat_completions(request: Request):
             )
         except executor.AllFailedError as exc:
             fallback = dispatcher.fallback_model(
-                catalog, had_images, exclude={target}, messages=messages,
+                catalog, had_images, exclude={target} | set(sampler.cooked_models()), messages=messages,
             )
             fallback_providers = catalog.providers_for(fallback)
             if fallback and fallback != target and fallback_providers:
@@ -1357,7 +1539,7 @@ async def chat_completions(request: Request):
             **routing_meta, "provider": prov.id, "account": account_id, "attempts": attempts,
         }
         log.info(
-            "chat complete requested=%s target=%s provider=%s stream=false latency_ms=%.1f",
+            "chat handled requested=%s target=%s provider=%s stream=false latency_ms=%.1f",
             requested, target, prov.id, (time.time() - request_started) * 1000.0,
         )
         return JSONResponse(resp)
@@ -1369,16 +1551,21 @@ async def chat_completions(request: Request):
     # Recovery re-emits the whole answer after a reset marker, so a client that
     # ignores the marker would render it twice. Callers can opt out per request.
     recover = bool(body.get("lingling_recover", config.STREAM_RECOVERY))
+    # A hidden-reasoning model is silent on the wire while it thinks; the default
+    # watchdog/read budgets would cut that off as a broken stream, so a reasoning
+    # target gets a longer "thinking patience" (output is untouched). pacing_for
+    # returns (idle_budget, read_timeout); reorder into the names used below.
+    stream_idle_budget, stream_read_to = _stream_pacing(target, body)
     started = time.time()
     try:
-        # execute_stream blocks until the first upstream chunk arrives (up to
-        # STREAM_FIRST_TOKEN_TIMEOUT), so it cannot run on the event loop. The
-        # generator it returns is safe: StreamingResponse iterates sync
-        # iterators in a worker thread already.
+        # execute_stream blocks until the first upstream chunk arrives (up to the
+        # per-stream read timeout below), so it cannot run on the event loop. The
+        # generator it returns is safe: StreamingResponse iterates sync iterators
+        # in a worker thread already.
         stream_iter, prov, key, attempts = await _execute_with_egress_wait(
             executor.execute_stream,
             messages, target, target_providers, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, **params
+            session_id=session_id, timeout=stream_read_to, **params
         )
     except (executor.AllFailedError, executor.NoProviderError) as exc:
         error = str(getattr(exc, "last_error", exc))
@@ -1386,7 +1573,7 @@ async def chat_completions(request: Request):
             requested, target, routed_by, reason, status="exhausted",
             had_images=had_images, error=error[:300],
         )
-        raise HTTPException(503, f"No upstream stream started within {config.STREAM_FIRST_TOKEN_TIMEOUT:g}s for '{target}'.")
+        raise HTTPException(503, f"No upstream stream started within {stream_read_to:g}s for '{target}'.")
 
     account_id = key.id if key is not None else None  # keyless -> no account
     # Log at first chunk so a stream that dies mid-flight still leaves a record;
@@ -1398,7 +1585,7 @@ async def chat_completions(request: Request):
         streamed=True,
     )
     log.info(
-        "chat stream started requested=%s target=%s provider=%s first_chunk_ms=%.1f",
+        "chat: streaming requested=%s target=%s provider=%s first_chunk_ms=%.1f",
         requested, target, prov.id, (time.time() - request_started) * 1000.0,
     )
 
@@ -1422,7 +1609,7 @@ async def chat_completions(request: Request):
         retry_params = params
         if auto_routed:
             alternative = dispatcher.fallback_model(
-                catalog, had_images, exclude={target}, messages=messages,
+                catalog, had_images, exclude={target} | set(sampler.cooked_models()), messages=messages,
             )
             alt_providers = catalog.providers_for(alternative)
             if alternative and alternative != target and alt_providers:
@@ -1444,12 +1631,16 @@ async def chat_completions(request: Request):
         # model could; swap them for the same placeholder the non-streaming
         # fallback uses, or OpenCode answers 400 and the retry is wasted.
         retry_messages = _messages_for_model(messages, retry_model, had_images)
+        # The retry may land on a different model: re-derive its thinking
+        # patience so a reroute off a hidden-reasoning model does not carry the
+        # long budget onto a normal one (and vice versa).
+        retry_idle_budget, retry_read_to = _stream_pacing(retry_model, body)
         again, _prov, _key, _attempts = executor.execute_stream(
             retry_messages, retry_model, providers_for_retry, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT,
+            session_id=session_id, timeout=retry_read_to,
             **retry_params
         )
-        return stream_idle.with_idle_timeout(again, config.STREAM_IDLE_TIMEOUT, log)
+        return stream_idle.with_idle_timeout(again, retry_idle_budget, log)
 
     def _hold_for_egress():
         """Wait for a free exit before the mid-stream retry reopens.
@@ -1474,9 +1665,11 @@ async def chat_completions(request: Request):
                 open_stream=_reopen,
                 # Wrapped in the idle watchdog: a stream that stops speaking
                 # without closing raises StreamStalled, which guarded_stream
-                # already treats as a mid-flight death and retries once.
+                # already treats as a mid-flight death and retries once. The
+                # budget is model-aware: a hidden-reasoning model is allowed a
+                # longer silent thinking pause (see _stream_pacing).
                 first=stream_idle.with_idle_timeout(
-                    stream_iter, config.STREAM_IDLE_TIMEOUT, log),
+                    stream_iter, stream_idle_budget, log),
                 outcome=outcome,
                 on_chunk=lambda raw: _harvest_stream_usage(raw, seen),
                 log=log,
@@ -1487,6 +1680,11 @@ async def chat_completions(request: Request):
                 retry_model=lambda: (
                     reroute["model"] if reroute["model"] != target else None
                 ),
+                # The resolved target: so a hidden-reasoning model can be learned
+                # from its wire behaviour (reasoning tokens, or a stall before any
+                # visible content) and given thinking patience on the retry / next
+                # turn via _stream_pacing -> pacing_memory.
+                model_id=target,
             )
         finally:
             if outcome.error:
@@ -1514,7 +1712,7 @@ async def chat_completions(request: Request):
             )
             if outcome.recovered:
                 log.info(
-                    "chat stream recovered target=%s attempts=%d",
+                    "chat: recovered target=%s attempts=%d",
                     reroute["model"], outcome.attempts,
                 )
 
@@ -1600,7 +1798,7 @@ async def responses(request: Request):
             # this a rate-limited free tier returned a hard 503 to Codex while
             # Cline silently got an answer from a different model.
             fallback = dispatcher.fallback_model(
-                catalog, had_images, exclude={target}, messages=messages,
+                catalog, had_images, exclude={target} | set(sampler.cooked_models()), messages=messages,
             )
             fallback_providers = catalog.providers_for(fallback)
             if not (fallback and fallback != target and fallback_providers):
@@ -1644,17 +1842,19 @@ async def responses(request: Request):
             "reason": reason, "account": account_id, "attempts": attempts,
         })
         log.info(
-            "responses complete requested=%s target=%s provider=%s stream=false latency_ms=%.1f",
+            "responses: handled requested=%s target=%s provider=%s stream=false latency_ms=%.1f",
             requested, target, prov.id, (time.time() - request_started) * 1000.0,
         )
         return JSONResponse(out)
 
+    # Hidden-reasoning models get a longer silent-thinking patience; see chat.
+    stream_idle_budget, stream_read_to = _stream_pacing(target, body)
     started = time.time()
     try:
         stream_iter, prov, key, attempts = await _execute_with_egress_wait(
             executor.execute_stream,
             messages, target, target_providers, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, **params
+            session_id=session_id, timeout=stream_read_to, **params
         )
     except (executor.AllFailedError, executor.NoProviderError) as exc:
         error = str(getattr(exc, "last_error", exc))
@@ -1662,7 +1862,7 @@ async def responses(request: Request):
             requested, target, routed_by, reason, status="exhausted",
             had_images=had_images, error=error[:300],
         )
-        raise HTTPException(503, f"No upstream stream started within {config.STREAM_FIRST_TOKEN_TIMEOUT:g}s for '{target}'.")
+        raise HTTPException(503, f"No upstream stream started within {stream_read_to:g}s for '{target}'.")
 
     account_id = key.id if key is not None else None
     row_id = usage_store.log(
@@ -1672,7 +1872,7 @@ async def responses(request: Request):
         streamed=True,
     )
     log.info(
-        "responses stream started requested=%s target=%s provider=%s first_chunk_ms=%.1f attempts=%d",
+        "responses: streaming requested=%s target=%s provider=%s first_chunk_ms=%.1f attempts=%d",
         requested, target, prov.id, (time.time() - request_started) * 1000.0, len(attempts),
     )
 
@@ -1689,8 +1889,10 @@ async def responses(request: Request):
                 # closing would otherwise hold the turn open indefinitely.
                 # StreamStalled is caught by stream_events and ends the turn
                 # honestly rather than propagating into a broken SSE response.
+                # The budget is model-aware so a hidden-reasoning model that
+                # thinks silently is not cut off mid-thought (see _stream_pacing).
                 guarded = stream_idle.with_idle_timeout(
-                    stream_iter, config.STREAM_IDLE_TIMEOUT, log)
+                    stream_iter, stream_idle_budget, log)
                 for raw in guarded:
                     _harvest_stream_usage(raw if isinstance(raw, bytes) else raw.encode("utf-8"), seen)
                     yield raw
@@ -1799,7 +2001,7 @@ async def messages(request: Request):
             # different free model beats handing Claude Code a hard failure,
             # which ends its turn.
             fallback = dispatcher.fallback_model(
-                catalog, had_images, exclude={target}, messages=messages_in,
+                catalog, had_images, exclude={target} | set(sampler.cooked_models()), messages=messages_in,
             )
             fallback_providers = catalog.providers_for(fallback)
             if not (fallback and fallback != target and fallback_providers):
@@ -1841,17 +2043,19 @@ async def messages(request: Request):
             resp, requested, target, prov.id, show_thinking=show_thinking,
         )
         log.info(
-            "messages complete requested=%s target=%s provider=%s stream=false latency_ms=%.1f",
+            "messages: handled requested=%s target=%s provider=%s stream=false latency_ms=%.1f",
             requested, target, prov.id, (time.time() - request_started) * 1000.0,
         )
         return JSONResponse(out)
 
+    # Hidden-reasoning models get a longer silent-thinking patience; see chat.
+    stream_idle_budget, stream_read_to = _stream_pacing(target, body)
     started = time.time()
     try:
         stream_iter, prov, key, attempts = await _execute_with_egress_wait(
             executor.execute_stream,
             messages_in, target, target_providers, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, **params
+            session_id=session_id, timeout=stream_read_to, **params
         )
     except (executor.AllFailedError, executor.NoProviderError) as exc:
         error = str(getattr(exc, "last_error", exc))
@@ -1859,7 +2063,7 @@ async def messages(request: Request):
             requested, target, routed_by, reason, status="exhausted",
             had_images=had_images, error=error[:300],
         )
-        raise HTTPException(503, f"No upstream stream started within {config.STREAM_FIRST_TOKEN_TIMEOUT:g}s for '{target}'.")
+        raise HTTPException(503, f"No upstream stream started within {stream_read_to:g}s for '{target}'.")
 
     account_id = key.id if key is not None else None
     row_id = usage_store.log(
@@ -1869,7 +2073,7 @@ async def messages(request: Request):
         streamed=True,
     )
     log.info(
-        "messages stream started requested=%s target=%s provider=%s first_chunk_ms=%.1f",
+        "messages: streaming requested=%s target=%s provider=%s first_chunk_ms=%.1f",
         requested, target, prov.id, (time.time() - request_started) * 1000.0,
     )
 
@@ -1882,9 +2086,11 @@ async def messages(request: Request):
                 # closing would otherwise hold the turn open indefinitely -- one
                 # measured session sat 885s with zero tokens before giving up.
                 # StreamStalled is caught below and ends the turn honestly rather
-                # than propagating into a broken SSE response.
+                # than propagating into a broken SSE response. The budget is
+                # model-aware so a hidden-reasoning model that thinks silently is
+                # not cut off mid-thought (see _stream_pacing).
                 guarded = stream_idle.with_idle_timeout(
-                    stream_iter, config.STREAM_IDLE_TIMEOUT, log)
+                    stream_iter, stream_idle_budget, log)
                 for raw in guarded:
                     frame = raw if isinstance(raw, bytes) else raw.encode("utf-8")
                     _harvest_stream_usage(frame, seen)
@@ -1985,12 +2191,39 @@ class _QuietPollFilter(logging.Filter):
 
 
 def _build_log_config() -> Dict[str, Any]:
-    """Uvicorn's default LOGGING_CONFIG + the quiet-poll filter on access."""
+    """Uvicorn's default LOGGING_CONFIG + the quiet-poll filter + a file handler.
+
+    The file handler mirrors every record to ``data/backend.log`` so the launcher
+    no longer redirects stdout there: the minimized window shows the live
+    (minimal, WARP-verbose-off) output instead of a blank pane, while the file
+    still holds a runtime crash trace after the window closes. ``uvicorn`` and
+    ``uvicorn.access`` keep uvicorn's default ``propagate = False`` (so the root
+    handler set below cannot double-emit them); ``uvicorn.error`` has no own
+    handlers and propagates up to ``uvicorn`` for one pass through console + file.
+    The file handler carries the quiet-poll filter too, so dashboard GET-200 polls
+    do not flood the file. Root catches third-party libs (httpx/urllib3/socksio)
+    at warning level only, so the window stays minimal.
+    """
     from uvicorn.config import LOGGING_CONFIG
 
     cfg = copy.deepcopy(LOGGING_CONFIG)
     cfg.setdefault("filters", {})["quiet_poll"] = {"()": _QuietPollFilter}
     cfg["handlers"]["access"]["filters"] = ["quiet_poll"]
+
+    config.ensure_data_dir()
+    cfg["handlers"]["file"] = {
+        "class": "logging.FileHandler",
+        "formatter": "default",
+        "filename": str(config.DATA_DIR / "backend.log"),
+        "mode": "a",
+        "encoding": "utf-8",
+        "filters": ["quiet_poll"],
+    }
+    cfg["root"] = {"handlers": ["default", "file"], "level": "WARNING"}
+    uvi = cfg["loggers"]["uvicorn"]
+    uvi["handlers"] = uvi.get("handlers", []) + ["file"]
+    acc = cfg["loggers"]["uvicorn.access"]
+    acc["handlers"] = acc.get("handlers", []) + ["file"]
     return cfg
 
 

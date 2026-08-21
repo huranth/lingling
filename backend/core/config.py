@@ -96,6 +96,12 @@ WARP_FORMATION_MAX_ROUNDS = int(os.getenv("LINGLING_WARP_FORMATION_MAX_ROUNDS", 
 WARP_FORMATION_MAX_ROLLS = int(os.getenv("LINGLING_WARP_FORMATION_MAX_ROLLS", "5"))
 # Form the distinct-exit lanes automatically after the startup probe.
 WARP_FORM_ON_STARTUP = os.getenv("LINGLING_WARP_FORM_ON_STARTUP", "1") not in ("0", "false", "False", "")
+# Verbose per-element WARP chatter: every exit's probe result, every reroll,
+# every intermediate spread roll. Off by default so the terminal shows summaries
+# (probe done, formation X->Y, sampler verdicts, per-request chat) instead of a
+# wall of "warp-N healthy (Ms)" / "restart_instance #N ok" lines. Flip to 1 only
+# when debugging the pool.
+WARP_VERBOSE = os.getenv("LINGLING_WARP_VERBOSE", "0") not in ("0", "false", "False", "")
 
 # --- Tor egress lanes ---
 # Zero-account exit IPs beside WARP: OpenCode answers Tor exits (measured),
@@ -140,6 +146,24 @@ def retired_seed_ids() -> frozenset:
     """
     return frozenset(m.strip() for m in RETIRED_MODELS_SEED.split(",") if m.strip())
 
+# Cooldown on the "is this model actually gone from the free section?" recheck
+# that gates runtime retirement (see _flag_model_retired in app.py). A model
+# 400ing "unavailable" under heavy upstream load fires that recheck on many
+# concurrent requests at once; this bounds it to one catalog refresh per model
+# per window so a burst of transient "unavailable" 400s doesn't hammer /models.
+RETIRE_RECHECK_COOLDOWN_S = float(os.getenv("LINGLING_RETIRE_RECHECK_COOLDOWN_S", "30"))
+
+# Defer re-rolling/restarting an egress (WARP wireproxy / Tor lane) while an
+# HTTP stream is riding it, so the health/formation/probe daemons don't
+# terminate the tunnel under a live request (the graceful FIN reads as
+# "upstream closed before completing" and breaks long reasoning-model streams
+# such as MuseSpark; see providers/active_streams.py). 0 reverts to the old
+# re-roll-anyway behaviour if a regression appears.
+DEFER_REROLL_WHEN_BUSY = os.getenv(
+    "LINGLING_DEFER_REROLL_WHEN_BUSY", "1",
+) not in ("0", "false", "False", "")
+
+
 # --- User API keys ---
 # Random ``ll_<32 hex>`` tokens in this file; clients send them as
 # ``Authorization: Bearer ll_...`` or ``x-api-key: ll_...``.
@@ -175,6 +199,24 @@ BOOTSTRAP_WARP = os.getenv("LINGLING_BOOTSTRAP_WARP", "0") not in ("0", "false",
 PROBE_ON_STARTUP = os.getenv("LINGLING_PROBE_ON_STARTUP", "1") not in ("0", "false", "False", "")
 PROBE_MODEL = os.getenv("LINGLING_PROBE_MODEL", "deepseek-v4-flash-free")
 PROBE_TIMEOUT = float(os.getenv("LINGLING_PROBE_TIMEOUT", "15"))
+# Per-lane probe read timeout extended for a *reasoning* probe model. OpenCode's
+# free tier is currently all reasoning models, so the probe often lands on one,
+# and a model that thinks before its first token can stretch the trivial "hi"
+# probe past PROBE_TIMEOUT -- which false-positives as "dead" and churns the
+# healers (regenerating identities) for lanes that are merely thinking. 0 or <=
+# PROBE_TIMEOUT disables the extension (reasoning probe models fall back to the
+# tight budget). The watchdog cap scales with it, so a wedged lane is only
+# slower-to-cut while the probe is on a reasoning model.
+PROBE_REASONING_TIMEOUT = float(os.getenv("LINGLING_PROBE_REASONING_TIMEOUT", "45"))
+# Probe max_tokens: how many completion tokens the liveness probe asks for. A
+# fast model accepts a tiny budget (a cheap is-this-exit-alive ping), but a
+# reasoning / long-thinking model rejects it -- muse-spark returns HTTP 400 at
+# max_tokens=5 because its reasoning cannot fit, which the sampler misreads as a
+# model-side refusal and false-cooks (every green exit probe-errors, so a
+# healthy model gets pinned cooked). Reasoning probes get a real budget; fast
+# models stay cheap. See routing/sampler._sampler_probe_budget + warp/probe._probe_single.
+PROBE_MAX_TOKENS = int(os.getenv("LINGLING_PROBE_MAX_TOKENS", "5"))
+PROBE_REASONING_MAX_TOKENS = int(os.getenv("LINGLING_PROBE_REASONING_MAX_TOKENS", "64"))
 # Lanes probed at once. Parallel probing keeps one slow lane from stretching
 # the whole pass by its full timeout (a sequential pass once measured 6.6
 # minutes while every individual request took ~2s); the count stays small
@@ -198,6 +240,52 @@ PROBE_CAP_SLACK = float(os.getenv("LINGLING_PROBE_CAP_SLACK", "12"))
 # 0 disables the periodic probe (startup probe still runs).
 PROBE_INTERVAL_S = float(os.getenv("LINGLING_PROBE_INTERVAL_S", "300"))
 
+# --- Post-heal multi-model sampler ---
+# After the startup heal (and, when enough time has passed, after the daemon's
+# heal cycle) the pool is freshly verified against a *canary* free model. The
+# sampler then runs a tiny non-stream completion per configured model across the
+# canary-green exits and attributes the outcome:
+#   * a model that errors (model-side 4xx) on every canary-green exit while those
+#     same exits serve the canary -> OpenCode-side outage, so the request path
+#     fails fast instead of churning the whole pool, and the existing per-model
+#     fallback fires.
+#   * a model that 429s/timeouts on some green exits but serves others -> per-IP
+#     burns, so requests for that model route onto its green subset.
+# State is in-memory and short-lived (SAMPLER_TTL_S), refreshed each pass, so a
+# model that recovers is retried without a restart. The request path treats a
+# model with no fresh sampler data exactly as before, so this is strictly
+# additive and reverts fully when LINGLING_SAMPLER_ENABLED=0. See routing/sampler.py.
+SAMPLER_ENABLED = os.getenv(
+    "LINGLING_SAMPLER_ENABLED", "1",
+) not in ("0", "false", "False", "")
+# Models swept across the green pool, in order. DeepSeek first (the primary most
+# users route through Lingling to reach), then the hidden-reasoning MuseSpark the
+# dynamic pacing already protects, then the other curated OpenCode free models.
+SAMPLER_MODELS = [
+    m.strip()
+    for m in os.getenv(
+        "LINGLING_SAMPLER_MODELS",
+        "deepseek-v4-flash-free,muse-spark-1.2-contributor-free,"
+        "nemotron-3-ultra-free,north-mini-code-free,big-pickle,"
+        "longcat-2.0-free,laguna-s-2.1-free",
+    ).split(",")
+    if m.strip()
+]
+# Minimum time between sampler passes. The sampler piggybacks on the heal cycle,
+# so this is a *skip-if-too-recent* gate rather than its own timer; a value >= the
+# heal cadence means at most one sampler pass per heal cycle. 0 means every heal.
+SAMPLER_INTERVAL_S = float(os.getenv("LINGLING_SAMPLER_INTERVAL_S", "300"))
+# How long the request path trusts a sampler result. >= INTERVAL_S so the data is
+# always fresh while the sampler is running, but a sampler that stops (disabled at
+# runtime, or a long OpenCode outage that empties the green pool) does not pin a
+# stale "cooked" flag on a model forever. 0 means trust indefinitely (not advised).
+SAMPLER_TTL_S = float(os.getenv("LINGLING_SAMPLER_TTL_S", "600"))
+# When the sampler proves a model is OpenCode-side cooked, cap the per-request
+# per-egress attempt budget to this many exits so the request fails (and falls
+# back) instead of burning the whole pool retrying IPs that cannot fix a
+# model-side refusal. 1 = try exactly one exit, then give up to the fallback.
+SAMPLER_FAIL_FAST_ATTEMPTS = int(os.getenv("LINGLING_SAMPLER_FAIL_FAST_ATTEMPTS", "1"))
+
 # --- Streaming recovery ---
 # A stream that dies after the first chunk cannot fail over at the HTTP level
 # (the 200 is already sent). When enabled, Lingling retries once on a fresh exit
@@ -207,10 +295,57 @@ STREAM_RECOVERY = os.getenv("LINGLING_STREAM_RECOVERY", "1") not in ("0", "false
 
 # Longest an open stream may go without a usable frame before it is treated as
 # broken -- catches an upstream that stops speaking while the socket stays open
-# (neither the first-token budget nor stream_guard covers this). Generous,
-# because a thinking model streams reasoning continuously; only a true stall goes
-# quiet. 0 disables the watchdog.
+# (neither the first-token budget nor stream_guard covers this). A model that
+# streams its reasoning continuously never goes quiet, so a true stall is the
+# only thing that trips this. 0 disables the watchdog.
 STREAM_IDLE_TIMEOUT = float(os.getenv("LINGLING_STREAM_IDLE_TIMEOUT", "90"))
+
+# A *hidden-reasoning* model thinks with server-side tokens it never streams
+# and sends no keepalives while it does, so the wire is silent for the whole
+# thinking pause. The watchdog above would read that silence as a broken stream
+# and stream_guard would retry it to death -- while the model was merely
+# thinking. Reasoning models therefore get a longer "thinking patience": a
+# silent pause up to this many seconds is tolerated (per-gap, the budget resets
+# on every frame, so streaming-then-thinking still only bounds each pause).
+# The httpx read timeout for these streams is set above this so the watchdog's
+# informative StreamStalled (and its one retry) governs a pause rather than a
+# bare httpx ReadTimeout. 0 disables the extension (reasoning models fall back
+# to the budgets above) -- it is *not* the watchdog-disable sentinel.
+STREAM_THINKING_TIMEOUT = float(os.getenv("LINGLING_STREAM_THINKING_TIMEOUT", "300"))
+# Model ids known to think with hidden reasoning tokens even when the catalog
+# does not flag them reasoning (a model whose reasoning is server-side and
+# unadvertised). Comma-separated; they get the thinking patience regardless of
+# metadata. MuseSpark 1.2 Contributor free is the canonical case -- it thinks
+# silently (no streamed reasoning tokens, no keepalives) and models.dev does
+# not reliably flag it reasoning -- so it ships in the default set rather than
+# requiring an operator to discover the break the hard way. Set
+# LINGLING_LONG_THINKING_MODELS="" to clear, or list your own ids to override.
+LONG_THINKING_MODELS = frozenset(
+    m.strip() for m in os.getenv(
+        "LINGLING_LONG_THINKING_MODELS", "muse-spark-1.2-contributor-free",
+    ).split(",") if m.strip()
+)
+
+# --- Runtime-learned "needs thinking patience" registry ---
+# A hidden-reasoning model whose listing does NOT advertise reasoning and whose
+# client never sends a reasoning param is invisible to LONG_THINKING_MODELS, the
+# catalog flag, and the per-request body check -- the only signal that it thinks
+# is how it behaves on the wire (a chunk carrying reasoning tokens, or a stream
+# that trips the idle watchdog before emitting any visible content). That signal
+# is timestamped and persisted here so the patience it needs survives a restart
+# and is shared across the chat/responses/messages entrypoints: a future model
+# of the same kind self-adapts after its first turn instead of stalling on every
+# request until an operator edits LONG_THINKING_MODELS by hand. See
+# routing/pacing_memory.py.
+REASONING_LEARNED_FILE = Path(
+    os.getenv("LINGLING_REASONING_MODELS_FILE",
+              str(DATA_DIR / "reasoning_models.json"))
+)
+# How long a learned entry stays trusted. Long, because reasoning is a stable
+# property of a model -- but finite, so a one-time transient stall (a model
+# that stalled for an unrelated reason) does not pin it patient forever. 0
+# disables the learning extension entirely (falls back to override/catalog/body).
+REASONING_LEARNED_TTL_DAYS = int(os.getenv("LINGLING_REASONING_TTL_DAYS", "30"))
 
 # --- Waiting out an exhausted egress pool ---
 # When every WARP exit is cooling at once, the request waits for the soonest one

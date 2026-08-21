@@ -234,11 +234,11 @@ class WarpManager:
             results["wireproxy"] = str(self._wireproxy_path())
             return results
         if not self._wgcf_path().exists():
-            log("[warp] downloading wgcf ...")
+            log("[warp] grabbing wgcf ...")
             self._download_latest(self._wgcf_path(), WGCF_REPO, _pick_wgcf_asset)
             results["downloaded"].append("wgcf")
         if not self._wireproxy_path().exists():
-            log("[warp] downloading wireproxy ...")
+            log("[warp] grabbing wireproxy ...")
             self._download_latest(self._wireproxy_path(), WIREPROXY_REPO, _pick_wireproxy_asset)
             results["downloaded"].append("wireproxy")
         results["wgcf"] = str(self._wgcf_path()) if self._wgcf_path().exists() else None
@@ -380,7 +380,7 @@ class WarpManager:
         last_err: Optional[Exception] = None
         for attempt in range(1, 4):
             try:
-                log(f"[warp] registering identity #{inst.index} (attempt {attempt}/3) ...")
+                log(f"[warp] minting identity #{inst.index} (attempt {attempt}/3) ...")
                 _run([wgcf, "register", "--accept-tos"], cwd=d)
                 _run([wgcf, "generate"], cwd=d)
                 prof = (d / "wgcf-profile.conf").read_text()
@@ -388,7 +388,7 @@ class WarpManager:
                 (d / "wireproxy.conf").write_text(_wireproxy_conf(
                     inst.private_key, inst.address_v4, inst.address_v6, inst.port,
                 ))
-                log(f"[warp] identity #{inst.index} ready on 127.0.0.1:{inst.port}")
+                log(f"[warp] identity #{inst.index} live on 127.0.0.1:{inst.port} — fresh out the oven")
                 return
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
@@ -636,7 +636,8 @@ class WarpManager:
         # Wait for port to open
         for _ in range(12):  # ~6 seconds
             if _port_is_open("127.0.0.1", inst.port, timeout=0.5):
-                log(f"[warp] restart_instance #{inst.index} ok on port {inst.port}")
+                if config.WARP_VERBOSE:
+                    log(f"[warp] restart_instance #{inst.index} ok on port {inst.port}")
                 return True
             time.sleep(0.5)
 

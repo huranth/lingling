@@ -2983,6 +2983,7 @@ function slotRow(s, probeById, laneOf){
   if (probeResult && probeResult.exit_ip) tipBits.push('exit ' + probeResult.exit_ip);
   if (probeStatus === 'ok' && probeLat) tipBits.push(probeLat + 'ms');
   if (probeStatus === 'healed') tipBits.push('exit refreshed — next probe verifies it');
+  if (probeStatus === 'probe_error') tipBits.push('tunnel up — probe model rejected');
   if (probeResult && probeResult.error) tipBits.push(probeResult.error);
   const chipTitle = tipBits.length ? ' title="' + esc(tipBits.join(' · ')) + '"' : '';
   const lane = probeResult && probeResult.exit_ip ? laneOf[probeResult.exit_ip] : '';
@@ -2995,7 +2996,12 @@ function slotRow(s, probeById, laneOf){
       ? '<span class="chip bad"><span class="dot"></span>dead</span>'
       : (probeStatus === 'healed'
         ? '<span class="chip warn"><span class="dot"></span>healed</span>'
-        : ''));
+        : (probeStatus === 'probe_error'
+          // The tunnel reached OpenCode but the probe model was rejected
+          // (e.g. gated behind a key) — the lane still carries traffic, it
+          // just couldn't be verified by this probe. Warn, not bad.
+          ? '<span class="chip warn"><span class="dot"></span>probe?</span>'
+          : '')));
   const chip = probeChip || (cooling
     ? '<span class="chip warn"><span class="dot"></span>cooling ' + Number(s.cooldown_remaining_s || 0).toFixed(0) + 's</span>'
     : (up
@@ -3130,16 +3136,27 @@ async function loadEgress(){
             ? (probe.interval_s / 60 >= 10 ? Math.round(probe.interval_s / 60) : (probe.interval_s / 60).toFixed(1)) + 'm'
             : Math.round(probe.interval_s) + 's')
         : '';
+      // probe.total is a snapshot captured at probe time; the live pool
+      // (total) can be larger -- Tor lanes join the pool after the WARP
+      // startup probe ran, so probe.total reads 10 while the gauge shows 13.
+      // Using the snapshot as the "exit lanes" denominator made the rack say
+      // "across 10 slots" right beside a 13/13 gauge. Denominators now follow
+      // the live pool, and the lanes the probe hasn't reached yet are shown
+      // as "pending" so the two numbers agree instead of contradicting.
+      const slotsTotal = pool ? total : probe.total;
+      const pending = (pool && total > probe.total) ? (total - probe.total) : 0;
       probeHealth = '<div class="vital"><span class="k">exit probe</span><span class="v">' +
           probe.healthy + '/' + probe.total + ' healthy' +
           (probe.rate_limited ? ', ' + probe.rate_limited + ' rate-limited' : '') +
           (probe.dead ? ', ' + probe.dead + ' dead' : '') +
+          (probe.probe_error ? ', ' + probe.probe_error + ' probe?' : '') +
+          (pending ? ' · ' + pending + ' pending' : '') +
           (ageS != null ? ' · ' + fmtAge(ageS) + ' ago' : '') +
           cadence + '</span></div>' +
         '<div class="vital"><span class="k">exit lanes</span><span class="v' +
-          (exitCount && exitCount < probe.total ? ' hot' : '') + '">' +
-          (exitCount ? exitCount + ' across ' + probe.total + ' slots' : '—') +
-          (exitCount < probe.total ? ' — Form lanes to spread' : '') +
+          (exitCount && exitCount < slotsTotal ? ' hot' : '') + '">' +
+          (exitCount ? exitCount + ' across ' + slotsTotal + ' slots' : '—') +
+          (exitCount < slotsTotal ? ' — Form lanes to spread' : '') +
           '</span></div>';
     } else if (probe && probe.probed === false) {
       probeHealth = '<div class="vital"><span class="k">exit probe</span>' +

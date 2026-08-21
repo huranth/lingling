@@ -165,10 +165,56 @@ def test_probe_single_500():
     assert "HTTP 500" in result.error
 
 
+def test_probe_single_401_is_probe_error_not_dead():
+    """A 401 (OpenCode rejected the probe model/auth) reached the upstream, so
+    the tunnel is up and not rate-limited -- it is NOT a dead tunnel. This
+    regressed live: every freshly registered identity got ``probe_error``'d as
+    ``dead`` and heal_expired regenerated the whole pool on the next probe
+    because ``deepseek-v4-flash-free`` had been gated behind a key, burning
+    Cloudflare registrations for a problem the identity can't fix."""
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 401
+    with mock.patch("warp.probe.socks5_connect_check", return_value=""), \
+         mock.patch("warp.probe.httpx.Client") as MockClient:
+        ctx = mock.MagicMock()
+        ctx.__enter__ = mock.MagicMock(return_value=ctx)
+        ctx.__exit__ = mock.MagicMock(return_value=False)
+        ctx.post.return_value = mock_resp
+        MockClient.return_value = ctx
+        result = probe._probe_single(
+            "socks5://127.0.0.1:51001", "warp-1",
+            "deepseek-v4-flash-free", "https://opencode.ai/zen/v1", 15,
+        )
+    assert result.status == "probe_error"
+    assert "HTTP 401" in result.error
+
+
+def test_probe_error_lanes_are_not_healed_as_dead():
+    """A probe model rejection (probe_error) must not be churned by ``heal_expired``
+    or ``heal_rate_limited``: the tunnel reached OpenCode, so neither regenerating
+    the identity nor re-rolling the exit can fix an upstream model gate."""
+    pool = _make_pool(2)
+    wm = FakeWarpManager(count=2)
+    summary = probe.ProbeSummary(
+        total=2, healthy=1, probe_error=1, results=[
+            probe.ProbeResult(proxy_id="warp-1", status="ok"),
+            probe.ProbeResult(proxy_id="warp-2", status="probe_error",
+                              error="HTTP 401", exit_ip="104.28.231.142"),
+        ])
+    healed_expired = probe.heal_expired(pool, summary, wm, log=lambda *a, **k: None)
+    healed_rate = probe.heal_rate_limited(pool, summary, wm, log=lambda *a, **k: None)
+    assert healed_expired == 0 and healed_rate == 0
+    assert wm.regenerated_indices == []
+    # The probe_error lane stays in the pool so real traffic still routes it.
+    assert pool.get_by_id("warp-1") is not None
+    assert pool.get_by_id("warp-2") is not None
+    # And neither healer rewrote the verdict.
+    assert summary.results[1].status == "probe_error"
+
+
 # ---------------------------------------------------------------------------
 # SOCKS5 liveness pre-check -- httpcore's handshake reads carry no timeout,
-# so a silent tunnel used to park the probing thread forever. These tests
-# reproduce that exact wedge with a local server that accepts and never
+# so a silent tunnel used to park the probing thread forever. These tests# reproduce that exact wedge with a local server that accepts and never
 # answers.
 # ---------------------------------------------------------------------------
 
@@ -967,3 +1013,666 @@ def test_formation_never_targets_a_burned_exit():
         result = formation.form_distinct_exits(pool, wm, log=lambda *a, **k: None)
     # The burned exit never became a lane, no matter that rolls landed on it.
     assert "6.6.6.6" not in result["lanes"], result["lanes"]
+
+
+# ---------------------------------------------------------------------------
+# resolve_probe_model -- the probe must verify lanes with a model OpenCode
+# actually serves. A hardcoded pin rots the moment OpenCode pulls it behind a
+# key, and then every lane reads probe_error and the pool looks dead while the
+# egress is fine. These pin the resolution rule.
+# ---------------------------------------------------------------------------
+
+class _FreeModel:
+    """Stand-in for a LogicalModel -- resolve_probe_model only reads .id and
+    .reasoning off it (getattr-with-defaults), so this is all it needs."""
+    def __init__(self, id, reasoning=False):
+        self.id = id
+        self.reasoning = reasoning
+
+
+def test_resolve_probe_model_prefers_free_non_reasoning(monkeypatch):
+    """Prefer a free, non-reasoning model from the live catalog: it answers the
+    5-token probe immediately and is the least likely to be gated or to burn the
+    probe's timeout thinking. The pin is the fallback, not the first choice."""
+    monkeypatch.setattr(probe.config, "PROBE_MODEL", "deepseek-v4-flash-free")
+    free = [
+        _FreeModel("musespark-1.2-contributor-free", reasoning=True),
+        _FreeModel("ling-3.0-flash-free", reasoning=False),
+    ]
+    assert probe.resolve_probe_model(free) == "ling-3.0-flash-free"
+
+
+def test_resolve_probe_model_skips_reasoning_models(monkeypatch):
+    """A reasoning model thinks before its first token -- sometimes silently --
+    which stretches the probe and risks a watchdog/timeout on a lane that is
+    fine. Reasoning models are skipped over when a non-reasoning free model
+    exists, even when they appear first in the catalog order."""
+    monkeypatch.setattr(probe.config, "PROBE_MODEL", "deepseek-v4-flash-free")
+    free = [
+        _FreeModel("o3-deep-reasoning-free", reasoning=True),
+        _FreeModel("musespark-1.2-contributor-free", reasoning=True),
+        _FreeModel("ling-3.0-flash-free", reasoning=False),
+    ]
+    assert probe.resolve_probe_model(free) == "ling-3.0-flash-free"
+
+
+def test_resolve_probe_model_uses_reasoning_when_no_non_reasoning(monkeypatch):
+    """OpenCode's free tier is currently all reasoning models. When every free
+    model is reasoning the resolver must NOT fall back to the hardcoded pin --
+    that pin may be gated, and using it makes every lane read probe_error (the
+    trap convergence exists to escape). It uses a reasoning catalog model (one
+    OpenCode is actually serving) instead, in catalog order, so convergence can
+    still advance across models."""
+    monkeypatch.setattr(probe.config, "PROBE_MODEL", "deepseek-v4-flash-free")
+    free = [
+        _FreeModel("big-pickle", reasoning=True),
+        _FreeModel("nemotron-3-ultra-free", reasoning=True),
+    ]
+    assert probe.resolve_probe_model(free) == "big-pickle"
+    assert probe.resolve_probe_model(
+        free, exclude=frozenset({"big-pickle"})
+    ) == "nemotron-3-ultra-free"
+
+
+def test_resolve_probe_model_falls_back_to_pin_only_when_no_free_models(monkeypatch):
+    """The configured pin is the last resort, used only when the catalog
+    advertises no free model to probe with -- and as the explicit escape hatch
+    when an operator wants a specific model probed."""
+    monkeypatch.setattr(probe.config, "PROBE_MODEL", "deepseek-v4-flash-free")
+    assert probe.resolve_probe_model(None) == "deepseek-v4-flash-free"
+    assert probe.resolve_probe_model([]) == "deepseek-v4-flash-free"
+
+
+def test_probe_timeout_extended_for_reasoning_probe_model(monkeypatch):
+    """A reasoning probe model (OpenCode's free tier is all-reasoning) thinks
+    before its first token; cutting it off at the tight PROBE_TIMEOUT reads as a
+    dead lane and churns the healers (regenerating identities) for lanes that
+    were merely thinking. _probe_timeout_for extends a reasoning model's per-lane
+    budget when the extended timeout is larger, while a non-reasoning model keeps
+    the tight base so a genuinely stuck lane is still caught fast."""
+    monkeypatch.setattr(probe.config, "PROBE_TIMEOUT", 15.0)
+    monkeypatch.setattr(probe.config, "PROBE_REASONING_TIMEOUT", 45.0)
+    monkeypatch.setattr(probe.config, "LONG_THINKING_MODELS", frozenset())
+
+    class _M:
+        def __init__(self, reasoning):
+            self.reasoning = reasoning
+
+    class _Cat:
+        def by_id(self, mid):
+            return _M(True) if mid == "nemotron-3-ultra-free" else _M(False)
+
+    cat = _Cat()
+    # Non-reasoning -> tight base.
+    assert probe._probe_timeout_for("x-free", cat, 15.0) == 15.0
+    # Reasoning via the live catalog -> extended.
+    assert probe._probe_timeout_for("nemotron-3-ultra-free", cat, 15.0) == 45.0
+    # Reasoning via the LONG_THINKING_MODELS override (catalog says otherwise).
+    monkeypatch.setattr(
+        probe.config, "LONG_THINKING_MODELS",
+        frozenset({"musespark-1.2-contributor-free"}),
+    )
+    assert probe._probe_timeout_for(
+        "musespark-1.2-contributor-free", cat, 15.0,
+    ) == 45.0
+    # Override honored even without a catalog.
+    assert probe._probe_timeout_for(
+        "musespark-1.2-contributor-free", None, 15.0,
+    ) == 45.0
+    assert probe._probe_timeout_for("unknown", None, 15.0) == 15.0
+    # Extension disabled (0, or <= base) -> base even for reasoning.
+    monkeypatch.setattr(probe.config, "LONG_THINKING_MODELS", frozenset())
+    monkeypatch.setattr(probe.config, "PROBE_REASONING_TIMEOUT", 0.0)
+    assert probe._probe_timeout_for("nemotron-3-ultra-free", cat, 15.0) == 15.0
+    monkeypatch.setattr(probe.config, "PROBE_REASONING_TIMEOUT", 10.0)  # <= base
+    assert probe._probe_timeout_for("nemotron-3-ultra-free", cat, 15.0) == 15.0
+
+
+def test_resolve_probe_model_excludes_ids(monkeypatch):
+    """Convergence borrows another free model for the pass without retiring the
+    rejected one, so resolve_probe_model must skip ids already tried. With a mix
+    of non-reasoning and reasoning free models, a non-reasoning one is preferred;
+    only when it (and the next non-reasoning one) are excluded does the resolver
+    fall to a reasoning catalog model -- not the pin. The pin is the last resort,
+    when every free model is excluded."""
+    monkeypatch.setattr(probe.config, "PROBE_MODEL", "deepseek-v4-flash-free")
+    free = [
+        _FreeModel("deepseek-v4-flash-free", reasoning=False),
+        _FreeModel("ling-3.0-flash-free", reasoning=False),
+        _FreeModel("mimo-v2.5-free", reasoning=True),
+    ]
+    # Non-reasoning is preferred.
+    assert probe.resolve_probe_model(free) == "deepseek-v4-flash-free"
+    # First non-reasoning excluded -> the next non-reasoning one.
+    assert probe.resolve_probe_model(
+        free, exclude=frozenset({"deepseek-v4-flash-free"})
+    ) == "ling-3.0-flash-free"
+    # Both non-reasoning excluded -> fall to the reasoning free model, not pin.
+    assert probe.resolve_probe_model(
+        free, exclude=frozenset({"deepseek-v4-flash-free", "ling-3.0-flash-free"})
+    ) == "mimo-v2.5-free"
+    # Everything excluded -> the configured pin.
+    assert probe.resolve_probe_model(
+        free, exclude=frozenset(
+            {"deepseek-v4-flash-free", "ling-3.0-flash-free", "mimo-v2.5-free"}
+        )
+    ) == "deepseek-v4-flash-free"
+    # A reasoning model is skipped when a non-reasoning (non-excluded) one exists.
+    assert probe.resolve_probe_model(
+        free, exclude=frozenset({"ling-3.0-flash-free"}),
+    ) == "deepseek-v4-flash-free"
+
+
+# ---------------------------------------------------------------------------
+# probe_all log line + total -- pins the log-vs-summary contradiction and the
+# snapshot-vs-live-pool contradiction the dashboard showed.
+# ---------------------------------------------------------------------------
+
+def test_probe_all_logs_probe_error_lane_as_probe_error_not_dead():
+    """The per-lane log line used to lump every non-ok/non-429 verdict into
+    "dead", so a probe model rejection (probe_error) logged as
+    ``probe: warp-2 -- dead (HTTP 400)`` while the summary line counted it as
+    ``1 probe-error`` -- a direct contradiction an operator sees in the logs.
+    The per-lane line now labels a probe_error as ``probe-error`` to match the
+    summary, instead of mislabelling it as a dead tunnel (which would also
+    trigger the wrong healer: a dead tunnel regenerates, a probe_error is left
+    alone)."""
+    pool = _make_pool(2)
+
+    def fake_probe(url, pid, model, base, timeout):
+        if "51001" in url:
+            return probe.ProbeResult(proxy_id=pid, status="ok", latency_ms=10,
+                                     probed_at=time.time())
+        return probe.ProbeResult(proxy_id=pid, status="probe_error",
+                                 error="HTTP 400", probed_at=time.time())
+
+    lines = []
+
+    def log(fmt, *args, **_kw):
+        lines.append(fmt % args if args else fmt)
+
+    with mock.patch("warp.probe._probe_single", side_effect=fake_probe), \
+         mock.patch("warp.probe.config.WARP_VERBOSE", True):
+        probe.probe_all(pool, log=log)
+
+    per_lane = [ln for ln in lines if ln.startswith("probe: warp-2")]
+    assert per_lane, lines
+    assert "-- probe-error (HTTP 400)" in per_lane[0], per_lane[0]
+    assert "-- dead" not in per_lane[0], per_lane[0]
+    # The summary still aggregates it under probe-error.
+    assert any("1 told-us-no" in ln for ln in lines), lines
+
+
+def test_probe_all_counts_non_warp_lanes_in_total():
+    """The startup probe ran in the WARP bootstrap thread while Tor lanes were
+    still joining in a concurrent thread, so the cached snapshot said
+    probe.total=10 while the live pool gauge showed 13/13 -- a dashboard
+    contradiction. probe_all must count every lane the pool holds, including
+    the non-warp Tor/SOCKS lanes, so a snapshot taken after they join reflects
+    the real pool size (the Tor-join refresh in _bootstrap_tor relies on this)."""
+    pool = _make_pool(2)                                  # warp-1, warp-2
+    pool.add("socks5://127.0.0.1:51010", proxy_id="tor-1")
+    pool.add("socks5://127.0.0.1:51011", proxy_id="tor-2")
+
+    def fake_probe(url, pid, model, base, timeout):
+        return probe.ProbeResult(proxy_id=pid, status="ok", latency_ms=5,
+                                 probed_at=time.time())
+
+    with mock.patch("warp.probe._probe_single", side_effect=fake_probe):
+        summary = probe.probe_all(pool, log=lambda *a, **k: None)
+    assert summary.total == 4, summary.total
+    assert summary.healthy == 4
+
+
+# ---------------------------------------------------------------------------
+# probe-model convergence -- OpenCode keeps advertising free models it is
+# temporarily not serving (under heavy load), so a probe pinned to one 400-s on
+# every lane and reports the whole pool as probe_error while the egress is
+# fine. probe_all now borrows another free model for the pass instead of
+# leaving every lane read "probe?" -- it does NOT retire the rejected model,
+# because a "-free" model that 400s while still listed is transient overload,
+# not removal (OpenCode pulls a genuinely-dropped model from the free section
+# outright; genuine removal is detected per-request by _flag_model_retired).
+# ---------------------------------------------------------------------------
+
+class _FakeCatalog:
+    """Minimal stand-in for UnifiedCatalog used by resolve_probe_model +
+    probe_all convergence. free() mirrors the real one's "exclude
+    unavailable" rule, so resolve_probe_model naturally skips retired ids."""
+    def __init__(self, models):
+        self._all = list(models)
+        self._unavail = set()
+        self.marked = []          # ids handed to mark_unavailable, in order
+
+    def free(self):
+        return [m for m in self._all if m.id not in self._unavail]
+
+    def by_id(self, model_id):
+        # _probe_timeout_for reads .reasoning off the returned model.
+        for m in self._all:
+            if m.id == model_id:
+                return m
+        return None
+
+    def mark_unavailable(self, model_id):
+        self.marked.append(model_id)
+        self._unavail.add(model_id)
+
+    def is_unavailable(self, model_id):
+        return model_id in self._unavail
+
+
+def _probe_url_warp_index(url):
+    """Pick the warp-N index out of a socks5://127.0.0.1:510NN url, so a fake
+    _probe_single can give different lanes different verdicts."""
+    return int(url.rsplit(":", 1)[-1]) - 51000
+
+
+def test_probe_single_4xx_captures_the_upstream_reason():
+    """A 400 used to be logged as a bare "HTTP 400", forcing a manual
+    reproduction to learn *why* OpenCode rejected the probe. The body is now
+    parsed so the per-lane log reads "probe-error (HTTP 400: This model is
+    unavailable for free)" -- which immediately says the egress is fine and the
+    model is the problem, not the tunnel."""
+    mock_resp = mock.MagicMock()
+    mock_resp.status_code = 400
+    mock_resp.json.return_value = {"error": {"message": "This model is unavailable for free"}}
+    with mock.patch("warp.probe.socks5_connect_check", return_value=""), \
+         mock.patch("warp.probe.httpx.Client") as MockClient:
+        ctx = mock.MagicMock()
+        ctx.__enter__ = mock.MagicMock(return_value=ctx)
+        ctx.__exit__ = mock.MagicMock(return_value=False)
+        ctx.post.return_value = mock_resp
+        MockClient.return_value = ctx
+        result = probe._probe_single(
+            "socks5://127.0.0.1:51001", "warp-1",
+            "deepseek-v4-flash-free", "https://opencode.ai/zen/v1", 15,
+        )
+    assert result.status == "probe_error"
+    assert "HTTP 400" in result.error
+    assert "This model is unavailable for free" in result.error
+
+
+def test_probe_all_borrows_another_model_when_every_lane_rejects_it():
+    """When the probe model is rejected on *every* lane (all probe_error,
+    nothing served/dead), the model -- not the pool -- is the problem:
+    probe_all borrows the next free non-reasoning model for this pass so lane
+    health is still reported. The rejected model is NOT retired -- a "-free"
+    model that 400s while still listed is transient overload, not removal
+    (OpenCode pulls a genuinely-dropped model from the free section outright),
+    so it must stay routable; retiring it would hide it from routing/dispatcher
+    for the full TTL just because the upstream was busy."""
+    pool = _make_pool(2)
+    cat = _FakeCatalog([
+        _FreeModel("deepseek-v4-flash-free", reasoning=False),
+        _FreeModel("ling-3.0-flash-free", reasoning=False),
+    ])
+
+    def fake_probe(url, pid, model, base, timeout):
+        if model == "deepseek-v4-flash-free":
+            return probe.ProbeResult(proxy_id=pid, status="probe_error",
+                                     error="HTTP 400: unavailable for free",
+                                     probed_at=time.time())
+        return probe.ProbeResult(proxy_id=pid, status="ok", latency_ms=5,
+                                 probed_at=time.time())
+
+    with mock.patch("warp.probe._probe_single", side_effect=fake_probe):
+        summary = probe.probe_all(pool, catalog=cat, log=lambda *a, **k: None)
+
+    # NOT retired -- still routable and still offered by the catalog.
+    assert cat.marked == []
+    assert not cat.is_unavailable("deepseek-v4-flash-free")
+    assert "deepseek-v4-flash-free" in [m.id for m in cat.free()]
+    # The borrowed model verified both lanes.
+    assert summary.healthy == 2
+    assert summary.probe_error == 0
+    assert summary.total == 2
+
+
+def test_probe_all_stops_when_no_other_model_is_available_to_borrow(monkeypatch):
+    """When the only free model is rejected on every lane there is nothing
+    left to borrow for the pass. probe_all must stop rather than looping on the
+    same rejected model -- max_model_attempts bounds it, but the tried-set exits
+    as soon as resolve falls back to a model already tried (here the pin is the
+    rejected model itself). The rejected model stays routable (not retired), and
+    the pass reports probe_error (the probe could not verify, not that egress
+    is down -- the lane is dead only if the tunnel is)."""
+    monkeypatch.setattr(probe.config, "PROBE_MODEL", "deepseek-v4-flash-free")
+    pool = _make_pool(2)
+    cat = _FakeCatalog([_FreeModel("deepseek-v4-flash-free", reasoning=False)])
+
+    def fake_probe(url, pid, model, base, timeout):
+        return probe.ProbeResult(proxy_id=pid, status="probe_error",
+                                 error="HTTP 400: unavailable for free",
+                                 probed_at=time.time())
+
+    sweeps = []
+    real = probe._sweep_pool
+
+    def counting_sweep(pool_, model, base, timeout_, log):
+        sweeps.append(model)
+        return real(pool_, model, base, timeout_, log)
+
+    with mock.patch("warp.probe._probe_single", side_effect=fake_probe), \
+         mock.patch("warp.probe._sweep_pool", side_effect=counting_sweep):
+        summary = probe.probe_all(pool, catalog=cat, log=lambda *a, **k: None)
+
+    assert cat.marked == []                       # not retired
+    assert len(sweeps) == 1                      # did not loop on the rejected model
+    assert summary.probe_error == 2
+    assert summary.healthy == 0
+
+
+def test_probe_all_borrows_a_reasoning_model_when_all_free_models_are_reasoning():
+    """OpenCode's free tier is currently entirely reasoning models, so the
+    first-resolve pass in resolve_probe_model finds nothing and it must use a
+    reasoning catalog model (not the gated pin) -- otherwise convergence could
+    never borrow a *different* model and every lane would read probe_error while
+    the egress is fine. Pinned with two reasoning models: the first is gated on
+    every lane, the second serves, so convergence borrows the second and the
+    lanes verify healthy."""
+    pool = _make_pool(2)
+    cat = _FakeCatalog([
+        _FreeModel("deepseek-v4-flash-free", reasoning=True),
+        _FreeModel("nemotron-3-ultra-free", reasoning=True),
+    ])
+
+    def fake_probe(url, pid, model, base, timeout):
+        if model == "deepseek-v4-flash-free":
+            return probe.ProbeResult(proxy_id=pid, status="probe_error",
+                                     error="HTTP 400: Model is unavailable",
+                                     probed_at=time.time())
+        return probe.ProbeResult(proxy_id=pid, status="ok", latency_ms=5,
+                                 probed_at=time.time())
+
+    swept = []
+    real = probe._sweep_pool
+
+    def counting_sweep(pool_, model, base, timeout_, log):
+        swept.append(model)
+        return real(pool_, model, base, timeout_, log)
+
+    with mock.patch("warp.probe._probe_single", side_effect=fake_probe), \
+         mock.patch("warp.probe._sweep_pool", side_effect=counting_sweep):
+        summary = probe.probe_all(pool, catalog=cat, log=lambda *a, **k: None)
+
+    assert swept == ["deepseek-v4-flash-free", "nemotron-3-ultra-free"]
+    assert cat.marked == []                       # not retired -- stays routable
+    assert summary.healthy == 2                    # the borrowed model verified lanes
+    assert summary.probe_error == 0
+    assert summary.total == 2
+
+
+def test_probe_all_does_not_retire_when_any_lane_is_served():
+    """A mixed pass (one healthy, one probe_error) is a genuinely mixed pool,
+    not a dead model: a model swap would only mask the real lane's health. The
+    model is NOT retired and there is no second sweep."""
+    pool = _make_pool(2)
+    cat = _FakeCatalog([_FreeModel("deepseek-v4-flash-free", reasoning=False)])
+
+    def fake_probe(url, pid, model, base, timeout):
+        idx = _probe_url_warp_index(url)
+        if idx == 1:                         # warp-1: served -> ok
+            return probe.ProbeResult(proxy_id=pid, status="ok", latency_ms=5,
+                                     probed_at=time.time())
+        return probe.ProbeResult(proxy_id=pid, status="probe_error",
+                                 error="HTTP 400: unavailable for free",
+                                 probed_at=time.time())
+
+    with mock.patch("warp.probe._probe_single", side_effect=fake_probe):
+        summary = probe.probe_all(pool, catalog=cat, log=lambda *a, **k: None)
+
+    assert cat.marked == []                  # not retired
+    assert summary.healthy == 1
+    assert summary.probe_error == 1
+
+
+def test_probe_all_without_catalog_sweeps_once_and_does_not_retry():
+    """No catalog => no convergence path (the legacy behaviour). An all-probe_error
+    pass is returned as-is rather than looping, since there is no other free
+    model to borrow and nothing to converge against."""
+    pool = _make_pool(2)
+
+    def fake_probe(url, pid, model, base, timeout):
+        return probe.ProbeResult(proxy_id=pid, status="probe_error",
+                                 error="HTTP 400", probed_at=time.time())
+
+    sweeps = []
+    real = probe._sweep_pool
+
+    def counting_sweep(pool_, model, base, timeout_, log):
+        sweeps.append(model)
+        return real(pool_, model, base, timeout_, log)
+
+    with mock.patch("warp.probe._probe_single", side_effect=fake_probe), \
+         mock.patch("warp.probe._sweep_pool", side_effect=counting_sweep):
+        summary = probe.probe_all(pool, log=lambda *a, **k: None)
+
+    assert len(sweeps) == 1                  # exactly one pass, no retry
+    assert summary.probe_error == 2
+    assert summary.healthy == 0
+
+
+def test_probe_all_skips_a_model_retired_after_resolve():
+    """A model may be unavailable at sweep time even though the caller resolved
+    it -- seeded by the operator, or genuinely removed by a concurrent request
+    (see _flag_model_retired). probe_all must re-resolve instead of sweeping a
+    known-unavailable model, which would 400 the whole pool a second time.
+    Pinned with an already-unavailable model so the guard fires on the very
+    first iteration."""
+    pool = _make_pool(2)
+    cat = _FakeCatalog([
+        _FreeModel("deepseek-v4-flash-free", reasoning=False),
+        _FreeModel("ling-3.0-flash-free", reasoning=False),
+    ])
+    cat.mark_unavailable("deepseek-v4-flash-free")   # unavailable: seeded / genuinely removed
+
+    swept = []
+    real = probe._sweep_pool
+
+    def counting_sweep(pool_, model, base, timeout_, log):
+        swept.append(model)
+        return real(pool_, model, base, timeout_, log)
+
+    def fake_probe(url, pid, model, base, timeout):
+        # ling is served; deepseek would 400 but must never reach the sweep.
+        assert model == "ling-3.0-flash-free", model
+        return probe.ProbeResult(proxy_id=pid, status="ok", latency_ms=5,
+                                 probed_at=time.time())
+
+    with mock.patch("warp.probe._probe_single", side_effect=fake_probe), \
+         mock.patch("warp.probe._sweep_pool", side_effect=counting_sweep):
+        summary = probe.probe_all(
+            pool, model="deepseek-v4-flash-free", catalog=cat,
+            log=lambda *a, **k: None,
+        )
+
+    assert swept == ["ling-3.0-flash-free"]          # deepseek never swept
+    assert summary.healthy == 2
+    assert summary.probe_error == 0
+
+
+# ---------------------------------------------------------------------------
+# Active-in-flight-stream guard: healers defer a busy egress
+# ---------------------------------------------------------------------------
+
+
+def _active_busy_for(*targets):
+    """Patch the healers' view of the in-flight registry: report 1 (busy) for
+    the named proxy ids and 0 (idle) for everything else. With no args every
+    egress reads idle, exercising the control path."""
+    busy = set(targets)
+    return mock.patch(
+        "warp.probe.active_streams.active",
+        side_effect=lambda pid: 1 if pid in busy else 0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# heal_rate_limited: never re-roll a streaming (busy) burned exit
+# ---------------------------------------------------------------------------
+
+def test_heal_rate_limited_defers_busy_egress():
+    """A burned exit with an open stream is left for the next pass. The tight
+    re-roll loop never starts, so no wireproxy is torn down under the request."""
+    pool = _make_pool(1)
+    wm = FakeWarpManager(count=1)
+    summary = probe.ProbeSummary(total=1, rate_limited=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="rate_limited",
+                          exit_ip="104.28.231.142"),
+    ])
+    with _active_busy_for("warp-1"):
+        healed = probe.heal_rate_limited(pool, summary, wm,
+                                         log=lambda *a, **k: None)
+    assert healed == 0
+    assert wm.rerolls == []                      # the re-roll loop never entered
+    assert wm.regenerated_indices == []
+    assert pool.get_by_id("warp-1") is not None  # not removed
+    r = summary.results[0]
+    assert r.status == "rate_limited" and r.exit_ip == "104.28.231.142"
+    assert summary.rate_limited == 1 and summary.healthy == 0
+
+
+def test_heal_rate_limited_still_heals_when_idle():
+    """Control: an idle burned exit escapes. The guard only blocks a streaming
+    egress; a quiet one must still re-roll off its burned IP."""
+    pool = _make_pool(1)
+    wm = FakeWarpManager(count=1)
+    summary = probe.ProbeSummary(total=1, rate_limited=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="rate_limited",
+                          exit_ip="104.28.231.142"),
+    ])
+    exits = iter(["104.28.231.145"])
+    checks = iter([probe.ProbeResult(proxy_id="warp-1", status="ok", latency_ms=10)])
+    with _active_busy_for(), \
+         mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
+         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid: next(checks)), \
+         mock.patch("warp.probe.time.sleep"):
+        healed = probe.heal_rate_limited(pool, summary, wm,
+                                         log=lambda *a, **k: None)
+    assert healed == 1
+    assert wm.rerolls and (1, 0) in wm.rerolls
+    assert summary.results[0].status == "ok"
+
+
+# ---------------------------------------------------------------------------
+# heal_expired: never remove/regenerate a lane a stream is riding
+# ---------------------------------------------------------------------------
+
+def test_heal_expired_defers_busy_dead_slot():
+    """The guard runs before remove+regenerate. A busy lane is left in the pool
+    and keeps its verdict until the stream drains -- it is never killed under a
+    request."""
+    pool = _make_pool(2)
+    wm = FakeWarpManager(count=2)
+    summary = probe.ProbeSummary(total=2, healthy=1, dead=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="ok"),
+        probe.ProbeResult(proxy_id="warp-2", status="dead", error="timeout"),
+    ])
+    with _active_busy_for("warp-2"):
+        healed = probe.heal_expired(pool, summary, wm, log=lambda *a, **k: None)
+    assert healed == 0
+    assert wm.regenerated_indices == []
+    assert pool.get_by_id("warp-2") is not None   # not removed under the stream
+    assert summary.dead == 1 and summary.healthy == 1
+
+
+def test_heal_expired_still_regenerates_when_idle():
+    """Control: an idle dead tunnel is removed and regenerated."""
+    pool = _make_pool(2)
+    wm = FakeWarpManager(count=2)
+    summary = probe.ProbeSummary(total=2, healthy=1, dead=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="ok"),
+        probe.ProbeResult(proxy_id="warp-2", status="dead", error="timeout"),
+    ])
+    with _active_busy_for():                       # all idle
+        healed = probe.heal_expired(pool, summary, wm, log=lambda *a, **k: None)
+    assert healed == 1
+    assert 2 in wm.regenerated_indices
+    assert pool.get_by_id("warp-2") is None
+
+
+# ---------------------------------------------------------------------------
+# spread_distinct_exits: leave a busy duplicate on its current exit
+# ---------------------------------------------------------------------------
+
+def test_spread_defers_busy_duplicate():
+    """The duplicate spread would move is streaming -- it stays put, no roll is
+    attempted, and the summary keeps its healthy count (no spurious churn)."""
+    from warp import egress_map
+
+    egress_map.observe("9.9.9.9", "edge-free")
+    pool = _make_pool(3)
+    wm = FakeWarpManager(count=3)
+    summary = probe.ProbeSummary(total=3, healthy=3, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="ok", exit_ip="3.3.3.3"),
+        probe.ProbeResult(proxy_id="warp-2", status="ok", exit_ip="3.3.3.3"),
+        probe.ProbeResult(proxy_id="warp-3", status="ok", exit_ip="4.4.4.4"),
+    ])
+    with _active_busy_for("warp-2"), \
+         mock.patch("warp.probe.time.sleep"):
+        moved = probe.spread_distinct_exits(pool, summary, wm,
+                                            log=lambda *a, **k: None)
+    assert moved == 0
+    assert wm.rerolls == []                        # the busy duplicate was not rolled
+    assert summary.healthy == 3
+
+
+# ---------------------------------------------------------------------------
+# rotate_burned_tor_lanes: never restart a Tor lane a stream is riding
+# ---------------------------------------------------------------------------
+
+class _FakeTorInstance:
+    def __init__(self, index):
+        self.index = index
+
+
+class _FakeTorManager:
+    def __init__(self, count=1):
+        self.instances = [_FakeTorInstance(i + 1) for i in range(count)]
+        self.restarts = []
+
+    def restart_instance(self, inst, log=None):
+        self.restarts.append(inst.index)
+        return True
+
+
+def _tor_pool(count=1):
+    pool = ProxyPool()
+    for i in range(count):
+        pool.add(f"socks5://127.0.0.1:{9050 + i}", proxy_id=f"tor-{i + 1}")
+    return pool
+
+
+def test_rotate_burned_tor_lanes_defers_busy():
+    """A Tor lane with an open stream is not restarted -- its route (and the
+    live request) is preserved. The verdict stays until it can rotate."""
+    pool = _tor_pool(1)
+    tm = _FakeTorManager(1)
+    summary = probe.ProbeSummary(total=1, rate_limited=1, results=[
+        probe.ProbeResult(proxy_id="tor-1", status="rate_limited",
+                          exit_ip="185.220.101.1"),
+    ])
+    with _active_busy_for("tor-1"):
+        rotated = probe.rotate_burned_tor_lanes(pool, tm, summary,
+                                                 log=lambda *a, **k: None)
+    assert rotated == 0
+    assert tm.restarts == []
+    assert summary.results[0].status == "rate_limited"  # not healed under stream
+    assert summary.rate_limited == 1
+
+
+def test_rotate_burned_tor_lanes_heals_when_idle():
+    """Control: an idle burned Tor lane rotates to a fresh exit."""
+    pool = _tor_pool(1)
+    tm = _FakeTorManager(1)
+    summary = probe.ProbeSummary(total=1, rate_limited=1, results=[
+        probe.ProbeResult(proxy_id="tor-1", status="rate_limited",
+                          exit_ip="185.220.101.1"),
+    ])
+    with _active_busy_for():                        # all idle
+        rotated = probe.rotate_burned_tor_lanes(pool, tm, summary,
+                                                log=lambda *a, **k: None)
+    assert rotated == 1
+    assert tm.restarts == [1]
+    assert summary.results[0].status == "healed"

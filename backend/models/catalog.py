@@ -125,6 +125,11 @@ class UnifiedCatalog:
         # request hits that 400, so the catalog stops offering models the
         # upstream has retired even though it still advertises them.
         self._unavailable: Dict[str, float] = {}
+        # Operator-curated dead ids (config.retired_seed_ids). Honored verbatim
+        # and excluded from the runtime self-heal in refresh(): the seed exists
+        # precisely because /models keeps advertising a model the operator knows
+        # is dead, so a live re-appearance is NOT authoritative for a seeded id.
+        self._seed_ids: set = set(config.retired_seed_ids())
         self._load_unavailable()
 
     # -- retired models ----------------------------------------------------
@@ -238,6 +243,31 @@ class UnifiedCatalog:
             self._all_models = all_models
             self._per_provider = per_provider
             self._generated_at = time.time()
+
+            # Self-heal runtime retirements against the live free section. A
+            # -free model retired at runtime was absent from /models at retirement
+            # time; if a later refresh sees it back in the free section, OpenCode
+            # has not actually removed it -- the outage was transient upstream
+            # overload, exactly the case the auto-recycle must NOT lock out for
+            # the full TTL (7 days) just because it 400'd once. Reconcile only
+            # against authoritative (non-stale) provider fetches, so a fallback
+            # to the cached last-good list cannot resurrect an id the upstream
+            # genuinely stopped offering. Operator-seeded ids are left alone: the
+            # seed exists precisely because /models keeps advertising a model the
+            # operator knows is dead, so the live list is not authoritative for
+            # it.
+            reconciled = False
+            for mid in list(self._unavailable):
+                if mid in self._seed_ids:
+                    continue
+                lm = logical.get(mid)
+                if lm is None:
+                    continue
+                if any(not self._stale.get(pid, False) for pid in lm.provider_ids):
+                    self._unavailable.pop(mid, None)
+                    reconciled = True
+            if reconciled:
+                self._save_unavailable()
             return self
 
     # -- queries -----------------------------------------------------------

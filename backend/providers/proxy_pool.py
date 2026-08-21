@@ -287,6 +287,82 @@ class ProxyPool:
                 self._remember(session_id, chosen.id)
             return chosen
 
+    def pick_from(
+        self, candidate_ids: Any, session_id: str = "",
+    ) -> Optional[Proxy]:
+        """Least-loaded available proxy restricted to ``candidate_ids``.
+
+        Used by the request path (via the executor) to route a model onto the
+        exits the post-heal sampler proved serve it. Mirrors :meth:`pick`
+        (least-decayed-load among the non-cooling candidates, round-robin
+        tie-break) and :meth:`pick_sticky` (a sticky session whose remembered
+        proxy is still a candidate and not cooling stays pinned).
+
+        If every candidate is cooling, the soonest-to-recover is returned (same
+        "wait or fail fast" contract as :meth:`pick`); if no candidate is in the
+        pool at all, it falls back to a normal :meth:`pick` so the request still
+        gets *an* exit rather than going direct -- a possibly-cooling exit is
+        better than no egress, which for OpenCode would simply 429 the home IP.
+        """
+        cand = {pid for pid in (candidate_ids or ()) if isinstance(pid, str)}
+        with self._lock:
+            if not self.proxies:
+                return None
+            now = time.time()
+            chosen: Optional[Proxy] = None
+            if cand and config.PROXY_STICKY_SESSIONS and session_id:
+                known = self._sessions.get(session_id)
+                if known in cand:
+                    for px in self.proxies:
+                        if px.id == known and not px.in_cooldown(now):
+                            chosen = px
+                            break
+            if chosen is None:
+                if not cand:
+                    chosen = self._pick_locked(now)
+                else:
+                    best: List[Proxy] = []
+                    best_load = float('inf')
+                    soonest_cooling: Optional[Proxy] = None
+                    min_cooldown = float('inf')
+                    for px in self.proxies:
+                        if px.id not in cand:
+                            continue
+                        if not px.in_cooldown(now):
+                            load = px.decayed_load(now)
+                            if load < best_load:
+                                best_load = load
+                                best = [px]
+                            elif load == best_load:
+                                best.append(px)
+                        else:
+                            remaining = px.cooldown_remaining(now)
+                            if remaining < min_cooldown:
+                                min_cooldown = remaining
+                                soonest_cooling = px
+                    if best:
+                        if len(best) > 1:
+                            self._cursor = (self._cursor + 1) % len(best)
+                            chosen = best[self._cursor % len(best)]
+                        else:
+                            chosen = best[0]
+                    elif soonest_cooling is not None:
+                        chosen = soonest_cooling
+                    else:
+                        # Candidates gone from the pool entirely.
+                        chosen = self._pick_locked(now)
+            # Mirror pick_sticky: remember the session's proxy so the next call
+            # reuses it. A stale pin (a fallback pick, or a candidate that has
+            # since left the set) self-corrects on the next call, when ``known in
+            # cand`` is False and a fresh candidate is selected.
+            if (
+                chosen is not None
+                and config.PROXY_STICKY_SESSIONS
+                and session_id
+            ):
+                self._remember(session_id, chosen.id)
+            return chosen
+
     def _remember(self, session_id: str, proxy_id: str) -> None:
         """Record a session's proxy, bounding the map so it cannot grow forever.
 
