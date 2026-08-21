@@ -627,7 +627,23 @@ def health(request: Request) -> Dict[str, Any]:
 
 
 def _multimodel_entry() -> Dict[str, Any]:
-    """The single hard-coded model: the multi-model router itself."""
+    """The hard-coded ``lingling-auto`` entry: the multi-model router itself.
+
+    Not a model the gateway forwards -- the alias a client picks to ask Lingling
+    to *choose*. The dispatcher reads the turn and routes onto a real free model,
+    so ``lingling-auto`` has no upstream of its own: ``context_length`` and
+    ``max_output`` are ``None`` (no ceiling to advertise, not "unbounded
+    upstream"). It is baked into the catalog responses -- ``/v1/models`` lists it
+    first, making it the default pick in OpenAI/Codex model pickers -- rather than
+    fetched from OpenCode, which is exactly why the recycler can never touch it:
+    ``catalog.mark_unavailable`` retires ids the upstream once listed, and the
+    router never was one. Vision and reasoning are claimed True so a capability
+    probe ("is there a model here that can see this image?") does not filter the
+    catch-all out before the dispatcher picks a real vision/reasoning model; the
+    providers list names every upstream so the dashboard's "served by" reads
+    sensibly, while failover runs over the chosen model's *real* providers, not
+    this alias.
+    """
     return {
         "id": config.MULTIMODEL_ID,
         "name": config.MULTIMODEL_NAME,
@@ -713,6 +729,9 @@ def v1_models(refresh: int = 0) -> Dict[str, Any]:
     remains key-gated when LINGLING_REQUIRE_KEY=1.
     """
     catalog.refresh(force=bool(refresh))
+    # lingling-auto goes first so it is the default model an OpenAI/Codex picker
+    # lands on; everything after is the live free list (retired-by-recycler ids
+    # are already excluded by catalog.free()).
     models = [_openai_model_entry(_multimodel_entry())]
     models.extend(_openai_model_entry(m.to_dict()) for m in catalog.free())
     return {"object": "list", "data": models}
@@ -1150,6 +1169,19 @@ def _call_dispatcher_model(messages: List[Dict[str, Any]], model: str, session_i
 
 
 def _run_dispatcher(messages: List[Dict[str, Any]], had_images: bool, session_id: str = ""):
+    """Run the routing brain over the turn; return ``(target, reason, routed_by)``.
+
+    Thin wrapper over :func:`dispatcher.decide` that closes over the session id,
+    so the ``/v1/chat/completions``, ``/v1/responses`` and ``/v1/messages``
+    handlers all route through one call site. ``routed_by`` is ``"dispatcher"`` on
+    a clean decision and ``"fallback"`` when the router itself broke, so the
+    ledger can tell "the dispatcher picked this" from "the dispatcher fell over
+    and we picked for it". Any failure of the router model -- a 429, malformed
+    JSON, an id nobody serves -- is caught here: a routing outage must never drop
+    a request, so the deterministic, request-aware
+    :func:`dispatcher.fallback_model` answers instead (see the inline note on why
+    ``messages`` is passed).
+    """
     def call_model(msgs, mdl):
         return _call_dispatcher_model(msgs, mdl, session_id=session_id)
     try:
@@ -1449,6 +1481,14 @@ async def chat_completions(request: Request):
             if bare != target and catalog.providers_for(bare):
                 target = bare
             else:
+                # Two distinct "no" cases, deliberately separated.
+                # is_unavailable means the recycler retired it -- the model WAS
+                # listed free and OpenCode dropped it (or the operator seeded it
+                # in LINGLING_RETIRED_MODELS), so the message points the client
+                # at /v1/models, which won't list it. The else is a genuinely
+                # unknown id -- a typo, an unrecognised provider-prefixed name, a
+                # premium id -- that was never free here, so "unknown" rather
+                # than the misleading "no longer served".
                 if catalog.is_unavailable(target):
                     raise HTTPException(400, f"Model {requested!r} is no longer served for free by OpenCode; pick from /v1/models.")
                 raise HTTPException(400, f"Unknown or unsupported model: {requested!r}")
@@ -1722,6 +1762,14 @@ async def chat_completions(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            # X-Lingling-* mirror the routing decision onto the response headers
+            # so a client or operator tool can see where a turn actually went
+            # without parsing the body's ``lingling`` key (the /v1/responses and
+            # /v1/messages entrypoints carry the same set). `_header_safe`
+            # latin-1-safe sanitises the model-generated `reason` -- its em-dashes
+            # and smart quotes would otherwise abort the whole response. Stream-Mode
+            # tells the client whether a mid-flight retry ("guarded") is opt-out
+            # for this turn (see ``lingling_recover`` / STREAM_RECOVERY).
             "X-Lingling-Routed-Model": _header_safe(target),
             "X-Lingling-Routed-By": _header_safe(routed_by),
             "X-Lingling-Reason": _header_safe(reason),
