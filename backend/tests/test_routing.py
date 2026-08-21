@@ -1902,7 +1902,7 @@ def test_unit_one_session_still_spreads_across_every_exit():
         for i in range(10)
     ])
     session = "01999b4c-8f4a-7b31-9c2e-4d5a6b7c8d9e"   # one Codex session, 40 turns
-    used: Dict[str, int] = {}
+    used = {}                                            # proxy.id -> hit count
     for _ in range(40):
         proxy = _pick_proxy(Prov(), pool, session, "deepseek-v4-flash-free")
         used[proxy.id] = used.get(proxy.id, 0) + 1

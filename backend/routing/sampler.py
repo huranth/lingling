@@ -37,7 +37,7 @@ import threading
 import time
 from concurrent import futures
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, List, Optional, Set
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from core import config
 
@@ -208,7 +208,7 @@ def _sweep_model(
     SOCKS5 liveness pre-check that bounds httpx's un-timed handshake), so a
     verdict here is directly comparable to the canary's verdict per exit.
     """
-    wprobe = _warp_probe()
+    _warp_probe()
     probe_single = _probe_single  # memoized by _warp_probe
     workers = max(1, min(len(green), max(1, config.PROBE_CONCURRENCY)))
     cap = (

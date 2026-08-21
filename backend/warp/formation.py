@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List
 from core import config
 from providers import active_streams
 from warp import egress_map
-from warp.probe import _fetch_exit_ip, _find_instance, _instance_index, latest_summary
+from warp.probe import _fetch_exit_ip, _instance_index, latest_summary
 
 
 def _burned_exits() -> set:

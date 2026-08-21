@@ -170,15 +170,15 @@ class UnifiedCatalog:
         """Hide a model from the catalog because the upstream retired its free tier.
 
         Called when a request to an advertised-`-free` model comes back with the
-        "unavailable for free" 400. The model is dropped from every query and
-        the fact is persisted so the Codex catalog generator (a separate
-        process) agrees. The entry expires after ``RETIRED_MODEL_TTL_DAYS``, so
-        a restored free tier reappears without a manual step.
+        "unavailable for free" 400. The model is dropped from every query (the
+        ``_unavailable`` membership is what ``by_id`` / ``_active`` / ``is_free``
+        consult, not the ``_logical`` cache) and the fact is persisted so the
+        Codex catalog generator (a separate process) agrees. The entry expires
+        after ``RETIRED_MODEL_TTL_DAYS``, so a restored free tier reappears
+        without a manual step.
         """
         with self._lock:
             self._unavailable[model_id] = time.time()
-            self._logical.pop(model_id, None)
-            self._all_models = [m for m in self._all_models if m.id != model_id]
             self._save_unavailable()
 
     def is_unavailable(self, model_id: str) -> bool:

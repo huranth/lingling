@@ -400,7 +400,18 @@ class ProxyPool:
             proxy.last_used_ts = now
 
     def mark_failure(self, proxy: Proxy, status_code: int) -> float:
-        """Apply cooldown backoff for rate-limit / auth / server failures."""
+        """Apply cooldown backoff for rate-limit / auth / server failures.
+
+        The body is the request-side partner of :meth:`extend_cooldown`: a real
+        request failed through this proxy (a 429 here, not a probe verdict), so
+        the cooldown bumps the burn tally *and* pushes the cooldown out. The
+        push only ever *extends* -- ``max(remaining, now + delay)`` -- so a
+        parked lane (a probe-time verdict the heal left for next pass) is not
+        pulled back into selection by a single request-time 429 only to
+        re-shorten its park. The exponential backoff stays meaningful: the
+        streak grows on every request, the cooldown just never shrinks back
+        to a value the operator already benched the lane for.
+        """
         with self._lock:
             proxy.total_requests += 1
             now = time.time()
@@ -410,14 +421,20 @@ class ProxyPool:
                 proxy.total_429 += 1
             # 404 is deliberately excluded: the executor treats it as a hard,
             # non-retryable failure, so cooling this exit would bench a healthy IP
-            # for a problem no other IP would fix.
-            if status_code not in (401, 403, 429, 500, 502, 503, 504):
+            # for a problem no other IP would fix. The set here is kept in lock-step
+            # with executor._RETRYABLE: any status that the executor fails over on
+            # (a different proxy / key) should also cool the originating proxy, so
+            # pick() does not re-select the same bad IP next turn and force another
+            # failover. Drifting the two leaves 410/426/etc. retrying forever
+            # without ever cooling their responsible interface.
+            if status_code not in (401, 403, 426, 409, 410, 428, 429,
+                                   500, 502, 503, 504):
                 return 0.0
             proxy.consecutive_failures += 1
             base_s = config.PROXY_COOLDOWN_BASE_MS / 1000.0
             max_s = config.PROXY_COOLDOWN_MAX_MS / 1000.0
             delay = min(max_s, base_s * (2 ** (proxy.consecutive_failures - 1)))
-            proxy.cooldown_until = now + delay
+            proxy.cooldown_until = max(proxy.cooldown_until, now + delay)
             return delay
 
     # -- lookup ------------------------------------------------------------
@@ -444,6 +461,26 @@ class ProxyPool:
                     px.total_429 = 0
                     px.cooldown_until = 0.0
                     break
+
+    def extend_cooldown(self, proxy: "Proxy", seconds: float) -> None:
+        """Push this proxy's cooldown out to at least ``now + seconds`` (no failure bump).
+
+        The probe verdicts -- a rate-limited exit the heal could not re-roll
+        onto a serving IP, or a re-roll deferred because a stream is in flight
+        -- are *known* rate-limits rather than a request that just 429'd. They
+        want the exit gated out of :meth:`pick` until the next probe pass
+        re-evaluates it, so a live request is never routed through a known-burned
+        address only to rediscover its 429 at request time. But they must not
+        inflate ``consecutive_failures`` / ``total_429``: those are real-request
+        burn counters and feed ``_dump_burned_identities``, so a probe signal
+        would otherwise drive the dump threshold -- and a probe-time 429 is the
+        *old* observation, not a fresh request failure. So this is the
+        probe-side mirror of :meth:`mark_failure`: it raises ``cooldown_until``
+        to ``max(remaining, now + seconds)`` and leaves the failure tally alone.
+        """
+        with self._lock:
+            target = time.time() + max(0.0, float(seconds))
+            proxy.cooldown_until = max(proxy.cooldown_until, target)
 
     def get_all_proxies(self) -> List[Proxy]:
         """Thread-safe snapshot of all proxies (returns a copy)."""

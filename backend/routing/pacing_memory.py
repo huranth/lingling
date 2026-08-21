@@ -77,7 +77,6 @@ def _load_locked() -> None:
 
 
 def _ensure_loaded() -> None:
-    global _loaded
     if _loaded:
         return
     with _lock:

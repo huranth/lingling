@@ -145,17 +145,24 @@ class ConnectionPool:
             pooled.touch()
             yield client
         finally:
-            # Return client to pool
-            try:
+            # Return client to pool. The capacity check and the append (or, on
+            # overflow, the deliberate close) must run under the same lock the
+            # grab path already takes; without it two threads releasing against
+            # the same proxy can both pass ``len(pool) < self._max_per_proxy`` and
+            # both append, and deque(maxlen=N) would then silently drop the
+            # oldest PooledClient -- without calling ``.close()`` -- leaking its
+            # httpx client (with held-socket fds). Holding the lock also repairs
+            # the previously-incomplete branch where ``is_healthy() == False``
+            # with capacity left in the pool did nothing at all: the un-healthy
+            # client was abandoned and never closed.
+            with self._lock:
                 if pooled.is_healthy() and len(pool) < self._max_per_proxy:
                     pool.append(pooled)
-                elif len(pool) >= self._max_per_proxy:
+                else:
                     try:
-                        client.close()
+                        pooled.client.close()
                     except Exception:
                         pass
-            except Exception:
-                pass
     
     def invalidate(self, proxy_id: str) -> None:
         """Close all clients for a proxy."""

@@ -38,6 +38,7 @@ import socket
 import struct
 import threading
 import time
+import copy
 from concurrent import futures
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Dict, List, Optional
@@ -86,7 +87,27 @@ class ProbeSummary:
     # this is neither healthy nor dead -- it is unverified by the probe. Kept
     # separate so the healers leave it alone (see the module docstring).
     probe_error: int = 0
+    # Lanes a healer just acted on -- a rate-limited exit re-rolled onto a
+    # canary-verified fresh IP, a dead identity regenerated, a Tor lane
+    # restarted -- whose verdict the next periodic probe has not re-confirmed
+    # yet. Each carries the transient ``healed`` per-result status, which the
+    # dashboard paints as a warn-orange "healed" chip (tooltip "exit refreshed
+    # — next probe verifies it"), distinguishing a freshly-rolled lane from one
+    # that was always healthy. In its own counter (NOT ``healthy``) so the
+    # freshly-healed lane is not silently re-counted as probe-confirmed: the
+    # exit-probe panel totals ``healthy + rate_limited + dead + healed ==
+    # total``, and the next periodic probe rewrites the whole summary so the
+    # lane graduates to ``ok`` (alive) or back to ``rate_limited``/``dead`` on
+    # its own. See :func:`_recount` for the counter moves.
+    healed: int = 0
     duration_ms: float = 0.0
+    # The model id this sweep actually probed with -- ``probe_all`` records the
+    # converged canary here so a downstream healer can verify its re-rolled exits
+    # through a model OpenCode is *serving right now*, not the stale
+    # ``config.PROBE_MODEL`` pin (which the convergence step exists precisely
+    # because OpenCode pulls pins behind a gate). Empty for summaries built by
+    # hand; the healers fall back to the pin then.
+    model: str = ""
     results: List[ProbeResult] = field(default_factory=list)
     completed_at: float = 0.0
 
@@ -97,7 +118,9 @@ class ProbeSummary:
             "rate_limited": self.rate_limited,
             "dead": self.dead,
             "probe_error": self.probe_error,
+            "healed": self.healed,
             "duration_ms": round(self.duration_ms, 1),
+            "model": self.model,
             "completed_at": self.completed_at,
             "results": [r.to_dict() for r in self.results],
         }
@@ -116,9 +139,25 @@ _probe_lock = threading.Lock()
 
 
 def latest_summary() -> Optional[Dict[str, Any]]:
-    """Return the most recent probe summary, or None."""
+    """Return the most recent probe summary, or None.
+
+    The healers (heal_expired's ``_mark_healed``, _reroll_until_clean's
+    verified re-roll, spread_distinct_exits' verify-fail, the Tor rotator)
+    rewrite ``summary.results`` entries' fields in place -- ``status``,
+    ``exit_ip``, ``latency_ms``, ``error``, ``probed_at`` -- one at a time and
+    not under any lock. A reader iterating into ``to_dict()`` could observe a
+    slot mid-mutation, e.g. the half-written ``status='healed'`` still
+    carrying the pre-heal ``exit_ip``. Deep-copy the summary under ``_lock``
+    so a consistent-as-of-now snapshot is serialised; further healer writes
+    land on the live summary and never bleed into a part-way-assembled dict.
+    ``_lock`` continues to guard the ``_latest`` reference itself so the
+    snapshot is consistent before and after the ``_store`` assignment.
+    """
     with _lock:
-        return _latest.to_dict() if _latest else None
+        if _latest is None:
+            return None
+        snap = copy.deepcopy(_latest)
+    return snap.to_dict()
 
 
 def _store(summary: ProbeSummary) -> None:
@@ -470,7 +509,7 @@ def _sweep_pool(
     different free model rather than 400-ing every lane."""
     proxies = proxy_pool.get_all_proxies()
     if not proxies:
-        summary = ProbeSummary(total=0, completed_at=time.time())
+        summary = ProbeSummary(total=0, model=model, completed_at=time.time())
         _store(summary)
         return summary
 
@@ -542,6 +581,7 @@ def _sweep_pool(
         dead=sum(1 for r in results if r.status == "dead"),
         probe_error=sum(1 for r in results if r.status == "probe_error"),
         duration_ms=round(elapsed, 1),
+        model=model,
         results=results,
         completed_at=time.time(),
     )
@@ -716,8 +756,17 @@ def _recount(summary: ProbeSummary, old_status: str, new_status: str) -> None:
     The counters are computed once at probe time; a heal flips a result's
     status in place, so the matching counter must move too or the aggregate
     panel (driven by the counters) would keep reporting pre-heal verdicts
-    while the per-slot chips already show the healed state. ``healed`` is
-    transient and unverified, so it is deliberately counted nowhere.
+    while the per-slot chips already show the healed state. Every verdict
+    the per-result status can hold must move in both directions so the totals
+    reconcile after any transition -- including a ``probe_error`` slot that a
+    spread re-rolls onto a fresh exit, where the slot's status flips to
+    ``ok`` but ``probe_error`` would otherwise stay wrongly counted.
+    ``healed`` is the transient "rolled or regenerated but not yet
+    re-confirmed" verdict; it lands in its own :attr:`ProbeSummary.healed`
+    counter (NOT ``healthy``) so the panel totals
+    ``healthy + rate_limited + dead + probe_error + healed == total`` even
+    during the heal → next-probe window when the lane is not yet
+    probe-confirmed.
     """
     if old_status == "ok":
         summary.healthy = max(0, summary.healthy - 1)
@@ -725,12 +774,20 @@ def _recount(summary: ProbeSummary, old_status: str, new_status: str) -> None:
         summary.rate_limited = max(0, summary.rate_limited - 1)
     elif old_status == "dead":
         summary.dead = max(0, summary.dead - 1)
+    elif old_status == "probe_error":
+        summary.probe_error = max(0, summary.probe_error - 1)
+    elif old_status == "healed":
+        summary.healed = max(0, summary.healed - 1)
     if new_status == "ok":
         summary.healthy += 1
     elif new_status == "rate_limited":
         summary.rate_limited += 1
     elif new_status == "dead":
         summary.dead += 1
+    elif new_status == "probe_error":
+        summary.probe_error += 1
+    elif new_status == "healed":
+        summary.healed += 1
 
 
 def _mark_healed(summary: ProbeSummary, r: ProbeResult) -> None:
@@ -784,13 +841,20 @@ def heal_expired(
         proxy_pool.remove(r.proxy_id)
         try:
             idx = _instance_index(r.proxy_id)
-            if idx is not None:
-                inst = _find_instance(warp_manager, idx)
-                if inst is not None:
-                    warp_manager.regenerate_instance(inst)
-                    healed += 1
-                    _mark_healed(summary, r)
-                    log("heal-expired: regenerated identity #%d", idx)
+            inst = _find_instance(warp_manager, idx) if idx is not None else None
+            if inst is not None and warp_manager.regenerate_instance(inst):
+                healed += 1
+                _mark_healed(summary, r)
+                log("heal-expired: regenerated identity #%d", idx)
+            elif inst is not None:
+                # ``regenerate_instance`` returns False on a port-find /
+                # registration / restart-after-regen failure (manager.py). The
+                # identity never came back, so do NOT chip ``healed``: an
+                # optimistic pill would hide a still-down lane from the operator
+                # until a real request rediscovered the dead state at request
+                # time. Leave the verdict ``dead`` so the next probe pass sees
+                # the lane still needs work -- the pool already dropped it.
+                log("heal-expired: regeneration failed for #%d -- lane stays dead", idx)
         except Exception as exc:
             log("heal-expired: regeneration failed for %s: %s", r.proxy_id, exc)
     return healed
@@ -814,8 +878,25 @@ def heal_rate_limited(
     tunnel (rotating the WARP endpoint for entropy) until its exit IP leaves
     the burned set, then confirms with a real model request.
 
-    Slots that cannot escape the burned IPs stay in the pool for the next
-    periodic pass; their existing cooldown keeps live traffic off them.
+    Slots that cannot escape the burned IPs (or whose polite canary probe
+    still comes back ``probe_error`` because OpenCode refused even the
+    converged model on the new exit) are parked out of :meth:`pick` until the
+    next periodic probe re-evaluates them, via ``proxy_pool.extend_cooldown``
+    rather than ``mark_failure``. ``mark_failure`` would inflate the
+    real-request burn counters that feed ``_dump_burned_identities`` -- a
+    probe signal is the old observation, not a fresh request failure -- so the
+    healer uses the no-attribution gate. Without it, ``pick`` returned the
+    known-burned exit to a live request and the request rediscovered its 429
+    at request time (the symptom of a request through a rate-limited lane).
+
+    The per-roll verification probe uses ``summary.model`` -- the canary
+    ``probe_all`` converged on and proved serving this pass -- not the stale
+    ``config.PROBE_MODEL`` pin. OpenCode can pull the pin behind a gate while
+    the catalog still serves another free model, and then every freshly
+    re-rolled exit answered "400 Model is unavailable" -> ``probe_error``
+    "leaving for the health cycle", so the heal never succeeded until the pin
+    came back. Verifying with a serving canary re-rolls an exit to a
+    *known-usable* address rather than a merely-different one.
     """
     burned = {
         r.exit_ip for r in summary.results
@@ -835,6 +916,7 @@ def heal_rate_limited(
             "waiting on the upstream reset",
             len(known),
         )
+    verify_model = getattr(summary, "model", "") or config.PROBE_MODEL
     healed = 0
     for r in summary.results:
         if r.status != "rate_limited":
@@ -854,15 +936,31 @@ def heal_rate_limited(
             continue
         if config.DEFER_REROLL_WHEN_BUSY and active_streams.active(r.proxy_id) > 0:
             log("heal-rate-limit: %s re-roll deferred -- stream in flight", r.proxy_id)
+            # An in-flight stream may finish on the burned IP, but the *next*
+            # request must not pile onto it; gate it until the next probe pass
+            # re-evaluates rather than dropping a known-burned exit back to pick.
+            proxy_pool.extend_cooldown(px, config.PROBE_INTERVAL_S)
             continue
         try:
             if _reroll_until_clean(
                 proxy_pool, warp_manager, inst, px, r.proxy_id, burned, log,
                 max_attempts=max_attempts, result=r, summary=summary,
+                verify_model=verify_model,
             ):
                 healed += 1
+            else:
+                # Could not get this slot onto an unburned, serving exit this
+                # pass. Without gating, ``proxy_pool.pick`` would route the
+                # next request through this known-burned IP and rediscover the
+                # 429 at request time -- exactly the symptom of a request
+                # through a rate-limited proxy. Park it out of selection until
+                # the next periodic probe re-probes+re-heals it. A real-request
+                # 429 (should it still get picked) still escalates
+                # ``consecutive_failures`` via ``mark_failure`` on its own.
+                proxy_pool.extend_cooldown(px, config.PROBE_INTERVAL_S)
         except Exception as exc:  # noqa: BLE001
             log("heal-rate-limit: re-roll failed for %s: %s", r.proxy_id, exc)
+            proxy_pool.extend_cooldown(px, config.PROBE_INTERVAL_S)
     return healed
 
 
@@ -877,6 +975,7 @@ def _reroll_until_clean(
     max_attempts: Optional[int] = None,
     result: Optional[ProbeResult] = None,
     summary: Optional[ProbeSummary] = None,
+    verify_model: Optional[str] = None,
 ) -> bool:
     """Re-establish one tunnel until its exit IP is unburned; verify for real.
 
@@ -889,14 +988,34 @@ def _reroll_until_clean(
     A newly reached IP that turns out to be limited too joins the burned set,
     so no later slot wastes rolls landing on it.
 
-    When ``result`` is given, a successful verify rewrites it in place to
-    ``status="ok"`` with the new exit IP and latency, so the stored probe
-    summary reflects the heal immediately (the dashboard polls it, not the
-    logs).
+    When ``result`` is given, a successful verify rewrites it in place to the
+    transient ``status="healed"`` (not ``ok``) with the new exit IP and
+    latency. The dashboard's per-slot chip has a warn-orange "healed" pill
+    (tooltip "exit refreshed — next probe verifies it") that distinguishes a
+    lane freshly rolled off a burned exit from one that was always healthy;
+    bypassing it (writing straight to ``ok``) was what made the heal look
+    invisible — a graduated lane snapped from red to green with no tag, as
+    if nothing had happened. The fresh exit IP + measured latency stay
+    (unlike :func:`_mark_healed` for the regeneration / Tor-restart paths,
+    which cannot observe the new exit yet), because this re-roll was
+    canary-verified end-to-end. The next periodic probe pass rewrites the
+    whole summary, so the lane flips to ``ok`` once it survives a probe on
+    its own. ``healed`` lands in :attr:`ProbeSummary.healed`, not
+    ``healthy``, so the panel totals reconcile.
+
+    ``verify_model`` pins the per-roll verification probe to the canary
+    ``probe_all`` proved serving this pass (see :func:`heal_rate_limited`),
+    not the configured ``PROBE_MODEL`` pin. OpenCode can pull the pin behind a
+    gate while the catalog still serves another free model, leaving every
+    freshly re-rolled exit reading ``probe_error`` and the slot "left for the
+    health cycle" until the pin comes back -- so the heal never succeeded.
+    Falling back to ``config.PROBE_MODEL`` when ``summary.model`` is empty
+    keeps the legacy behaviour for hand-built / direct callers.
     """
     from warp import egress_map
 
     max_attempts = max_attempts or config.WARP_REROLL_MAX_ATTEMPTS
+    verify_model = verify_model or config.PROBE_MODEL
     occupied = set()  # not known here; aimed_order tolerates an empty view
     order = egress_map.aimed_order(burned, occupied)
     for attempt in range(max_attempts):
@@ -921,7 +1040,7 @@ def _reroll_until_clean(
                     inst.index, ip or "an unknown exit",
                 )
             continue
-        check = probe_proxy(px.url, proxy_id)
+        check = probe_proxy(px.url, proxy_id, model=verify_model)
         if check.status == "ok":
             proxy_pool.mark_success(px)
             proxy_pool.reset_counters(px.id)
@@ -931,13 +1050,20 @@ def _reroll_until_clean(
             )
             if result is not None:
                 old = result.status
-                result.status = "ok"
+                # ``healed`` (not ``ok``) so the dashboard shows the warn-orange
+                # "healed" pill — the operator-visible signal a lane was freshly
+                # rolled off a burned exit. The fresh exit IP + measured latency
+                # stay (this re-roll is canary-verified, not the unobservable
+                # regeneration / Tor-restart paths routed through _mark_healed).
+                # Next periodic probe overwrites the whole summary, so the lane
+                # graduates to ``ok`` if it survives a probe on its own.
+                result.status = "healed"
                 result.exit_ip = ip
                 result.latency_ms = check.latency_ms
                 result.error = ""
                 result.probed_at = check.probed_at
                 if summary is not None:
-                    _recount(summary, old, "ok")
+                    _recount(summary, old, "healed")
             return True
         if check.status == "rate_limited":
             # The exit was unburned a moment ago but is limited now (another
@@ -1004,11 +1130,22 @@ def rotate_burned_tor_lanes(
             log("[tor] lane #%d re-roll deferred -- stream in flight", idx)
             continue
         log("[tor] lane #%d is %s -- rotating its exit", idx, r.status)
+        px = proxy_pool.get_by_id(r.proxy_id)
         try:
             if tor_manager.restart_instance(inst, log=log):
                 proxy_pool.reset_counters(r.proxy_id)
                 _mark_healed(summary, r)
                 rotated += 1
+            elif px is not None:
+                # The Tor restart failed -- the lane stays on the same burned
+                # exit but ``pick()`` would still route through it, letting a
+                # real request re-429 before request-time mark_failure could
+                # cool it. Park the lane until the next probe pass re-checks
+                # the exit; extend_cooldown (the probe-side mirror of
+                # mark_failure) raises cooldown_until without bumping the
+                # failure tally -- a Tor-restart verdict is not a request burn.
+                proxy_pool.extend_cooldown(px, config.PROBE_INTERVAL_S)
+                log("[tor] lane #%d restart failed -- parked for next probe", idx)
         except Exception as exc:  # noqa: BLE001
             log("[tor] rotate failed for #%d: %s", idx, exc)
     return rotated
@@ -1046,6 +1183,11 @@ def spread_distinct_exits(
     if not free_targets:
         return 0
 
+    # Spread's verify probe uses the same serving canary probe_all converged
+    # on, so a pulled pin cannot make a would-be move read ``probe_error`` and
+    # skip -- the slot stays where it is while a fresh exit it could have lived
+    # on is silently refused. Match the heal path's canary.
+    verify_model = getattr(summary, "model", "") or config.PROBE_MODEL
     moved = 0
     for shared_ip, ids in sorted(occ.items(), key=lambda kv: -len(kv[1])):
         if shared_ip in burned or len(ids) < 2 or not free_targets:
@@ -1082,7 +1224,7 @@ def spread_distinct_exits(
                         proxy_id, got or "an unknown exit", target,
                     )
                 continue
-            check = probe_proxy(px.url, proxy_id)
+            check = probe_proxy(px.url, proxy_id, model=verify_model)
             if check.status == "ok":
                 proxy_pool.mark_success(px)
                 proxy_pool.reset_counters(proxy_id)
@@ -1100,4 +1242,25 @@ def spread_distinct_exits(
             else:
                 log("spread: %s reached %s but the probe said %s",
                     proxy_id, got, check.status)
+                # The slot moved onto an exit the verify probe found burned. A
+                # real request would route through this lane and rediscover the
+                # 429 at request time before mark_failure cooled it -- so park
+                # the lane until the next probe pass re-evaluates the exit.
+                # extend_cooldown (the probe-side mirror of mark_failure) gates
+                # pick() without inflating the failure tally: a probe verdict on
+                # a freshly-rolled exit is an observation, not a request burn.
+                px_moved = proxy_pool.get_by_id(proxy_id)
+                if px_moved is not None:
+                    proxy_pool.extend_cooldown(px_moved, config.PROBE_INTERVAL_S)
+                if check.status == "rate_limited" and got:
+                    burned.add(got)
+                moved_result = by_id.get(proxy_id)
+                if moved_result is not None:
+                    old = moved_result.status
+                    moved_result.status = check.status
+                    moved_result.exit_ip = got or moved_result.exit_ip
+                    moved_result.latency_ms = check.latency_ms
+                    moved_result.error = check.error
+                    moved_result.probed_at = check.probed_at
+                    _recount(summary, old, check.status)
     return moved

@@ -23,8 +23,6 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from core import config
-
 TOR_VERSION = "15.0.20"
 TOR_DIST = "https://dist.torproject.org/torbrowser"
 TOR_BASE_PORT = 52001  # WARP owns 51001+; Tor lanes live one block above

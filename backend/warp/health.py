@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from core import config
@@ -149,6 +150,23 @@ class WarpHealthDaemon:
             self._thread.join(timeout=5)
             self._thread = None
             self.log("[warp-health] daemon stopped")
+
+    @contextmanager
+    def frozen(self):
+        """Hold the daemon's two serialization locks for the with-block's body.
+
+        Used by API routes (POST /api/warp/refresh) that wholesale stop / wipe /
+        re-register WARP identities. A periodic probe running into the middle
+        of that -- ``_check_and_heal`` probing through proxies we're about to
+        delete from the pool, or ``heal_expired``'s regenerate_instance racing
+        this route's rmtree -- would restart a half-wiped identity. Both
+        ``_probe_lock`` (probe + heal) and ``_cycle_lock`` (SOCKS5 health cycle)
+        are non-blocking in the daemon's own ``acquire``, so holding them here
+        simply makes the periodic loop skip its cycles while the caller runs;
+        there is no nested acquisition in the daemon to deadlock against.
+        """
+        with self._probe_lock, self._cycle_lock:
+            yield
 
     def check_and_heal(self) -> Dict[str, Any]:
         """Run one full health check cycle synchronously and return results.
@@ -619,6 +637,13 @@ class WarpHealthDaemon:
                          idx, reason)
                 if self.warp.re_roll_tunnel(inst, log=self.log) is not None:
                     self.pool.reset_counters(px.id)
+                    # We do NOT observe the fresh exit here (egress_map.observe
+                    # via probe._fetch_exit_ip). It costs a ~250ms SOCKS5 ping
+                    # per burned lane on a cycle that already runs every 60s and
+                    # mutates state under the cycle lock, and the next periodic
+                    # probe_now()'s probe_all already does the observe/verify --
+                    # duplicating it here would slow cycles and re-implement the
+                    # heavier heal_rate_limited reroll sequence.
                     self.log("[warp-health] #%d re-rolled onto a fresh exit", idx)
                     dumped += 1
                 else:

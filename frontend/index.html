@@ -845,9 +845,6 @@ const chatOnce   = (payload) => api('/v1/chat/completions', { method:'POST', bod
 
 
 /* Streaming chat. Reads X-Lingling-* headers for routing metadata, then pipes
-   the SSE body. Falls back to the JSON shape when the backend answered
-   application/json even though stream:true was requested. */
-/* Streaming chat. Reads X-Lingling-* headers for routing metadata, then pipes
    the SSE body. Three things beyond a plain reader:
 
    - `signal` lets the caller abort an in-flight request (the Stop button).
@@ -3150,6 +3147,7 @@ async function loadEgress(){
           (probe.rate_limited ? ', ' + probe.rate_limited + ' rate-limited' : '') +
           (probe.dead ? ', ' + probe.dead + ' dead' : '') +
           (probe.probe_error ? ', ' + probe.probe_error + ' probe?' : '') +
+          (probe.healed ? ', ' + probe.healed + ' healed' : '') +
           (pending ? ' · ' + pending + ' pending' : '') +
           (ageS != null ? ' · ' + fmtAge(ageS) + ' ago' : '') +
           cadence + '</span></div>' +

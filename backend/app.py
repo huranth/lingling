@@ -764,16 +764,6 @@ def get_keys(pid: str) -> Dict[str, Any]:
     return _get_provider(pid).keys.status()
 
 
-@app.post("/api/providers/{pid}/keys")
-def add_key(pid: str, body: KeyIn) -> Dict[str, Any]:
-    prov = _get_provider(pid)
-    secret = body.resolved_secret().strip()
-    if not secret:
-        raise HTTPException(400, "a credential (secret/api_key/key/token) is required")
-    key = prov.keys.add(secret, body.label, body.id)
-    return {"added": key.status(), "pool": prov.keys.status()}
-
-
 @app.delete("/api/providers/{pid}/keys/{kid}")
 def remove_key(pid: str, kid: str) -> Dict[str, Any]:
     prov = _get_provider(pid)
@@ -783,15 +773,10 @@ def remove_key(pid: str, kid: str) -> Dict[str, Any]:
     return {"removed": kid, "pool": prov.keys.status()}
 
 
-# OpenCode shortcuts (the OpenCode key router), kept for convenience.
+# OpenCode shortcut (the OpenCode key router), kept for convenience.
 @app.get("/api/accounts")
 def get_accounts() -> Dict[str, Any]:
     return _get_provider("opencode").keys.status()
-
-
-@app.post("/api/accounts")
-def add_account(body: KeyIn) -> Dict[str, Any]:
-    return add_key("opencode", body)
 
 
 # ---------------------------------------------------------------------------
@@ -943,48 +928,55 @@ def warp_refresh() -> Dict[str, Any]:
     if not warp_manager.tools_ready():
         raise HTTPException(409, "WARP tools not available. POST /api/warp/setup first.")
 
-    try:
-        # 1. Stop all running wireproxy instances
-        stop_result = warp_manager.stop_all()
+    # Hold the daemon frozen for the whole stop/wipe/re-register/restart: a
+    # periodic probe / heal cycle running into the middle of this -- probing
+    # proxies we are about to remove from the pool, or regenerate_instance on
+    # an identity we just wiped -- would race and restart half-wiped lanes.
+    # The daemon's locks are non-blocking in its own acquire, so this just
+    # skips its cycles; no deadlock.
+    with warp_health_daemon.frozen():
+        try:
+            # 1. Stop all running wireproxy instances
+            stop_result = warp_manager.stop_all()
 
-        # 2. Remove every WARP entry from the proxy pool
-        removed_ids: List[str] = []
-        for px in proxy_pool.get_all_proxies():
-            if px.id.startswith("warp-"):
-                proxy_pool.remove(px.id)
-                removed_ids.append(px.id)
+            # 2. Remove every WARP entry from the proxy pool
+            removed_ids: List[str] = []
+            for px in proxy_pool.get_all_proxies():
+                if px.id.startswith("warp-"):
+                    proxy_pool.remove(px.id)
+                    removed_ids.append(px.id)
 
-        # 3. Wipe identity directories and reset state
-        if warp_manager.identities_dir.exists():
-            for ident_dir in warp_manager.identities_dir.iterdir():
-                if ident_dir.is_dir() and ident_dir.name.startswith("warp-"):
-                    shutil.rmtree(ident_dir)
-        for inst in warp_manager.instances:
-            inst.process = None
-            inst.private_key = ""
-            inst.address_v4 = ""
-            inst.address_v6 = ""
+            # 3. Wipe identity directories and reset state
+            if warp_manager.identities_dir.exists():
+                for ident_dir in warp_manager.identities_dir.iterdir():
+                    if ident_dir.is_dir() and ident_dir.name.startswith("warp-"):
+                        shutil.rmtree(ident_dir)
+            for inst in warp_manager.instances:
+                inst.process = None
+                inst.private_key = ""
+                inst.address_v4 = ""
+                inst.address_v6 = ""
 
-        # 4. Re-register all identities
-        setup_result = warp_manager.setup_identities(log=log.info)
+            # 4. Re-register all identities
+            setup_result = warp_manager.setup_identities(log=log.info)
 
-        # 5. Start all + sync to pool
-        start_result = _start_warp_at_startup()
+            # 5. Start all + sync to pool
+            start_result = _start_warp_at_startup()
 
-        instances = warp_manager.status()["instances"]
+            instances = warp_manager.status()["instances"]
 
-        return {
-            "message": "WARP identities refreshed",
-            "stopped": stop_result.get("stopped", 0),
-            "removed_from_pool": removed_ids,
-            "setup": setup_result,
-            "start": start_result,
-            "pool": proxy_pool.status(),
-            "instances": instances,
-        }
-    except Exception as exc:  # noqa: BLE001
-        log.exception("WARP refresh failed: %s", exc)
-        raise HTTPException(500, f"WARP refresh failed: {exc}")
+            return {
+                "message": "WARP identities refreshed",
+                "stopped": stop_result.get("stopped", 0),
+                "removed_from_pool": removed_ids,
+                "setup": setup_result,
+                "start": start_result,
+                "pool": proxy_pool.status(),
+                "instances": instances,
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.exception("WARP refresh failed: %s", exc)
+            raise HTTPException(500, f"WARP refresh failed: {exc}")
 
 
 @app.get("/api/warp/probe")
@@ -1352,6 +1344,13 @@ def _messages_for_model(
 # burst (huge upstream traffic) fires that recheck on many concurrent requests
 # at once; without a cooldown each would force a catalog refresh.
 _retire_recheck_at: Dict[str, float] = {}
+# Guards _retire_recheck_at across the check-then-set window between the
+# cooldown test and the next-write slot: a burst of concurrent "unavailable"
+# 400s would each pass the cooldown test before any of them updated the
+# timestamp, scheduling N redundant /models refreshes for the same model.
+# The refresh itself runs outside this lock so one model's outage cannot
+# serialise the others.
+_retire_lock = threading.Lock()
 
 
 def _flag_model_retired(exc: Exception, model_id: str) -> bool:
@@ -1374,12 +1373,13 @@ def _flag_model_retired(exc: Exception, model_id: str) -> bool:
         return False
 
     now = time.time()
-    last = _retire_recheck_at.get(model_id, 0.0)
-    if now - last < config.RETIRE_RECHECK_COOLDOWN_S:
-        # Checked recently and it was still listed (else it would have been
-        # retired); don't hammer /models on every concurrent 400 in this burst.
-        return False
-    _retire_recheck_at[model_id] = now
+    with _retire_lock:
+        last = _retire_recheck_at.get(model_id, 0.0)
+        if now - last < config.RETIRE_RECHECK_COOLDOWN_S:
+            # Checked recently and it was still listed (else it would have been
+            # retired); don't hammer /models on every concurrent 400 in this burst.
+            return False
+        _retire_recheck_at[model_id] = now
 
     # Authoritative answer: force a refresh and see whether the model is still
     # offered free. refresh() falls back to the last good list on a fetch
@@ -1435,9 +1435,6 @@ async def _execute_with_egress_wait(fn, *args, **kwargs):
 async def chat_completions(request: Request):
     request_started = time.time()
     client = request.client.host if request.client else "unknown"
-
-    # Authorisation already happened in the _gate middleware.
-    actor = getattr(request.state, "actor", "open")
 
     try:
         body = await request.json()
@@ -1830,8 +1827,13 @@ async def responses(request: Request):
     target_lm = catalog.by_id(target)
     if target_lm is not None and not target_lm.vision:
         messages = vision_bridge.strip_images_for_text_model(messages)
-    _resolve_effort(params, target)
+    # Capture the client's effort before _resolve_effort mutates ``params``:
+    # afterwards ``reasoning_effort`` holds the clamped value the upstream got,
+    # and failover would re-clamp the clamps against the fallback instead of the
+    # value the client asked for (the same pitfall _resolve_effort's ``previous``
+    # branch was added to escape).
     original_effort = params.get("reasoning_effort")
+    _resolve_effort(params, target)
 
     if not stream:
         started = time.time()

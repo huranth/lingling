@@ -46,6 +46,7 @@ class FakeWarpManager:
     def regenerate_instance(self, inst):
         inst.regenerated = True
         self.regenerated_indices.append(inst.index)
+        return True                    # mirrors WarpManager: True on full success, False on fail
 
     def re_roll_tunnel(self, inst, attempt=0, endpoint=None, log=None):
         self.rerolls.append((inst.index, attempt))
@@ -71,6 +72,7 @@ def test_probe_summary_to_dict():
     d = s.to_dict()
     assert d["total"] == 2
     assert d["healthy"] == 1
+    assert d["healed"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -418,13 +420,21 @@ def test_heal_expired_marks_summary_healed():
     assert summary.healthy == 1 and summary.dead == 0
 
 
-def test_heal_rate_limited_updates_summary_to_ok():
-    """A successful re-roll rewrites the probe result to ``ok`` with the
-    fresh exit IP and latency.
+def test_heal_rate_limited_updates_summary_to_healed():
+    """A successful re-roll rewrites the probe result to the transient
+    ``healed`` status (not ``ok``) with the fresh exit IP and latency.
 
-    The stored summary is what the dashboard renders; a slot that just
-    escaped its burned exit must show as up (on its new lane) instead of
-    keeping the rate-limited chip until the next probe.
+    The stored summary is what the dashboard renders; the per-slot chip has
+    a warn-orange ``healed`` pill (tooltip "exit refreshed — next probe
+    verifies it") so an operator can pick a lane freshly rolled off a
+    burned exit out of the rack — bypassing it (writing ``ok``) was what
+    made the heal look invisible, a graduated lane snapping from red to
+    green with no tag. ``healed`` is counted in its own :class:`ProbeSummary`
+    counter (NOT ``healthy``): this re-roll was canary-verified once, but the
+    periodic probe is the standing confirmation, and the next pass rewrites
+    the summary so the lane flips to ``ok`` on its own. Totals reconcile —
+    ``healthy + rate_limited + dead + healed == total`` — so the exit-probe
+    panel still adds up.
     """
     pool = _make_pool(1)
     wm = FakeWarpManager(count=1)
@@ -435,15 +445,15 @@ def test_heal_rate_limited_updates_summary_to_ok():
     exits = iter(["104.28.231.145"])
     checks = iter([probe.ProbeResult(proxy_id="warp-1", status="ok", latency_ms=777)])
     with mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
-         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid: next(checks)), \
+         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid, model=None: next(checks)), \
          mock.patch("warp.probe.time.sleep"):
         healed = probe.heal_rate_limited(pool, summary, wm, log=lambda *a, **k: None)
     assert healed == 1
     r = summary.results[0]
-    assert r.status == "ok"
+    assert r.status == "healed"
     assert r.exit_ip == "104.28.231.145"
     assert r.latency_ms == 777
-    assert summary.rate_limited == 0 and summary.healthy == 1
+    assert summary.rate_limited == 0 and summary.healthy == 0 and summary.healed == 1
 
 
 def test_heal_rate_limited_failed_roll_keeps_summary_intact():
@@ -484,7 +494,7 @@ def test_heal_rate_limited_rerolls_until_clean_exit():
     checks = iter([probe.ProbeResult(proxy_id="warp-2", status="ok", latency_ms=900),
                    probe.ProbeResult(proxy_id="warp-3", status="ok", latency_ms=800)])
     with mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
-         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid: next(checks)), \
+         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid, model=None: next(checks)), \
          mock.patch("warp.probe.time.sleep"):
         healed = probe.heal_rate_limited(pool, summary, wm, log=lambda *a, **k: None)
     assert healed == 2
@@ -518,6 +528,67 @@ def test_heal_rate_limited_gives_up_after_max_rolls():
     assert pool.get_by_id("warp-1") is not None
 
 
+def test_heal_rate_limited_parks_unhealed_exit_out_of_pick():
+    """A rate-limited exit the heal could not move off a burned IP is parked
+    out of ``ProxyPool.pick`` until the next probe pass -- so a live request
+    is not routed through a known-burned address only to rediscover its 429
+    at request time. ``mark_failure`` is deliberately NOT the gate: probe
+    verdicts are the old observation, not a fresh request failure, and would
+    inflate the burn counters that drive ``_dump_burned_identities``.
+    """
+    pool = _make_pool(1)
+    wm = FakeWarpManager(count=1)
+    summary = probe.ProbeSummary(total=1, rate_limited=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="rate_limited",
+                          exit_ip="104.28.231.142"),
+    ])
+    px = pool.get_by_id("warp-1")
+    assert px is not None and not px.in_cooldown()
+    # Every roll lands back on the burned IP -> "could not escape".
+    with mock.patch("warp.probe._fetch_exit_ip",
+                    return_value="104.28.231.142"), \
+         mock.patch("warp.probe.time.sleep"):
+        healed = probe.heal_rate_limited(pool, summary, wm, log=lambda *a, **k: None)
+    assert healed == 0
+    # Still in the pool (no regeneration) but now cooling: parked, not gone.
+    still = pool.get_by_id("warp-1")
+    assert still is not None
+    assert still.in_cooldown()
+    # The gate came from extend_cooldown (no failure bump): probe verdict,
+    # not a real 429, so the burn counters stay untouched.
+    assert still.consecutive_failures == 0 and still.total_429 == 0
+
+
+def test_heal_rate_limited_verifies_with_converged_canary_not_the_pin():
+    """The post-roll verify probe must use the canary ``probe_all`` proved
+    serving (``summary.model``), not the configured ``PROBE_MODEL`` pin -- an
+    OpenCode pull behind a gate made the old pin 400 "Model is unavailable"
+    on every fresh exit, which read ``probe_error`` and left the slot
+    "for the health cycle" indefinitely. The fix is exactly this canary
+    thread-down from :func:`probe_all` to :func:`probe_proxy`.
+    """
+    pool = _make_pool(1)
+    wm = FakeWarpManager(count=1)
+    summary = probe.ProbeSummary(
+        total=1, rate_limited=1, model="mimo-v2.5-free", results=[
+            probe.ProbeResult(proxy_id="warp-1", status="rate_limited",
+                              exit_ip="104.28.231.142"),
+        ],
+    )
+    calls = []
+    sentinel = probe.ProbeResult(proxy_id="warp-1", status="ok", latency_ms=42)
+    with mock.patch("warp.probe._fetch_exit_ip",
+                    return_value="104.28.231.145"), \
+         mock.patch("warp.probe.probe_proxy",
+                    side_effect=lambda url, pid, model=None:
+                        (calls.append(model), sentinel)[1]), \
+         mock.patch("warp.probe.time.sleep"):
+        healed = probe.heal_rate_limited(pool, summary, wm, log=lambda *a, **k: None)
+    assert healed == 1
+    # The verify probe ran with the converged canary, not the stale pin.
+    assert calls and calls[-1] == "mimo-v2.5-free"
+
+
 def test_heal_rate_limited_newly_burned_exit_joins_the_burned_set():
     """An exit that turns out limited on first contact is not rolled onto twice."""
     pool = _make_pool(1)
@@ -531,7 +602,7 @@ def test_heal_rate_limited_newly_burned_exit_joins_the_burned_set():
         probe.ProbeResult(proxy_id="warp-1", status="ok"),
     ])
     with mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
-         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid: next(checks)), \
+         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid, model=None: next(checks)), \
          mock.patch("warp.probe.time.sleep"):
         healed = probe.heal_rate_limited(pool, summary, wm, log=lambda *a, **k: None)
     assert healed == 1
@@ -617,7 +688,7 @@ def test_spread_moves_duplicates_onto_free_exits():
         (aimed.append(endpoint), rolled.append(inst.index),
          endpoint or "edge-free")[2]
     with mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
-         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid: next(checks)), \
+         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid, model=None: next(checks)), \
          mock.patch("warp.probe.time.sleep"):
         moved = probe.spread_distinct_exits(pool, summary, wm, log=lambda *a, **k: None)
     assert moved == 1
@@ -645,7 +716,7 @@ def test_spread_updates_summary_with_new_exit():
     exits = iter(["9.9.9.9"])
     checks = iter([probe.ProbeResult(proxy_id="warp-2", status="ok", latency_ms=555)])
     with mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
-         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid: next(checks)), \
+         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid, model=None: next(checks)), \
          mock.patch("warp.probe.time.sleep"):
         moved = probe.spread_distinct_exits(pool, summary, wm, log=lambda *a, **k: None)
     assert moved == 1
@@ -773,7 +844,7 @@ def test_probe_and_heal_full_cycle():
     exits = iter(["104.28.231.145"])
     checks = iter([probe.ProbeResult(proxy_id="warp-2", status="ok", latency_ms=850)])
     with mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
-         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid: next(checks)), \
+         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid, model=None: next(checks)), \
          mock.patch("warp.probe.time.sleep"):
         rl_healed = probe.heal_rate_limited(pool, summary, wm, log=lambda *a, **k: None)
     expired_healed = probe.heal_expired(pool, summary, wm, log=lambda *a, **k: None)
@@ -1546,13 +1617,13 @@ def test_heal_rate_limited_still_heals_when_idle():
     checks = iter([probe.ProbeResult(proxy_id="warp-1", status="ok", latency_ms=10)])
     with _active_busy_for(), \
          mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
-         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid: next(checks)), \
+         mock.patch("warp.probe.probe_proxy", side_effect=lambda url, pid, model=None: next(checks)), \
          mock.patch("warp.probe.time.sleep"):
         healed = probe.heal_rate_limited(pool, summary, wm,
                                          log=lambda *a, **k: None)
     assert healed == 1
     assert wm.rerolls and (1, 0) in wm.rerolls
-    assert summary.results[0].status == "ok"
+    assert summary.results[0].status == "healed"
 
 
 # ---------------------------------------------------------------------------
@@ -1676,3 +1747,88 @@ def test_rotate_burned_tor_lanes_heals_when_idle():
     assert rotated == 1
     assert tm.restarts == [1]
     assert summary.results[0].status == "healed"
+
+
+def test_heal_expired_leaves_dead_when_regeneration_fails():
+    """A regeneration that returns False (port-find / registration / restart-after-regen
+    failure in WarpManager.regenerate_instance) must NOT chip the lane ``healed``.
+    The identity never came back, so the dashboard must keep the dead verdict
+    instead of an optimistic heal pill that hides a still-down lane until a real
+    request rediscovered it at request time.
+    """
+    pool = _make_pool(1)
+    wm = FakeWarpManager(count=1)
+    wm.regenerate_instance = mock.MagicMock(return_value=False)
+    summary = probe.ProbeSummary(total=1, dead=1, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="dead", error="timeout"),
+    ])
+    healed = probe.heal_expired(pool, summary, wm, log=lambda *a, **k: None)
+    assert healed == 0
+    assert wm.regenerate_instance.called
+    assert summary.dead == 1 and summary.healed == 0
+    assert summary.results[0].status == "dead"
+
+
+def test_rotate_burned_tor_lanes_parks_lane_when_restart_fails():
+    """A Tor restart that returns False leaves the lane on its burned exit. The
+    rotator must park it via ``extend_cooldown`` so ``pick()`` skips it until the
+    next probe pass; without that gate a live request lands on the still-burned
+    exit and 429s before request-time mark_failure sees it. The verdict stays
+    ``rate_limited`` (no optimistic ``healed`` pill: the lane did not recover).
+    """
+    pool = _tor_pool(1)
+    tm = _FakeTorManager(1)
+    tm.restart_instance = mock.MagicMock(return_value=False)
+    summary = probe.ProbeSummary(total=1, rate_limited=1, results=[
+        probe.ProbeResult(proxy_id="tor-1", status="rate_limited",
+                          exit_ip="1.2.3.4"),
+    ])
+    rotated = probe.rotate_burned_tor_lanes(pool, tm, summary,
+                                            log=lambda *a, **k: None)
+    assert rotated == 0
+    px = pool.get_by_id("tor-1")
+    assert px.in_cooldown(time.time())              # parked out of pick()
+    assert px.consecutive_failures == 0              # probe verdict did not bump
+    assert summary.rate_limited == 1 and summary.healed == 0
+    assert summary.results[0].status == "rate_limited"
+
+
+def test_spread_parks_burned_lane_when_verify_says_rate_limited():
+    """spread rolls a duplicate onto a free target exit, but the verify probe
+    finds the new exit rate-limited. The moved lane must be parked via
+    ``extend_cooldown`` (out of ``pick()`` until the next probe pass), the new
+    exit added to ``burned`` so no other slot is aimed there too, and the
+    stored summary rewritten so the dashboard chips the new exit as
+    rate-limited instead of green. The verify verdict is a probe observation,
+    not a fresh 429 -- no failure-tally bump.
+    """
+    from warp import egress_map
+
+    egress_map.observe("9.9.9.9", "edge-free")
+    pool = _make_pool(3)
+    wm = FakeWarpManager(count=3)
+    summary = probe.ProbeSummary(total=3, healthy=3, results=[
+        probe.ProbeResult(proxy_id="warp-1", status="ok", exit_ip="3.3.3.3"),
+        probe.ProbeResult(proxy_id="warp-2", status="ok", exit_ip="3.3.3.3"),
+        probe.ProbeResult(proxy_id="warp-3", status="ok", exit_ip="4.4.4.4"),
+    ])
+    exits = iter(["9.9.9.9"])
+    checks = iter([probe.ProbeResult(proxy_id="warp-2", status="rate_limited",
+                                     error="HTTP 429", latency_ms=12.0)])
+    with mock.patch("warp.probe._fetch_exit_ip", side_effect=lambda url: next(exits)), \
+         mock.patch("warp.probe.probe_proxy",
+                    side_effect=lambda url, pid, model=None: next(checks)), \
+         mock.patch("warp.probe.time.sleep"):
+        moved = probe.spread_distinct_exits(pool, summary, wm,
+                                            log=lambda *a, **k: None)
+    assert moved == 0
+    by_id = {r.proxy_id: r for r in summary.results}
+    r = by_id["warp-2"]
+    assert r.status == "rate_limited"               # chip flipped to the new exit
+    assert r.exit_ip == "9.9.9.9"
+    assert r.error == "HTTP 429"
+    assert r.latency_ms == 12.0
+    assert summary.rate_limited == 1 and summary.healthy == 2
+    px = pool.get_by_id("warp-2")
+    assert px.in_cooldown(time.time())              # parked out of pick()
+    assert px.consecutive_failures == 0             # no probe-bump to the tally

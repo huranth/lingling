@@ -237,14 +237,27 @@ class OpenAICompatibleProvider(Provider):
         elif proxy_id is None:
             proxy_id = "_direct_"
 
+        # Mirror stream_chat: tell the healers' ``active_streams.active(pid) > 0``
+        # guard a non-stream request is in flight on this egress too. Without
+        # this a chat_completions call mid-request could see ``remove(pid)`` from
+        # heal_expired / rotate_burned_tor_lanes (the lane reads as idle), and
+        # the executor's retry ``mark_failure`` would then mutate a ghost Proxy.
+        # inc/dec are no-ops for a falsy egress (a direct, non-proxied call), so
+        # the registry never sees a ``_direct_`` span.
+        from providers import active_streams
+        egress_id = proxy_id if proxy_url else None
+        active_streams.inc(egress_id)
         try:
-            with pool.get_client(proxy_id, proxy_url, timeout_val) as client:
-                resp = client.post(self._url(), json=body, headers=self.auth_headers(secret))
-        except httpx.HTTPError as exc:
-            raise UpstreamError(504, str(exc), self.id) from exc
-        if resp.status_code >= 400:
-            raise UpstreamError(resp.status_code, resp.text, self.id)
-        return resp.json()
+            try:
+                with pool.get_client(proxy_id, proxy_url, timeout_val) as client:
+                    resp = client.post(self._url(), json=body, headers=self.auth_headers(secret))
+            except httpx.HTTPError as exc:
+                raise UpstreamError(504, str(exc), self.id) from exc
+            if resp.status_code >= 400:
+                raise UpstreamError(resp.status_code, resp.text, self.id)
+            return resp.json()
+        finally:
+            active_streams.dec(egress_id)
 
     def stream_chat(
         self, messages: List[Dict[str, Any]], model: str, secret: str,
