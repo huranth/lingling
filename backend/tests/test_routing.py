@@ -3592,18 +3592,17 @@ def _fetch_provider_factory():
     return FetchProvider, UnifiedCatalog
 
 
-def test_unit_a_retired_model_self_heals_when_opencode_re_lists_it(tmp_path, monkeypatch):
-    """The auto-recycle (probation=0) resurrects a re-listed retired model on
-    the next live refresh, instead of hiding it for the full TTL.
+def test_unit_a_runtime_retirement_stays_parked_through_refresh(tmp_path, monkeypatch):
+    """A model retired at runtime (its free-tier chat 400'd 'unavailable')
+    STAYS parked across subsequent catalog refreshes -- even when OpenCode
+    keeps advertising it in /models the whole time (the chronic case).
 
-    A ``-free`` model retired at runtime (its free-tier chat 400'd
-    'unavailable') was parked; probation=0 collapses the chronic (still
-    listed, backend refuses chat) and genuine (gone from /models) cases to
-    'park once, resurrect on the next non-stale re-list', so a transient
-    upstream blip self-heals in one refresh. probation>0 (the default 300s)
-    holds chronic offenders parked for the probation window instead -- the
-    subject of its own test. Only a model genuinely gone from the free section
-    stays retired even when probation is 0."""
+    The auto-resurrect self-heal path used to pop such an entry on the very
+    next non-stale refresh; that proved wrong for the chronic case (still
+    listed in /models but the upstream refuses to serve chat) so it's gone.
+    Parked entries are now sticky until the operator clears
+    retired_models.json OR the LINGLING_RETIRED_MODEL_TTL_DAYS age filter in
+    _load_unavailable drops the entry on the next gateway start."""
     from core import config as core_config
 
     FetchProvider, UnifiedCatalog = _fetch_provider_factory()
@@ -3611,10 +3610,6 @@ def test_unit_a_retired_model_self_heals_when_opencode_re_lists_it(tmp_path, mon
     monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
     monkeypatch.setattr(core_config, "RETIRED_MODELS_SEED", "")
     monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
-    # Probation off: this test exercises the immediate-resurrection path
-    # (a re-listed retired model comes back on the very next live refresh).
-    # The probation window's behavior is pinned by its own test below.
-    monkeypatch.setattr(core_config, "RETIRED_MODEL_PROBATION_S", 0.0)
 
     prov = FetchProvider()
     cat = UnifiedCatalog({"opencode": prov})
@@ -3630,36 +3625,38 @@ def test_unit_a_retired_model_self_heals_when_opencode_re_lists_it(tmp_path, mon
     assert cat.is_unavailable("dead-free") is True
     assert "dead-free" in cat.meta()["retired_models"]
 
-    # Genuinely removed (OpenCode dropped it from the free section): absent from
-    # the next live fetch -> stays retired, NOT resurrected.
+    # OpenCode keeps advertising it across live non-stale refreshes. The OLD
+    # design would have resurrected it here; the new one keeps it parked.
+    for _ in range(3):
+        prov._ids = ["good-free", "dead-free"]
+        cat.refresh(force=True)
+        assert "dead-free" not in [m.id for m in cat.free()]
+        assert cat.is_unavailable("dead-free") is True
+
+    # Genuinely removed (OpenCode dropped it from the free section): absent
+    # from the next live fetch. The parked entry still holds; nothing
+    # opportunistically un-retires it either way.
     prov._ids = ["good-free"]
     cat.refresh(force=True)
     assert "dead-free" not in [m.id for m in cat.free()]
     assert cat.is_unavailable("dead-free") is True
 
-    # OpenCode re-lists it (transient overload cleared): a live, non-stale
-    # refresh resurrects it automatically -- no manual un-seed, no 7-day TTL wait.
-    prov._ids = ["good-free", "dead-free"]
-    cat.refresh(force=True)
-    assert "dead-free" in [m.id for m in cat.free()]
-    assert cat.is_unavailable("dead-free") is False
-    assert cat.by_id("dead-free") is not None
-
-    # The resurrection is persisted, so a freshly-built catalog (the Codex
-    # generator is a separate process) no longer hides it either.
+    # A freshly-built catalog (the Codex generator is a separate process)
+    # loads the persisted state and keeps dead-free parked across reload too.
     prov2 = FetchProvider()
     prov2._ids = ["good-free", "dead-free"]
     cat2 = UnifiedCatalog({"opencode": prov2})
     cat2.refresh(force=True)
-    assert "dead-free" in [m.id for m in cat2.free()]
+    assert "dead-free" not in [m.id for m in cat2.free()]
+    assert cat2.is_unavailable("dead-free") is True
 
 
 def test_unit_runtime_retirement_not_resurrected_from_stale_fetch(tmp_path, monkeypatch):
-    """A live fetch is authoritative for resurrection; a stale-fallback
-    appearance is the cached last-good list, not OpenCode actually serving the
-    model again, so it must NOT resurrect a retired id. Otherwise a transient
-    /models outage (falling back to a cache that still lists the model) would
-    falsely un-retire a model the upstream genuinely stopped offering."""
+    """With the self-heal auto-resurrect path removed, a retired model is
+    trivially kept retired on a stale /models fetch (the catalog fell back
+    to last-good, which still lists the model) -- there's no pop mechanism to
+    fire in the first place. Kept as a regression guard against any future
+    re-addition of opportunistic resurrection based on stale data."""
     from core import config as core_config
 
     FetchProvider, UnifiedCatalog = _fetch_provider_factory()
@@ -3667,9 +3664,6 @@ def test_unit_runtime_retirement_not_resurrected_from_stale_fetch(tmp_path, monk
     monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
     monkeypatch.setattr(core_config, "RETIRED_MODELS_SEED", "")
     monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
-    # Probation off so the resurrection gate tested here is staleness alone,
-    # not the probation window (its own test below pins that path).
-    monkeypatch.setattr(core_config, "RETIRED_MODEL_PROBATION_S", 0.0)
 
     prov = FetchProvider()
     cat = UnifiedCatalog({"opencode": prov})
@@ -3681,8 +3675,10 @@ def test_unit_runtime_retirement_not_resurrected_from_stale_fetch(tmp_path, monk
     assert cat.is_unavailable("dead-free") is True
 
     # The next fetch FAILS: the catalog falls back to last-good (which still
-    # lists dead-free) under stale=True. That appearance is the cache, not a
-    # live confirmation, so dead-free must stay retired.
+    # lists dead-free) under stale=True. No pop happens either way (live or
+    # stale), so dead-free stays retired -- with the auto-resurrect path gone
+    # this is the trivial outcome, but it stays tested to catch any future
+    # re-addition of /models-cache-driven resurrection.
     prov._fail_next = True
     cat.refresh(force=True)
     assert "dead-free" not in [m.id for m in cat.free()]
@@ -3822,16 +3818,16 @@ def test_unit_app_flags_model_retired_recheck_cooldown(monkeypatch):
     assert cat.mark_calls == 1
 
 
-def test_unit_a_retired_model_self_heal_holds_parked_within_probation(tmp_path, monkeypatch):
-    """The probation window keeps a runtime-retired model parked until
-    RETIRED_MODEL_PROBATION_S elapses, EVEN IF /models keeps advertising it
-    live throughout -- the chronic deepseek/musespark case ('still listed,
-    but the backend refuses chat'). Without probation the self-heal would
-    resurrect it on the very next refresh and the retirement would last
-    ~CATALOG_TTL. After probation elapses, a live non-stale re-list is allowed
-    to bring it back, so chronic offenders cycle parked -> retried -> re-parked
-    while a transient blip self-heals in PROBATION_S instead of the 7-day TTL
-    the old design locked out working models for."""
+def test_unit_a_runtime_retirement_survives_restart_via_persisted_state(tmp_path, monkeypatch):
+    """A model parked by the recycler, persisted to retired_models.json, is
+    reloaded on every gateway restart and STAYS parked across the restart --
+    even when its persisted timestamp is hours old (well past any probation
+    window the OLD design used to honour) AND /models keeps advertising it.
+
+    _load_unavailable re-stamps the loaded entry to `now`, so the entry is
+    treated as freshly parked again and there's no auto-resurrect pop to undo
+    the retirement on the next refresh. This is the bug the operator saw: a
+    parked deepseek that came back everywhere after a backend restart."""
     from core import config as core_config
 
     FetchProvider, UnifiedCatalog = _fetch_provider_factory()
@@ -3839,7 +3835,6 @@ def test_unit_a_retired_model_self_heal_holds_parked_within_probation(tmp_path, 
     monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
     monkeypatch.setattr(core_config, "RETIRED_MODELS_SEED", "")
     monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
-    monkeypatch.setattr(core_config, "RETIRED_MODEL_PROBATION_S", 300.0)
 
     prov = FetchProvider()
     cat = UnifiedCatalog({"opencode": prov})
@@ -3849,17 +3844,57 @@ def test_unit_a_retired_model_self_heal_holds_parked_within_probation(tmp_path, 
     cat.mark_unavailable("dead-free")
     assert cat.is_unavailable("dead-free") is True
 
-    # /models keeps advertising it; inside the probation window self-heal
-    # must NOT resurrect it -- otherwise the retirement lasts only one refresh.
+    # Back-date the persisted timestamp an hour so its original parked_at is
+    # well past the 5-minute probation window the OLD design used to gate
+    # auto-resurrect. Save back; a fresh catalog (simulating a backend
+    # restart) loads it, re-stamps to `now`, and SHOULD keep dead-free
+    # parked across the restart.
+    cat._unavailable["dead-free"] = time.time() - 3600.0
+    cat._save_unavailable()
+
+    prov2 = FetchProvider()
+    prov2._ids = ["good-free", "dead-free"]
+    cat2 = UnifiedCatalog({"opencode": prov2})
+    cat2.refresh(force=True)
+    assert "dead-free" not in [m.id for m in cat2.free()]
+    assert cat2.is_unavailable("dead-free") is True
+
+
+def test_unit_a_runtime_retirement_expires_via_ttl_on_reload(tmp_path, monkeypatch):
+    """TTL on LINGLING_RETIRED_MODEL_TTL_DAYS is the only auto-recover path
+    now that auto-resurrect is gone. A parked entry older than the TTL is
+    filtered out by _load_unavailable on the next gateway start, so when
+    /models still lists the model the catalog offers it again -- giving
+    OpenCode a week to resume serving it without an operator clearing
+    retired_models.json."""
+    from core import config as core_config
+    import json
+
+    FetchProvider, UnifiedCatalog = _fetch_provider_factory()
+
+    monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
+    monkeypatch.setattr(core_config, "RETIRED_MODELS_SEED", "")
+    monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
+
+    prov = FetchProvider()
+    cat = UnifiedCatalog({"opencode": prov})
+
     prov._ids = ["good-free", "dead-free"]
     cat.refresh(force=True)
-    assert "dead-free" not in [m.id for m in cat.free()]
+    cat.mark_unavailable("dead-free")
     assert cat.is_unavailable("dead-free") is True
 
-    # Push the parked timestamp past the probation window: now a live non-stale
-    # refresh is allowed to resurrect it.
-    cat._unavailable["dead-free"] = time.time() - 600.0
-    prov._ids = ["good-free", "dead-free"]
-    cat.refresh(force=True)
-    assert "dead-free" in [m.id for m in cat.free()]
-    assert cat.is_unavailable("dead-free") is False
+    # Fast-forward the persisted clock past the 7-day TTL: write a timestamp
+    # 8 days old straight into retired_models.json.
+    path = tmp_path / "retired.json"
+    path.write_text(json.dumps({"dead-free": time.time() - (8 * 86400)}),
+                    encoding="utf-8")
+
+    # A fresh gateway start drops the past-TTL entry, so the next refresh
+    # that re-lists dead-free resurrects it on the catalog.
+    prov2 = FetchProvider()
+    prov2._ids = ["good-free", "dead-free"]
+    cat2 = UnifiedCatalog({"opencode": prov2})
+    cat2.refresh(force=True)
+    assert "dead-free" in [m.id for m in cat2.free()]
+    assert cat2.is_unavailable("dead-free") is False

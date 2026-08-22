@@ -134,13 +134,22 @@ class UnifiedCatalog:
 
     # -- retired models ----------------------------------------------------
     def _load_unavailable(self) -> None:
-        """Restore the retired set: seeded known-dead ids plus persisted runtime ones.
+        """Restore the retired set; every loaded entry is re-stamped ``now``.
 
         Seeded ids (``config.retired_seed_ids()``) are hidden from the very
-        first startup -- OpenCode keeps advertising dropped models, so the
-        runtime 400-learning only triggers on first use. They are re-stamped
-        ``now`` on every load, so they never expire while they remain seeded.
-        Runtime-learned entries (below) keep their TTL.
+        first startup. Runtime-learned entries (parked by the recycler on a
+        'Model is unavailable' 400) are loaded back on every gateway start,
+        AND re-stamped ``now`` -- this is what lets a parked model STAY
+        parked across restarts and across refreshes: across a restart the
+        original parked_at of hours ago would already be past any probation
+        window, so the catalog's first refresh would otherwise resurrect the
+        model on a /models re-list (the chronic case gives /models the same
+        listing pre and post restart). The probation-pop loop is gone, the
+        re-stamp alone is what holds the parked state across the restart.
+        Persistence respects LINGLING_RETIRED_MODEL_TTL_DAYS on load only: an
+        entry whose persisted timestamp is older than the TTL is dropped
+        here, so OpenCode gets a chance to resume serving it during the next
+        week even without an operator clearing retired_models.json.
         """
         ttl = config.RETIRED_MODEL_TTL_DAYS * 86400
         now = time.time()
@@ -154,7 +163,7 @@ class UnifiedCatalog:
         if isinstance(raw, dict):
             for mid, ts in raw.items():
                 if isinstance(ts, (int, float)) and (now - float(ts)) < ttl:
-                    self._unavailable[str(mid)] = float(ts)
+                    self._unavailable[str(mid)] = now  # re-stamp: parked stays parked across restarts
 
     def _save_unavailable(self) -> None:
         try:
@@ -244,40 +253,18 @@ class UnifiedCatalog:
             self._per_provider = per_provider
             self._generated_at = time.time()
 
-            # Self-heal runtime retirements against the live free section,
-            # gated by a probation window: a -free model retired at runtime
-            # 400'd "unavailable" while chat refused to serve it; the
-            # recycler parked it including the chronic case where /models
-            # keeps advertising it. Without probation the self-heal here
-            # would resurrect it on the NEXT refresh (~CATALOG_TTL) and the
-            # retirement would last seconds -- so the probation floor holds
-            # a chronic offender parked for RETIRED_MODEL_PROBATION_S, after
-            # which a live non-stale re-list is allowed to bring it back.
-            # That window is also what keeps a *transient* "unavailable"
-            # burst self-healable in minutes instead of the full TTL the old
-            # "trust /models" gate used to lock out working models for.
-            # Reconcile only against authoritative (non-stale) provider
-            # fetches, so a fallback to the cached last-good list cannot
-            # resurrect an id the upstream genuinely stopped offering.
-            # Operator-seeded ids are left alone: the seed exists precisely
-            # because /models keeps advertising a model the operator knows is
-            # dead, so the live list is not authoritative for it.
-            probation = config.RETIRED_MODEL_PROBATION_S
-            reconciled = False
-            for mid in list(self._unavailable):
-                if mid in self._seed_ids:
-                    continue
-                parked_at = self._unavailable.get(mid, now)
-                if probation > 0 and (now - parked_at) < probation:
-                    continue
-                lm = logical.get(mid)
-                if lm is None:
-                    continue
-                if any(not self._stale.get(pid, False) for pid in lm.provider_ids):
-                    self._unavailable.pop(mid, None)
-                    reconciled = True
-            if reconciled:
-                self._save_unavailable()
+            # No auto-resurrection: a model parked by the recycler STAYS parked
+            # across refreshes and across restarts. The earlier "self-heal on a
+            # /models re-list" pop used to undo the retirement within one
+            # refresh for the chronic case (OpenCode keeps advertising the model
+            # but the backend refuses chat) -- across a gateway restart the
+            # parked entry's persisted timestamp was well past the probation
+            # window, so the FIRST post-startup refresh immediately resurrected
+            # the model "everywhere" again. Parked entries are now sticky until
+            # either the operator clears retired_models.json manually or the
+            # LINGLING_RETIRED_MODEL_TTL_DAYS age filter in _load_unavailable
+            # drops the entry on the next gateway start (gives OpenCode a week
+            # to resume serving it without an operator touch).
             return self
 
     # -- queries -----------------------------------------------------------

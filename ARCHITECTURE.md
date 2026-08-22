@@ -191,37 +191,37 @@ over to another free one.
 
 Upstream sometimes keeps advertising a model it no longer actually serves — the
 list says free, the chat says no. The first request that hits a 400 retires the
-model **regardless of the listing**. It stays hidden for a probation window,
-after which the catalog's self-heal can resurrect it on a live re-list, because
-OpenCode has restored free tiers before:
+model **regardless of the listing**. A parked model stays parked across
+refreshes and across restarts: the catalog re-stamps the persisted retired
+entry to `now` on every load, so a restart that used to bring the model
+straight back on the first `/models` re-list now leaves it hidden — no
+probation window, no self-heal pop:
 
 ```mermaid
 stateDiagram-v2
     direction LR
     [*] --> Listed: appears in live feed
     Listed --> Retired: chat returns "unavailable" 400
-    Retired --> Listed: probation elapses & live re-list holds
-    Retired --> Retired: still dead after probation → re-retired
+    Retired --> Listed: TTL drops entry on next start & live re-list holds
+    Retired --> Retired: still listed → stays parked
     note right of Retired
         hidden from Catalog
         survives restarts
     end note
 ```
 
-The five-minute probation window (`LINGLING_RETIRED_MODEL_PROBATION_S`) replaced
-the older "trust `/models`" gate, which kept chronic offenders (still listed but
-the upstream keeps refusing chat — the deepseek/musespark case) perpetually
-routable. A model that just 400'd once rides out a transient blip in five
-minutes instead of the seven-day lockdown the old design used to lock out
-working models for; a chronic offender cycles parked → retried → re-parked once
-per window until opencode actually restores the chat.
-
-`LINGLING_RETIRED_MODEL_TTL_DAYS` (7 days) is now the upper-bound age cap — a
-retired entry older than this is dropped on a fresh gateway start. Probation
-re-parks reset the timer, so a chronic offender that keeps cycling never ages
-out; the TTL only garbage-collects entries that genuinely went idle for over a
-week. Models already known to be gone are pre-seeded as retired
-(`LINGLING_RETIRED_MODELS`) so they never list even once.
+There is no probation-pop on refresh anymore. Earlier the self-heal in
+`refresh()` would resurrect a parked model on the very next `/models` re-list
+once any probation window elapsed — and across a gateway restart the persisted
+`parked_at` was already hours old, so the first post-startup refresh
+resurrected the model "everywhere" within one cycle. Parked now means parked:
+the entry sits in `backend/data/retired_models.json` until either the operator
+clears it manually or `LINGLING_RETIRED_MODEL_TTL_DAYS` drops it on the next
+gateway start, which gives OpenCode a week to resume actually serving the chat
+before the recycler learns afresh and re-parks it. Models already known to be
+gone are pre-seeded as retired (`LINGLING_RETIRED_MODELS`) and re-stamped on
+every load, so the TTL never ages them out while the seed is set — they never
+list even once.
 
 ## Reasoning effort
 
@@ -334,9 +334,8 @@ gateway. Skip this section unless something specific needs changing.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `LINGLING_RETIRED_MODELS` | *(seeded list)* | Models hidden from the catalog from startup — dropped free models the upstream still advertises |
-| `LINGLING_RETIRED_MODEL_PROBATION_S` | `300` | A runtime-retired model stays hidden this many seconds before the catalog self-heal can resurrect it on a live `/models` re-list; the window that replaced the old "trust `/models`" gate |
-| `LINGLING_RETIRED_MODEL_TTL_DAYS` | `7` | Upper-bound age cap — a retired entry older than this is dropped on a fresh gateway start (probation re-parks reset the timer, so chronic offenders never age out) |
+| `LINGLING_RETIRED_MODELS` | *(seeded list)* | Models hidden from the catalog from startup — dropped free models the upstream still advertises; re-stamped on every load so the TTL never ages them out while the seed is set |
+| `LINGLING_RETIRED_MODEL_TTL_DAYS` | `7` | The only auto-recover path: a retired entry whose persisted timestamp is older than this is dropped on a fresh gateway start, then the next live `/models` re-list can resurrect it. There is no probation/self-heal pop — a parked model stays parked across refreshes and across restarts until retired_models.json is cleared or this TTL drops the entry on the next start |
 | `LINGLING_UPSTREAM_USER_AGENT` | `opencode/1.0` | Identifies as the official client. See below — without this, the best free models 429 instantly |
 
 The complete list lives in `backend/core/config.py`, defaults included. Everything
