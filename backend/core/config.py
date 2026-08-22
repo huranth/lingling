@@ -152,20 +152,6 @@ def retired_seed_ids() -> frozenset:
 # retirement decision per model per window so a burst of transient
 # "unavailable" 400s doesn't hammer the lock or the persisted retired set.
 RETIRE_RECHECK_COOLDOWN_S = float(os.getenv("LINGLING_RETIRE_RECHECK_COOLDOWN_S", "30"))
-# Probation window that a runtime-retired model stays hidden before the
-# catalog self-heal is allowed to resurrect it on a /models re-list. The
-# recycler now retires a model on the first "Model is unavailable" 400 even
-# when OpenCode keeps advertising it in /models (the chronic deepseek/musespark
-# case: still listed, but the upstream refuses to serve chat). Without a
-# probation floor the self-heal in refresh() would resurrect such a model on
-# the very next refresh and the retirement would last ~30s -- useless. The
-# probation keeps it parked for this many seconds; on expiry a live non-stale
-# re-list is allowed to bring it back, so a transient blip self-heals in
-# minutes (not the 7-day TTL the old design used to lock out working models
-# for), while a chronic offender cycles parked -> retried -> re-parked.
-# 0 disables probation (immediate resurrect on the next live re-list, the
-# pre-engine-fix behavior).
-RETIRED_MODEL_PROBATION_S = float(os.getenv("LINGLING_RETIRED_MODEL_PROBATION_S", "300"))
 
 # Defer re-rolling/restarting an egress (WARP wireproxy / Tor lane) while an
 # HTTP stream is riding it, so the health/formation/probe daemons don't

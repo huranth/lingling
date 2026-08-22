@@ -1363,11 +1363,14 @@ def _flag_model_retired(exc: Exception, model_id: str) -> bool:
     So the model is retired here on that signal alone; the chat path's own
     AllFailedError already propagates to failover, and this drop keeps the
     same model off the dashboard, /v1/models, the sampler and the dispatcher
-    until the self-heal in catalog.refresh() resurrects it under a probation
-    window (config.RETIRED_MODEL_PROBATION_S). That probation bounds the time
-    a *transient* "unavailable" burst stays parked to minutes -- not the full
-    7-day TTL the old "trust /models" gate used to lock out working models
-    like MuseSpark/deepseek for. A per-model cooldown keeps a burst of
+    until either the operator clears backend/data/retired_models.json or
+    LINGLING_RETIRED_MODEL_TTL_DAYS (7 days) drops the entry on the next
+    gateway start. There is no probation-pop anymore: a parked model stays
+    parked across refreshes and across restarts (a loaded entry is re-stamped
+    ``now`` in _load_unavailable so a fresh restart doesn't trip any "old
+    entry, must resurrect" logic; see catalog.refresh -- the self-heal pop
+    loop was removed because chronic offenders kept popping straight back to
+    "everywhere" within one refresh). A per-model cooldown keeps a burst of
     "unavailable" 400s from firing more than one retirement per window.
     """
     err = getattr(exc, "last_error", None)
@@ -1382,14 +1385,16 @@ def _flag_model_retired(exc: Exception, model_id: str) -> bool:
         if now - last < config.RETIRE_RECHECK_COOLDOWN_S:
             # Decisive retirement attempt already made recently for this model;
             # don't hammer the lock / persisted-retired set on every concurrent
-            # 400 in this burst. Self-heal alone may resurrect it later.
+            # 400 in this burst. The parked entry is already effective across
+            # /v1/models, the dashboard, the sampler and the dispatcher.
             return False
         _retire_recheck_at[model_id] = now
 
     if catalog.is_unavailable(model_id):
-        # Already parked -- the parked_at anchor is the probation clock, so
-        # let it ride and keep the self-heal window anchored to the original
-        # failure rather than re-stamping on concurrent in-flight 400s.
+        # Already parked -- a parked model stays parked across refreshes and
+        # across restarts (catalog._load_unavailable re-stamps the persisted
+        # entry to ``now`` on load), so a concurrent in-flight 400 for a model
+        # already in the retired set has nothing to do here.
         return False
 
     try:
@@ -1398,7 +1403,8 @@ def _flag_model_retired(exc: Exception, model_id: str) -> bool:
         return False
     log.info(
         "catalog: retired model %s (upstream refused free-tier chat with "
-        "'unavailable' 400; self-heal will retry it after RETIRED_MODEL_PROBATION_S)",
+        "'unavailable' 400; parked until retired_models.json is cleared or "
+        "LINGLING_RETIRED_MODEL_TTL_DAYS drops it on the next gateway start)",
         model_id,
     )
     return True
