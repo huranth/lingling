@@ -1354,17 +1354,21 @@ _retire_lock = threading.Lock()
 
 
 def _flag_model_retired(exc: Exception, model_id: str) -> bool:
-    """Hide a model from the catalog only when OpenCode actually dropped it.
+    """Hide a model from the catalog when its free-tier chat starts 400-ing.
 
-    A ``-free`` model that 400s with "unavailable" while *still listed* in the
-    free section is transient overload (huge upstream traffic), not removal:
-    OpenCode pulls a genuinely-dropped model from the free section outright, it
-    doesn't answer "unavailable" for one it deleted. Retiring a still-listed
-    model here would hide it from routing/dispatcher for the full TTL (7 days)
-    just because the upstream was busy -- exactly the break MuseSpark and
-    deepseek kept hitting. So a refresh is forced and the model is retired ONLY
-    when it is no longer in the catalog's free list. A per-model cooldown keeps
-    a burst of "unavailable" 400s from forcing more than one refresh per window.
+    A ``-free`` model that comes back from upstream with HTTP 400 "Model is
+    unavailable" has stopped being served free, even when OpenCode keeps
+    advertising it in /models -- and it keeps advertising them: the chronic
+    deepseek/musespark case is "still listed, but the backend refuses chat".
+    So the model is retired here on that signal alone; the chat path's own
+    AllFailedError already propagates to failover, and this drop keeps the
+    same model off the dashboard, /v1/models, the sampler and the dispatcher
+    until the self-heal in catalog.refresh() resurrects it under a probation
+    window (config.RETIRED_MODEL_PROBATION_S). That probation bounds the time
+    a *transient* "unavailable" burst stays parked to minutes -- not the full
+    7-day TTL the old "trust /models" gate used to lock out working models
+    like MuseSpark/deepseek for. A per-model cooldown keeps a burst of
+    "unavailable" 400s from firing more than one retirement per window.
     """
     err = getattr(exc, "last_error", None)
     if err is None or getattr(err, "status_code", None) != 400:
@@ -1376,30 +1380,25 @@ def _flag_model_retired(exc: Exception, model_id: str) -> bool:
     with _retire_lock:
         last = _retire_recheck_at.get(model_id, 0.0)
         if now - last < config.RETIRE_RECHECK_COOLDOWN_S:
-            # Checked recently and it was still listed (else it would have been
-            # retired); don't hammer /models on every concurrent 400 in this burst.
+            # Decisive retirement attempt already made recently for this model;
+            # don't hammer the lock / persisted-retired set on every concurrent
+            # 400 in this burst. Self-heal alone may resurrect it later.
             return False
         _retire_recheck_at[model_id] = now
 
-    # Authoritative answer: force a refresh and see whether the model is still
-    # offered free. refresh() falls back to the last good list on a fetch
-    # failure, so a transient /models outage can't make us retire a model that
-    # is still listed.
-    try:
-        catalog.refresh(force=True)
-    except Exception:  # noqa: BLE001
+    if catalog.is_unavailable(model_id):
+        # Already parked -- the parked_at anchor is the probation clock, so
+        # let it ride and keep the self-heal window anchored to the original
+        # failure rather than re-stamping on concurrent in-flight 400s.
         return False
-    if catalog.by_id(model_id) is not None:
-        # Still in the free section -> genuinely transient, not removed. Leave
-        # it routable; the request's own 400 already propagates to failover.
-        return False
+
     try:
         catalog.mark_unavailable(model_id)
     except Exception:  # noqa: BLE001
         return False
     log.info(
-        "catalog: retired model %s (no longer in the free section; the "
-        "'unavailable' 400 was OpenCode dropping it, not a transient outage)",
+        "catalog: retired model %s (upstream refused free-tier chat with "
+        "'unavailable' 400; self-heal will retry it after RETIRED_MODEL_PROBATION_S)",
         model_id,
     )
     return True

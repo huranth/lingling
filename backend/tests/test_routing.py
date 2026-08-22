@@ -3593,16 +3593,17 @@ def _fetch_provider_factory():
 
 
 def test_unit_a_retired_model_self_heals_when_opencode_re_lists_it(tmp_path, monkeypatch):
-    """The auto-recycle must not lock out a model OpenCode still offers free.
+    """The auto-recycle (probation=0) resurrects a re-listed retired model on
+    the next live refresh, instead of hiding it for the full TTL.
 
-    A ``-free`` model retired at runtime was absent from /models when it 400'd;
-    if a later refresh sees it back in the free section the outage was transient
-    upstream overload (OpenCode pulls a genuinely-dropped model from the free
-    section outright -- it doesn't answer "unavailable" for one it removed), so
-    the catalog resurrects it immediately instead of hiding it for the full TTL.
-    Only a model genuinely gone from the free section stays retired. This is the
-    behavior that keeps deepseek-v4-flash-free routable during huge-traffic
-    overload instead of recycling it for a week."""
+    A ``-free`` model retired at runtime (its free-tier chat 400'd
+    'unavailable') was parked; probation=0 collapses the chronic (still
+    listed, backend refuses chat) and genuine (gone from /models) cases to
+    'park once, resurrect on the next non-stale re-list', so a transient
+    upstream blip self-heals in one refresh. probation>0 (the default 300s)
+    holds chronic offenders parked for the probation window instead -- the
+    subject of its own test. Only a model genuinely gone from the free section
+    stays retired even when probation is 0."""
     from core import config as core_config
 
     FetchProvider, UnifiedCatalog = _fetch_provider_factory()
@@ -3610,13 +3611,16 @@ def test_unit_a_retired_model_self_heals_when_opencode_re_lists_it(tmp_path, mon
     monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
     monkeypatch.setattr(core_config, "RETIRED_MODELS_SEED", "")
     monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
+    # Probation off: this test exercises the immediate-resurrection path
+    # (a re-listed retired model comes back on the very next live refresh).
+    # The probation window's behavior is pinned by its own test below.
+    monkeypatch.setattr(core_config, "RETIRED_MODEL_PROBATION_S", 0.0)
 
     prov = FetchProvider()
     cat = UnifiedCatalog({"opencode": prov})
 
     # Live free section lists both; retire one via the runtime path
-    # (mark_unavailable is what _flag_model_retired calls after a 400 once a
-    # refresh confirms the model is gone).
+    # (mark_unavailable is what _flag_model_retired calls after a 400).
     prov._ids = ["good-free", "dead-free"]
     cat.refresh(force=True)
     assert sorted(m.id for m in cat.free()) == ["dead-free", "good-free"]
@@ -3663,6 +3667,9 @@ def test_unit_runtime_retirement_not_resurrected_from_stale_fetch(tmp_path, monk
     monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
     monkeypatch.setattr(core_config, "RETIRED_MODELS_SEED", "")
     monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
+    # Probation off so the resurrection gate tested here is staleness alone,
+    # not the probation window (its own test below pins that path).
+    monkeypatch.setattr(core_config, "RETIRED_MODEL_PROBATION_S", 0.0)
 
     prov = FetchProvider()
     cat = UnifiedCatalog({"opencode": prov})
@@ -3709,12 +3716,13 @@ def test_unit_seeded_retirement_survives_re_listing(tmp_path, monkeypatch):
     assert cat.is_unavailable("seeded-free") is True
 
 
-def test_unit_app_flags_a_model_retired_only_when_gone_from_free_section(monkeypatch):
-    """Retirement is reserved for a model OpenCode actually dropped from the
-    free section. A "-free" model that 400s "unavailable" while *still listed*
-    is transient overload -- it stays routable. So _flag_model_retired forces a
-    refresh and retires ONLY when by_id comes back None. Other 400s and 429s do
-    not even refresh (no retirement, and no /models hammering on a non-match)."""
+def test_unit_app_flags_model_retired_on_unavailable_400_still_listed_or_not(monkeypatch):
+    """The recycler retires a -free model on a 'Model is unavailable' 400 even
+    when OpenCode keeps advertising it in /models -- the chronic
+    deepseek/musespark case ('still listed, but the backend refuses chat').
+    by_id is no longer consulted as a retirement gate; the probation-aware
+    self-heal in refresh() is what resurrects such a model later if OpenCode
+    genuinely restores the chat. Other 400s and 429s don't even mark."""
     import app as app_mod
     from providers.base import UpstreamError
     from routing import executor as exec_mod
@@ -3725,15 +3733,10 @@ def test_unit_app_flags_a_model_retired_only_when_gone_from_free_section(monkeyp
     class FakeCat:
         def __init__(self):
             self.marked = []
-            self.refresh_calls = 0
-            self._gone = set()      # ids by_id reports as None (dropped from free)
+            self._gone = set()  # ids whose /models membership has been dropped
 
-        def refresh(self, force=False):
-            self.refresh_calls += 1
-            return self
-
-        def by_id(self, mid):
-            return None if mid in self._gone else object()  # truthy = still listed
+        def by_id(self, mid):  # consulted only for log flavor; not a gate.
+            return None if mid in self._gone else object()
 
         def mark_unavailable(self, mid):
             self.marked.append(mid)
@@ -3747,49 +3750,48 @@ def test_unit_app_flags_a_model_retired_only_when_gone_from_free_section(monkeyp
     def unavail(detail):
         return exec_mod.AllFailedError(UpstreamError(400, detail), [])
 
-    # Still listed -> transient overload -> NOT retired; refresh was consulted.
+    # Chronic case: model STILL listed in /models AND chat 400'd 'unavailable'.
+    # The OLD design left it routable here; the engine-fix parks it outright --
+    # the 400 is the retirement signal, /models membership is not consulted.
     assert app_mod._flag_model_retired(
         unavail("This model is unavailable for free. use inclusionai/ling-3.0-flash"),
         "ling-3.0-flash-free",
-    ) is False
-    assert cat.marked == []
-    assert cat.refresh_calls == 1
+    ) is True
+    assert cat.marked == ["ling-3.0-flash-free"]
 
-    # Same model, now genuinely dropped from the free section -> retired.
-    cat._gone.add("ling-3.0-flash-free")
-    # The previous call stamped the recheck clock; clear it so this iteration
-    # is allowed to recheck (the cooldown is exercised in its own test below).
+    # Genuinely dropped (by_id now None) -> identical retirement behavior: the
+    # gate is the 400 itself, not the /models membership.
+    cat._gone.add("muse-free")
     app_mod._retire_recheck_at.clear()
     assert app_mod._flag_model_retired(
         unavail("This model is unavailable for free."),
-        "ling-3.0-flash-free",
+        "muse-free",
     ) is True
-    assert cat.marked == ["ling-3.0-flash-free"]
-    assert cat.refresh_calls == 2
+    assert cat.marked == ["ling-3.0-flash-free", "muse-free"]
 
-    # A non-retirement 400 must not retire AND must not even refresh.
-    before = cat.refresh_calls
+    # A non-retirement 400 (no 'unavailable' in detail) -> not retired.
+    app_mod._retire_recheck_at.clear()
     assert app_mod._flag_model_retired(
         exec_mod.AllFailedError(UpstreamError(400, "bad request shape"), []),
         "x-free",
     ) is False
-    assert cat.refresh_calls == before              # no /models refresh on a non-match
-    assert cat.marked == ["ling-3.0-flash-free"]
+    assert cat.marked == ["ling-3.0-flash-free", "muse-free"]
 
-    # A 429 is not retirement either -- and also does not refresh.
+    # A 429 is not retirement either.
     assert app_mod._flag_model_retired(
         exec_mod.AllFailedError(UpstreamError(429, "rate limited"), []),
         "x-free",
     ) is False
-    assert cat.refresh_calls == before
+    assert cat.marked == ["ling-3.0-flash-free", "muse-free"]
 
 
 def test_unit_app_flags_model_retired_recheck_cooldown(monkeypatch):
-    """A transient "unavailable" burst (huge upstream traffic) fires the
-    free-section recheck on many concurrent requests at once. The per-model
-    cooldown bounds it to one refresh per window: a second call for the same
-    model within the cooldown returns False WITHOUT refreshing again, so a burst
-    can't hammer /models."""
+    """A transient 'unavailable' burst (huge upstream traffic) fires the
+    retirement attempt on many concurrent requests at once. The per-model
+    cooldown bounds it to one retirement decision per window: a second call
+    for the same model within the cooldown returns False WITHOUT calling
+    mark_unavailable again, so a burst can't churn the lock / persisted
+    retired set."""
     import app as app_mod
     from providers.base import UpstreamError
     from routing import executor as exec_mod
@@ -3798,20 +3800,13 @@ def test_unit_app_flags_model_retired_recheck_cooldown(monkeypatch):
 
     class FakeCat:
         def __init__(self):
-            self.refresh_calls = 0
-
-        def refresh(self, force=False):
-            self.refresh_calls += 1
-            return self
-
-        def by_id(self, mid):
-            return object()        # always still listed -> never retired here
+            self.mark_calls = 0
 
         def mark_unavailable(self, mid):
-            pass
+            self.mark_calls += 1
 
         def is_unavailable(self, mid):
-            return False
+            return False  # not yet parked before the first call fires
 
     cat = FakeCat()
     monkeypatch.setattr(app_mod, "catalog", cat)
@@ -3819,8 +3814,52 @@ def test_unit_app_flags_model_retired_recheck_cooldown(monkeypatch):
     exc = exec_mod.AllFailedError(
         UpstreamError(400, "This model is unavailable for free"), []
     )
+    # First call parks the model; an immediate second call is gated by the
+    # cooldown and MUST NOT call mark_unavailable again.
+    assert app_mod._flag_model_retired(exc, "muse-free") is True
+    assert cat.mark_calls == 1
     assert app_mod._flag_model_retired(exc, "muse-free") is False
-    assert cat.refresh_calls == 1
-    # Immediate second call -> cooldown skips the recheck entirely.
-    assert app_mod._flag_model_retired(exc, "muse-free") is False
-    assert cat.refresh_calls == 1
+    assert cat.mark_calls == 1
+
+
+def test_unit_a_retired_model_self_heal_holds_parked_within_probation(tmp_path, monkeypatch):
+    """The probation window keeps a runtime-retired model parked until
+    RETIRED_MODEL_PROBATION_S elapses, EVEN IF /models keeps advertising it
+    live throughout -- the chronic deepseek/musespark case ('still listed,
+    but the backend refuses chat'). Without probation the self-heal would
+    resurrect it on the very next refresh and the retirement would last
+    ~CATALOG_TTL. After probation elapses, a live non-stale re-list is allowed
+    to bring it back, so chronic offenders cycle parked -> retried -> re-parked
+    while a transient blip self-heals in PROBATION_S instead of the 7-day TTL
+    the old design locked out working models for."""
+    from core import config as core_config
+
+    FetchProvider, UnifiedCatalog = _fetch_provider_factory()
+
+    monkeypatch.setattr(core_config, "RETIRED_MODELS_FILE", tmp_path / "retired.json")
+    monkeypatch.setattr(core_config, "RETIRED_MODELS_SEED", "")
+    monkeypatch.setattr(core_config, "RETIRED_MODEL_TTL_DAYS", 7)
+    monkeypatch.setattr(core_config, "RETIRED_MODEL_PROBATION_S", 300.0)
+
+    prov = FetchProvider()
+    cat = UnifiedCatalog({"opencode": prov})
+
+    prov._ids = ["good-free", "dead-free"]
+    cat.refresh(force=True)
+    cat.mark_unavailable("dead-free")
+    assert cat.is_unavailable("dead-free") is True
+
+    # /models keeps advertising it; inside the probation window self-heal
+    # must NOT resurrect it -- otherwise the retirement lasts only one refresh.
+    prov._ids = ["good-free", "dead-free"]
+    cat.refresh(force=True)
+    assert "dead-free" not in [m.id for m in cat.free()]
+    assert cat.is_unavailable("dead-free") is True
+
+    # Push the parked timestamp past the probation window: now a live non-stale
+    # refresh is allowed to resurrect it.
+    cat._unavailable["dead-free"] = time.time() - 600.0
+    prov._ids = ["good-free", "dead-free"]
+    cat.refresh(force=True)
+    assert "dead-free" in [m.id for m in cat.free()]
+    assert cat.is_unavailable("dead-free") is False
