@@ -244,21 +244,31 @@ class UnifiedCatalog:
             self._per_provider = per_provider
             self._generated_at = time.time()
 
-            # Self-heal runtime retirements against the live free section. A
-            # -free model retired at runtime was absent from /models at retirement
-            # time; if a later refresh sees it back in the free section, OpenCode
-            # has not actually removed it -- the outage was transient upstream
-            # overload, exactly the case the auto-recycle must NOT lock out for
-            # the full TTL (7 days) just because it 400'd once. Reconcile only
-            # against authoritative (non-stale) provider fetches, so a fallback
-            # to the cached last-good list cannot resurrect an id the upstream
-            # genuinely stopped offering. Operator-seeded ids are left alone: the
-            # seed exists precisely because /models keeps advertising a model the
-            # operator knows is dead, so the live list is not authoritative for
-            # it.
+            # Self-heal runtime retirements against the live free section,
+            # gated by a probation window: a -free model retired at runtime
+            # 400'd "unavailable" while chat refused to serve it; the
+            # recycler parked it including the chronic case where /models
+            # keeps advertising it. Without probation the self-heal here
+            # would resurrect it on the NEXT refresh (~CATALOG_TTL) and the
+            # retirement would last seconds -- so the probation floor holds
+            # a chronic offender parked for RETIRED_MODEL_PROBATION_S, after
+            # which a live non-stale re-list is allowed to bring it back.
+            # That window is also what keeps a *transient* "unavailable"
+            # burst self-healable in minutes instead of the full TTL the old
+            # "trust /models" gate used to lock out working models for.
+            # Reconcile only against authoritative (non-stale) provider
+            # fetches, so a fallback to the cached last-good list cannot
+            # resurrect an id the upstream genuinely stopped offering.
+            # Operator-seeded ids are left alone: the seed exists precisely
+            # because /models keeps advertising a model the operator knows is
+            # dead, so the live list is not authoritative for it.
+            probation = config.RETIRED_MODEL_PROBATION_S
             reconciled = False
             for mid in list(self._unavailable):
                 if mid in self._seed_ids:
+                    continue
+                parked_at = self._unavailable.get(mid, now)
+                if probation > 0 and (now - parked_at) < probation:
                     continue
                 lm = logical.get(mid)
                 if lm is None:

@@ -12,7 +12,7 @@ You know free AI tiers. They work beautifully for twenty minutes, then a per-IP 
 
 It also:
 - auto-discovers whatever free models opencode is serving *right now* — no frozen model table, because any list would be wrong within a month;
-- retires models opencode quietly stopped serving (learned at runtime, persists across restarts, auto-revives if opencode puts them back);
+- retires models opencode quietly stopped serving at chat, even when `/models` keeps advertising them (the deepseek/musespark chronic case), persists across restarts, and self-heals under a probation clock when opencode actually restores the chat;
 - sends a real probe request through every WARP lane at startup and every few minutes, so dead/burned IPs get re-rolled before your request finds them;
 - runs a tiny non-stream sampler after each heal that pokes every free model through every green exit and records which ones came back **cooked** — yes, that's the technical term — so a model-side refusal fails fast instead of churning the whole pool, and the per-model fallback fires.
 
@@ -57,10 +57,10 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 Whatever's free right now — the catalog is fetched live from the upstream at runtime, so there's deliberately no model table here. The defaults currently in play (the sampler's sweep order) are `deepseek-v4-flash-free`, `muse-spark-1.2-contributor-free`, `nemotron-3-ultra-free`, `north-mini-code-free`, `big-pickle`, `longcat-2.0-free`, `laguna-s-2.1-free`; the router's own brain is `deepseek-v4-flash-free`, because it's free, fast, large-context, and text-only. If one of these vanishes, the catalog drops it on the next refresh and the request path fails over to another free model.
 
-A quirk worth knowing: opencode **still advertises some pulled free models in `/v1/models`** even after the CLI drops them — the list lies. Lingling trusts the live list anyway (you told it to), learns the truth at chat-time, and routes a request to a refused model onto a live one transparently. So "this model works" and "this model is listed" are not the same sentence, and that's by design.
+A quirk worth knowing: opencode **still advertises some pulled free models in `/v1/models`** even after the CLI drops them — the list lies. Lingling learns the truth at chat-time, retires a refused model regardless of the listing (see the recycler below), and routes the request onto a live one transparently. So "this model works" and "this model is listed" are not the same sentence, and that's by design.
 
 ### The recycler (retirement cycle)
-First request that comes back with the "unavailable for free" 400 retires the model — hidden from the dashboard picker, `/v1/models`, `/api/models`, and the Codex/Claude Code setup catalogs — for `LINGLING_RETIRED_MODEL_TTL_DAYS` (7 days by default), because opencode has restored free tiers before. A model that genuinely vanishes from `/models` falls out on the next refresh (≤ 10 min, or immediately on dashboard load). Operator-seeded dead ids (`LINGLING_RETIRED_MODELS`, default `ling-3.0-flash-free`) are hidden from the very first startup. The recycler trusts `/models`, and so should you.
+First request that comes back with the "unavailable for free" 400 retires the model — hidden from the dashboard picker, `/v1/models`, `/api/models`, and the Codex/Claude Code setup catalogs — **regardless of whether `/models` still advertises it** (the chronic case: list says free, chat says no). The model stays hidden for `LINGLING_RETIRED_MODEL_PROBATION_S` (5 minutes by default); after that the catalog self-heal can resurrect it on a live re-list, so a transient upstream blip self-heals in minutes, not the seven-day lockdown the old "trust `/models`" design used to lock out working models for. Chronic offenders — `/models` keeps advertising but chat keeps refusing — cycle parked → retried → re-parked once per probation window until opencode actually restores the chat. Operator-seeded dead ids (`LINGLING_RETIRED_MODELS`, default `ling-3.0-flash-free`) are hidden from the very first startup. The recycler trusts the 400, not the listing.
 
 ## The egress pool, a.k.a. the part that sounds illegal
 
@@ -118,7 +118,8 @@ All `LINGLING_*` environment variables, all read once at startup, all with defau
 | variable | default | what it does |
 |---|---|---|
 | `LINGLING_RETIRED_MODELS` | `ling-3.0-flash-free` | known-dead ids hidden from the catalog from the very first startup (opencode keeps advertising them) |
-| `LINGLING_RETIRED_MODEL_TTL_DAYS` | `7` | how long a runtime-learned retirement lasts before the model is retried |
+| `LINGLING_RETIRED_MODEL_PROBATION_S` | `300` | how long a runtime-retired model stays hidden before the catalog self-heal can resurrect it on a live `/models` re-list; a chronic offender (still listed but chat refuses) cycles parked → retried → re-parked every window |
+| `LINGLING_RETIRED_MODEL_TTL_DAYS` | `7` | upper-bound age cap — a retired entry older than this is dropped on a fresh gateway start; probation re-parks reset the timer, so a chronic offender cycling on probation never ages out |
 
 **Sampler + streaming**
 
