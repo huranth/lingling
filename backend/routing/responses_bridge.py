@@ -12,6 +12,7 @@ import json
 import time
 from json import JSONDecodeError
 from typing import Any, Dict, Generator, List, Optional
+from routing.stream_guard import RESET_KEY
 
 
 def _content_from_parts(parts: Any) -> Any:
@@ -297,6 +298,69 @@ def stream_events(
     next_index = 0
     broke: Optional[str] = None
 
+    def _emit_in_flight_done():
+        """Flush in-flight reasoning + text items as ``incomplete`` before a retry.
+
+        Called on a mid-flight retry marker from guarded_stream (the chat
+        path's ``lingling_reset``); the chat client honours the marker and
+        discards what it rendered, but the Responses wire has no equivalent,
+        so emit ``.done`` events for whatever is in flight (with status
+        ``incomplete``) and clear their slots. The retry's deltas then open
+        fresh ``response.output_item.added`` events with the next
+        output_index -- so the Responses consumer sees a cleanly-discarded
+        partial followed by the retry, not the two attempts concatenated into
+        one item. In-flight tool calls are left to the end-of-stream
+        close-out (call arguments mid-call rarely break this way; trying to
+        split the arguments across retry attempts would do more harm than the
+        concat). The partial is NOT appended to the final summary ``output``
+        -- it is a discarded attempt, not part of the answer.
+        """
+        # ``nonlocal`` declares the names we *write* here. The two ``*_index``
+        # slots are read-only in this helper: the ``.done`` event emits the
+        # partial's own output_index, and on retry the chunk handler reserves
+        # a fresh one via next_index.
+        nonlocal reasoning_item_id, reasoning_parts
+        nonlocal text_item_id, text_parts
+        if reasoning_item_id is not None:
+            think = "".join(reasoning_parts)
+            item = {
+                "id": reasoning_item_id, "type": "reasoning",
+                "status": "incomplete",
+                "summary": [{"type": "summary_text", "text": think}],
+            }
+            yield sse("response.reasoning_summary_text.done", {
+                "type": "response.reasoning_summary_text.done",
+                "item_id": reasoning_item_id, "output_index": reasoning_index,
+                "summary_index": 0, "text": think,
+            })
+            yield sse("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": reasoning_index, "item": item,
+            })
+            reasoning_item_id = None
+            reasoning_parts = []
+        if text_item_id is not None:
+            text = "".join(text_parts)
+            item = {
+                "id": text_item_id, "type": "message", "role": "assistant",
+                "status": "incomplete",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+            yield sse("response.output_text.done", {
+                "type": "response.output_text.done", "item_id": text_item_id,
+                "output_index": text_index, "content_index": 0, "text": text,
+            })
+            yield sse("response.content_part.done", {
+                "type": "response.content_part.done", "item_id": text_item_id,
+                "output_index": text_index, "content_index": 0, "part": item["content"][0],
+            })
+            yield sse("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": text_index, "item": item,
+            })
+            text_item_id = None
+            text_parts = []
+
     try:
         for raw in chat_stream:
             line = raw if isinstance(raw, bytes) else raw.encode("utf-8")
@@ -311,6 +375,14 @@ def stream_events(
                 continue
             if isinstance(obj.get("usage"), dict):
                 usage = _usage(obj["usage"])
+            # Mid-flight retry marker from guarded_stream: the upstream stream
+            # broke mid-answer and was reopened on a fresh exit IP (and maybe a
+            # different model). Flush any in-flight partial as ``incomplete`` so
+            # the retry's deltas re-open fresh output_items -- without this the
+            # two attempts concatenate into one message.
+            if isinstance(obj.get(RESET_KEY), dict):
+                yield from _emit_in_flight_done()
+                continue
             for choice in obj.get("choices") or []:
                 delta = choice.get("delta") or {}
                 think = _delta_reasoning(delta)
@@ -469,19 +541,32 @@ def stream_events(
         })
     status = "completed" if finished else "incomplete"
     if outcome is not None:
-        outcome.completed = finished
-        outcome.error = broke
+        # When the chat source is guarded_stream (the chat/responses paths) it
+        # has its own completion tracking that catches OpenCode's no-[DONE]
+        # wire: a usage/cost frame flips outcome.completed (this bridge's
+        # choice-level finish_reason check misses it), and any unrecoverable
+        # error is recorded there too (guarded swallows the transport
+        # exception rather than letting it raise here, so the bridge's own
+        # ``broke`` is None on a recovered/retried break). Don't clobber the
+        # smarter verdict: a True completion stays True once set, and an error
+        # already surfaced stays surfaced.
+        outcome.completed = outcome.completed or finished
+        if outcome.error is None:
+            outcome.error = broke
     final = dict(
         resp,
         status=status,
         output=output,
         usage=usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     )
-    if broke:
-        # Surfaced so a client (and the dashboard's ledger) can tell a truncated
-        # answer from a complete one. There is no Responses equivalent of the
-        # chat path's `lingling_reset`, so this reports rather than retries.
-        final["incomplete_details"] = {"reason": broke[:200]}
+    # Surfaced so a client (and the dashboard's ledger) can tell a truncated
+    # answer from a complete one. guarded_stream has already retried once if it
+    # could on the wrapped paths; this is a record, not a retry. The bridge's
+    # own transport error wins when present (passthrough paths), and falls back
+    # to the guard's recorded error otherwise.
+    surfaced_error = broke or (outcome.error if outcome is not None else None)
+    if surfaced_error:
+        final["incomplete_details"] = {"reason": surfaced_error[:200]}
     yield sse("response.completed", {
         "type": "response.completed",
         "response": final,

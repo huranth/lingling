@@ -3898,3 +3898,136 @@ def test_unit_a_runtime_retirement_expires_via_ttl_on_reload(tmp_path, monkeypat
     cat2.refresh(force=True)
     assert "dead-free" in [m.id for m in cat2.free()]
     assert cat2.is_unavailable("dead-free") is False
+
+
+def test_unit_responses_bridge_flushes_in_flight_on_reset_marker():
+    """A ``lingling_reset`` chunk flushes in-flight items as ``incomplete``.
+
+    The chat path retries a broken stream by reopening on a fresh exit IP and
+    emitting a ``lingling_reset`` chat SSE frame telling the client to discard
+    the partial. The Responses wire has no equivalent, so the bridge closes
+    any in-flight reasoning/text item with status ``incomplete`` and lets the
+    retry's deltas open a fresh ``output_item`` at the next output_index.
+    Without this flush the two attempts concatenate into one message whose
+    text is "partial" + "retry" with status ``completed`` -- a silently
+    corrupt answer. See ``routing/responses_bridge._emit_in_flight_done``.
+    """
+    from routing import responses_bridge
+    from routing.stream_guard import RESET_KEY
+
+    # The exact retry marker ``stream_guard.reset_frame`` would produce.
+    reset_frame = (
+        b'data: {"' + RESET_KEY.encode()
+        + b'":{"reason":"tunnel died","attempt":2},"choices":[]}'
+    )
+    chat = iter([
+        # First attempt: a tiny content delta, then it breaks mid-flight.
+        b'data: {"choices":[{"delta":{"content":"partial"}}]}',
+        # ``guarded_stream`` emits this marker when it reopens upstream.
+        reset_frame,
+        # Retry: a fresh content delta, finish_reason, [DONE].
+        b'data: {"choices":[{"delta":{"content":"retry answer"}}]}',
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        b"data: [DONE]",
+    ])
+    body = b"".join(responses_bridge.stream_events(chat, "m")).decode()
+
+    # Two ``output_item.added`` events: the partial at index 0, retry at 1.
+    added = [
+        int(part.split('"output_index":')[1].split(",")[0])
+        for part in body.split("\n\n") if "response.output_item.added" in part
+    ]
+    assert added == [0, 1], added
+    # The partial must close out as ``incomplete`` BEFORE the retry renders
+    # anything; the first completed status belongs to the retry (or to the
+    # final ``response.completed`` event).
+    assert body.index('"status":"incomplete"') < body.index('"status":"completed"'), body
+    assert body.index('"status":"incomplete"') < body.index('"text":"retry answer"'), body
+    # Both halves survived the wire with their own text -- never concatenated
+    # into one ``output_item``.
+    assert '"text":"partial"' in body, body
+    assert '"text":"retry answer"' in body, body
+    # The bridge emitted a clean terminal event with the retry's summary status.
+    assert '"status":"completed"' in body, body
+
+
+def test_live_responses_stream_retries_on_a_fresh_exit_ip():
+    """The ``/v1/responses`` streaming path retries a broken stream once.
+
+    Mirrors the chat path's mid-flight recovery contract: a stream that dies
+    after HTTP 200 is reopened on a fresh exit IP via the executor, with the
+    bridge translating the chat path's ``lingling_reset`` marker into the
+    Responses wire by closing the partial as ``incomplete`` and opening a
+    fresh ``output_item`` for the retry. Before this was wired, the responses
+    path had no retry -- a stream that broke was terminal ``stream_broken``
+    while the chat path recovered its (the dashboard counted 80 broken
+    muse-spark turns in one hour on ``/v1/responses``, ~51% break rate).
+
+    Picks the model from the live catalog (see ``_live_free_ids``): OpenCode
+    retires free models without notice, and a stale hardcoded id makes the
+    suite fail against a model nobody serves any more (the chat-path mirror
+    ``test_unit_an_explicit_model_is_never_swapped_mid_stream`` still
+    hardcodes ``deepseek-v4-flash-free`` and is now red on that drift).
+    """
+    import app as app_mod
+
+    ids = _live_free_ids()
+    assert ids, "expected at least one live free model"
+    mid = config.DISPATCHER_MODEL if config.DISPATCHER_MODEL in ids else sorted(ids)[0]
+
+    seen = []
+
+    def fake_execute_stream(messages, model_id, providers, **kwargs):
+        seen.append(model_id)
+        def gen():
+            if len(seen) == 1:
+                # First attempt: emit a partial answer, then break mid-stream.
+                yield b'data: {"choices":[{"delta":{"content":"partial"}}]}'
+                raise RuntimeError("tunnel died mid-answer")
+            # Retry: a fresh, complete answer -- the bridge's close-out text is
+            # this verbatim, which only holds when the retry does not re-emit the
+            # partial the first attempt was cut short on (the chat-path mirror
+            # test happens to escape this by asserting on ``reset.model`` not text).
+            yield b'data: {"choices":[{"delta":{"content":"retry"},"finish_reason":"stop"}]}'
+        class _P:
+            id = "opencode"
+        return gen(), _P(), None, []
+
+    original = app_mod.executor.execute_stream
+    app_mod.executor.execute_stream = fake_execute_stream
+    try:
+        # The module-level client, not a fresh ``with TestClient(...)``:
+        # entering one runs the lifespan hook that registers WARP identities.
+        r = client.post("/v1/responses", json={
+            "model": mid,
+            "input": "Refactor this component",
+            "stream": True,
+        })
+        assert r.status_code == 200, r.status_code
+        body = b"".join(r.iter_bytes()).decode("utf-8")
+
+        # Exactly one mid-flight retry on a fresh exit IP. The same model: the
+        # request named it (not lingling-auto), so rerouting does not apply.
+        assert len(seen) == 2, f"expected exactly one retry, got {seen}"
+        assert seen == [mid, mid], seen
+        # ``guarded_stream`` wrote a ``lingling_reset`` chat SSE frame; the bridge
+        # consumes it rather than echoing -- on the Responses wire there is no
+        # such field, so the marker must NOT appear downstream. Its presence
+        # upstream is verified by the flush it triggered (the ``incomplete``
+        # close-out below) and the fresh ``output_item.added`` slot the retry
+        # opened afterwards.
+        assert "lingling_reset" not in body, body[:600]
+        assert '"status":"incomplete"' in body, body[:600]
+        assert body.index('"status":"incomplete"') < body.index('"status":"completed"'), body
+        # The two halves survived on separate output_item slots; the partial
+        # closed at output_index 0 and the retry reopened fresh at 1.
+        added = [
+            int(part.split('"output_index":')[1].split(",")[0])
+            for part in body.split("\n\n") if "response.output_item.added" in part
+        ]
+        assert added == [0, 1], added
+        # Each half has its own text on the wire (never concatenated).
+        assert '"text":"partial"' in body, body
+        assert '"text":"retry"' in body, body
+    finally:
+        app_mod.executor.execute_stream = original

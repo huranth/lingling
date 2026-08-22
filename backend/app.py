@@ -1904,6 +1904,14 @@ async def responses(request: Request):
 
     # Hidden-reasoning models get a longer silent-thinking patience; see chat.
     stream_idle_budget, stream_read_to = _stream_pacing(target, body)
+    # Same recovery contract as the chat path: a stream that breaks after
+    # HTTP 200 is retried once on a fresh exit IP. Opt-out per request with
+    # `lingling_recover: false` or via LINGLING_STREAM_RECOVERY. Without it, a
+    # break here was terminal `stream_broken` (the dashboard counted 80 lost
+    # muse-spark turns in one hour on this path while the chat path recovered
+    # its 2 -- the bridge literally commented "There is no Responses equivalent
+    # of the chat path's lingling_reset, so this reports rather than retries").
+    recover = bool(body.get("lingling_recover", config.STREAM_RECOVERY))
     started = time.time()
     try:
         stream_iter, prov, key, attempts = await _execute_with_egress_wait(
@@ -1931,42 +1939,145 @@ async def responses(request: Request):
         requested, target, prov.id, (time.time() - request_started) * 1000.0, len(attempts),
     )
 
+    # Mid-flight recovery may land on a different model, but only when the
+    # client asked the router to choose -- mirrors the chat handler's _reopen. A
+    # turn that named `muse-spark-1.2-contributor-free` is retried on the same
+    # model; `lingling-auto` is free to re-decide, which matters because the
+    # usual reason a stream dies mid-flight is the model itself stalling.
+    auto_routed = requested == config.MULTIMODEL_ID
+    reroute = {"model": target, "reason": reason, "by": routed_by}
+
+    def _reopen():
+        """Open a replacement upstream stream for mid-flight recovery.
+
+        Mirrors the chat handler's `_reopen`: a fresh exit IP through the
+        executor, a re-decided model only when the turn was auto-routed, and
+        effort re-resolved against the client's original label. The retry yields
+        chat-completions SSE -- the bridge translates it to Responses events the
+        same way it does for the original stream.
+        """
+        retry_model = target
+        retry_params = params
+        if auto_routed:
+            alternative = dispatcher.fallback_model(
+                catalog, had_images,
+                exclude={target} | set(sampler.cooked_models()), messages=messages,
+            )
+            alt_providers = catalog.providers_for(alternative)
+            if alternative and alternative != target and alt_providers:
+                retry_model = alternative
+                retry_params = dict(params)
+                _resolve_effort(retry_params, retry_model, previous=original_effort)
+                reroute.update({
+                    "model": retry_model,
+                    "reason": f"stream broke on {target}; rerouted to {retry_model}",
+                    "by": "reroute",
+                })
+                log.warning(
+                    "responses stream rerouting mid-flight: %s -> %s", target, retry_model,
+                )
+        providers_for_retry = catalog.providers_for(retry_model) or target_providers
+        # A text-only retry target cannot see images the stalled vision model
+        # could; swap them for the placeholder the non-streaming fallback uses,
+        # or OpenCode answers 400 and the retry is wasted.
+        retry_messages = _messages_for_model(messages, retry_model, had_images)
+        # The retry may land on a different model: re-derive its thinking
+        # patience so a reroute off a hidden-reasoning model does not carry the
+        # long budget onto a normal one (and vice versa).
+        retry_idle_budget, retry_read_to = _stream_pacing(retry_model, body)
+        again, _prov, _key, _attempts = executor.execute_stream(
+            retry_messages, retry_model, providers_for_retry,
+            proxy_pool=proxy_pool, session_id=session_id, timeout=retry_read_to,
+            **retry_params
+        )
+        return stream_idle.with_idle_timeout(again, retry_idle_budget, log)
+
+    def _hold_for_egress():
+        """Wait for a free exit before the mid-stream retry reopens (responses).
+
+        Same decision as the chat path's pre-first-token wait, but running inside
+        a live SSE response, so it emits keepalive comments rather than awaiting
+        silently. Yields nothing when waiting cannot help.
+        """
+        yield from parking.hold_stream_for_egress(
+            proxy_pool, config.EGRESS_WAIT_BUDGET, log,
+        )
+
     def event_stream():
         seen: Dict[str, int] = {}
-        # The bridge reports whether the upstream ever said finish_reason. A
-        # stream that dies mid-flight would otherwise stay filed as ok_stream,
-        # which is exactly the silent-truncation case stream_guard exists to
-        # surface on the chat path.
+        # stream_guard retries once on a fresh exit IP when the upstream dies
+        # mid-flight, and keeps completion honest for OpenCode's no-[DONE] wire:
+        # a usage/cost frame flips outcome.completed (the bridge's choice-level
+        # finish_reason check misses it), so a fully-successful turn that simply
+        # omitted finish_reason is no longer filed stream_broken. The bridge
+        # reports the outcome, so a recovered break is filed as ok_recovered and
+        # an unrecoverable one as stream_broken -- no more silent ok_stream on a
+        # turn the editor rendered half of.
         outcome = stream_guard.StreamOutcome()
         try:
-            def tracked():
-                # Idle watchdog first: an upstream that stops speaking without
-                # closing would otherwise hold the turn open indefinitely.
-                # StreamStalled is caught by stream_events and ends the turn
-                # honestly rather than propagating into a broken SSE response.
-                # The budget is model-aware so a hidden-reasoning model that
-                # thinks silently is not cut off mid-thought (see _stream_pacing).
-                guarded = stream_idle.with_idle_timeout(
-                    stream_iter, stream_idle_budget, log)
-                for raw in guarded:
-                    _harvest_stream_usage(raw if isinstance(raw, bytes) else raw.encode("utf-8"), seen)
-                    yield raw
-            yield from responses_bridge.stream_events(tracked(), requested, outcome)
+            yield from responses_bridge.stream_events(
+                stream_guard.guarded_stream(
+                    open_stream=_reopen,
+                    # Idle watchdog first: an upstream that stops speaking
+                    # without closing would otherwise hold the turn open
+                    # indefinitely. StreamStalled is treated by guarded_stream
+                    # as a mid-flight death and retried once on a fresh exit IP.
+                    # The budget is model-aware so a hidden-reasoning model
+                    # (muse-spark) is not cut off mid-thought (see _stream_pacing).
+                    first=stream_idle.with_idle_timeout(
+                        stream_iter, stream_idle_budget, log),
+                    outcome=outcome,
+                    on_chunk=lambda raw: _harvest_stream_usage(raw, seen),
+                    log=log,
+                    enabled=recover,
+                    hold=_hold_for_egress,
+                    # The model the retry actually landed on, so the bridge's
+                    # reset path (and the ledger) can name it; None when the
+                    # retry did not move (same model, fresh exit IP).
+                    retry_model=lambda: (
+                        reroute["model"] if reroute["model"] != target else None
+                    ),
+                    # The resolved target so pacing_memory can learn a
+                    # hidden-reasoning model from its wire behaviour (a chunk
+                    # that carries reasoning tokens, or a stall before any
+                    # visible content) and give it thinking patience next turn.
+                    model_id=target,
+                ),
+                requested,
+                outcome,
+            )
         finally:
             if outcome.error:
                 log.warning(
                     "responses stream broke target=%s provider=%s - %s",
                     target, prov.id, outcome.error,
                 )
+            if outcome.recovered:
+                status = "ok_recovered"
+            elif outcome.error:
+                status = "stream_broken"
+            else:
+                status = None  # keep ok_stream
             usage_store.finalize(
                 row_id,
                 tokens_in=seen.get("tokens_in", 0),
                 tokens_out=seen.get("tokens_out", 0),
                 reasoning_tokens=seen.get("reasoning_tokens", 0),
                 latency_ms=(time.time() - started) * 1000.0,
-                status=None if outcome.completed else "stream_broken",
+                status=status,
                 error=outcome.error,
+                # A mid-flight reroute means the answer came from a different
+                # model than the row was opened with. Recording the original
+                # would make the ledger name a model that produced nothing.
+                routed_model=reroute["model"] if reroute["model"] != target else None,
+                routed_by=reroute["by"] if reroute["model"] != target else None,
+                reason=reroute["reason"] if reroute["model"] != target else None,
             )
+            if outcome.recovered:
+                log.info(
+                    "responses: recovered target=%s attempts=%d",
+                    reroute["model"], outcome.attempts,
+                )
 
     return StreamingResponse(
         event_stream(),
@@ -1979,6 +2090,10 @@ async def responses(request: Request):
             "X-Lingling-Reason": _header_safe(reason),
             "X-Lingling-Provider": _header_safe(prov.id),
             "X-Lingling-Account": _header_safe(account_id or ""),
+            # Mirrors the chat path: tells a client (and the dashboard) whether
+            # mid-flight retry is opt-out for this turn (lingling_recover /
+            # STREAM_RECOVERY) or this is a passthrough.
+            "X-Lingling-Stream-Mode": "guarded" if recover else "passthrough",
         },
     )
 
