@@ -468,6 +468,27 @@ def _header_safe(value: str) -> str:
     return value.encode("latin-1", "replace").decode("latin-1")
 
 
+def _failure_provenance_headers(
+    target: str, routed_by: str, reason: str,
+) -> Dict[str, str]:
+    """The X-Lingling-Routed-* provenance a success carries, for an exhausted 503.
+
+    An operator already sees ``X-Lingling-Routed-Model``/``By``/``Reason`` on a
+    successful response; a failure used to drop them, so debugging the "429
+    prison" meant crossing into the log to reconstruct which model was attempted
+    and who chose it. The three keys that don't depend on a winning provider are
+    surfaced here too -- target (which model was tried) and its routing story.
+    Provider/Account are omitted: every provider was tried and refused (or none
+    projected for the model), so a single value would mislead. ``HTTPException``
+    accepts a ``headers=`` dict and Starlette merges it into the 503 response.
+    """
+    return {
+        "X-Lingling-Routed-Model": _header_safe(target),
+        "X-Lingling-Routed-By": _header_safe(routed_by),
+        "X-Lingling-Reason": _header_safe(reason),
+    }
+
+
 def _harvest_stream_usage(raw: bytes, into: Dict[str, int]) -> None:
     """Read token counts off an SSE line without altering the byte stream.
 
@@ -1554,7 +1575,10 @@ async def chat_completions(request: Request):
 
     target_providers = catalog.providers_for(target)
     if not target_providers:
-        raise HTTPException(503, f"No provider available for model '{target}'.")
+        raise HTTPException(
+            503, f"No provider available for model '{target}'.",
+            headers=_failure_provenance_headers(target, routed_by, reason),
+        )
 
     target_lm = catalog.by_id(target)
     if target_lm is not None and not target_lm.vision:
@@ -1614,13 +1638,19 @@ async def chat_completions(request: Request):
                         had_images=had_images,
                         error=str(getattr(fallback_exc, "last_error", fallback_exc))[:300],
                     )
-                    raise HTTPException(503, f"All providers exhausted for '{target}'.")
+                    raise HTTPException(
+                        503, f"All providers exhausted for '{target}'.",
+                        headers=_failure_provenance_headers(target, routed_by, reason),
+                    )
             else:
                 usage_store.log(
                     requested, target, routed_by, reason, status="exhausted",
                     had_images=had_images, error=str(exc.last_error)[:300],
                 )
-                raise HTTPException(503, f"All providers exhausted for '{target}'.")
+                raise HTTPException(
+                    503, f"All providers exhausted for '{target}'.",
+                    headers=_failure_provenance_headers(target, routed_by, reason),
+                )
 
         latency = (time.time() - started) * 1000.0
         usage = extract_usage(resp)
@@ -1701,6 +1731,7 @@ async def chat_completions(request: Request):
                 503,
                 f"No upstream stream started within {stream_read_to:g}s for '{target}' "
                 f"(last upstream status {last_status}).",
+                headers=_failure_provenance_headers(target, routed_by, reason),
             )
         log.warning(
             "chat stream rerouting %s -> %s (primary exhausted, last_status=%s)",
@@ -1740,6 +1771,7 @@ async def chat_completions(request: Request):
                 f"All providers exhausted for '{target}' "
                 f"(primary last status {last_status}; fallback {fallback} last "
                 f"status {fb_last_status}).",
+                headers=_failure_provenance_headers(target, routed_by, reason),
             )
         # The fallback opened cleanly -- rebind routing metadata the rest of the
         # handler streams against (the row opened below, `_reopen`, the idle
@@ -1971,7 +2003,10 @@ async def responses(request: Request):
 
     target_providers = catalog.providers_for(target)
     if not target_providers:
-        raise HTTPException(503, f"No provider available for model '{target}'.")
+        raise HTTPException(
+            503, f"No provider available for model '{target}'.",
+            headers=_failure_provenance_headers(target, routed_by, reason),
+        )
     target_lm = catalog.by_id(target)
     if target_lm is not None and not target_lm.vision:
         messages = vision_bridge.strip_images_for_text_model(messages)
@@ -2004,7 +2039,10 @@ async def responses(request: Request):
                     requested, target, routed_by, reason, status="exhausted",
                     had_images=had_images, error=str(exc.last_error)[:300],
                 )
-                raise HTTPException(503, f"All providers exhausted for '{target}'.")
+                raise HTTPException(
+                    503, f"All providers exhausted for '{target}'.",
+                    headers=_failure_provenance_headers(target, routed_by, reason),
+                )
             try:
                 retry_params = dict(params)
                 _resolve_effort(retry_params, fallback, previous=original_effort)
@@ -2020,7 +2058,10 @@ async def responses(request: Request):
                     had_images=had_images,
                     error=str(getattr(fallback_exc, "last_error", fallback_exc))[:300],
                 )
-                raise HTTPException(503, f"All providers exhausted for '{target}'.")
+                raise HTTPException(
+                    503, f"All providers exhausted for '{target}'.",
+                    headers=_failure_provenance_headers(target, routed_by, reason),
+                )
             attempts = exc.attempts + attempts2
             target = fallback
             reason = f"primary model failed ({exc.last_error}); fell back to {fallback}"
@@ -2104,6 +2145,7 @@ async def responses(request: Request):
                 503,
                 f"No upstream stream started within {stream_read_to:g}s for '{target}' "
                 f"(last upstream status {last_status}).",
+                headers=_failure_provenance_headers(target, routed_by, reason),
             )
         log.warning(
             "responses stream rerouting %s -> %s (primary exhausted, last_status=%s)",
@@ -2143,6 +2185,7 @@ async def responses(request: Request):
                 f"All providers exhausted for '{target}' "
                 f"(primary last status {last_status}; fallback {fallback} last "
                 f"status {fb_last_status}).",
+                headers=_failure_provenance_headers(target, routed_by, reason),
             )
         # The fallback opened cleanly -- rebind routing metadata the rest of the
         # handler streams against (its own headers, ledger, _reopen, watchdog
@@ -2378,7 +2421,10 @@ async def messages(request: Request):
 
     target_providers = catalog.providers_for(target)
     if not target_providers:
-        raise HTTPException(503, f"No provider available for model '{target}'.")
+        raise HTTPException(
+            503, f"No provider available for model '{target}'.",
+            headers=_failure_provenance_headers(target, routed_by, reason),
+        )
 
     target_lm = catalog.by_id(target)
     if target_lm is not None and not target_lm.vision:
@@ -2411,7 +2457,10 @@ async def messages(request: Request):
                     requested, target, routed_by, reason, status="exhausted",
                     had_images=had_images, error=str(exc.last_error)[:300],
                 )
-                raise HTTPException(503, f"All providers exhausted for '{target}'.")
+                raise HTTPException(
+                    503, f"All providers exhausted for '{target}'.",
+                    headers=_failure_provenance_headers(target, routed_by, reason),
+                )
             try:
                 retry_params = dict(params)
                 _resolve_effort(retry_params, fallback, previous=original_effort)
@@ -2430,7 +2479,10 @@ async def messages(request: Request):
                     had_images=had_images,
                     error=str(getattr(fallback_exc, "last_error", fallback_exc))[:300],
                 )
-                raise HTTPException(503, f"All providers exhausted for '{target}'.")
+                raise HTTPException(
+                    503, f"All providers exhausted for '{target}'.",
+                    headers=_failure_provenance_headers(target, routed_by, reason),
+                )
 
         account_id = key.id if key is not None else None
         usage = extract_usage(resp)
@@ -2496,6 +2548,7 @@ async def messages(request: Request):
                 503,
                 f"No upstream stream started within {stream_read_to:g}s for '{target}' "
                 f"(last upstream status {last_status}).",
+                headers=_failure_provenance_headers(target, routed_by, reason),
             )
         log.warning(
             "messages stream rerouting %s -> %s (primary exhausted, last_status=%s)",
@@ -2535,6 +2588,7 @@ async def messages(request: Request):
                 f"All providers exhausted for '{target}' "
                 f"(primary last status {last_status}; fallback {fallback} last "
                 f"status {fb_last_status}).",
+                headers=_failure_provenance_headers(target, routed_by, reason),
             )
         # The fallback opened cleanly -- rebind the routing metadata the rest of
         # the handler streams against (the row opened below, the SSE headers and

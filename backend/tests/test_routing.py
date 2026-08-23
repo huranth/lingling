@@ -1904,6 +1904,55 @@ def test_unit_stream_headers_survive_nonlatin1_reason():
         pass
 
 
+def test_unit_exhausted_503_carries_provenance_headers():
+    """An exhausted-503 now carries the same X-Lingling-Routed-* a success does.
+
+    Before this, a 503 dropped provenance, so an operator chasing the "429
+    prison" had to read the ledger to learn which model was tried and who chose
+    it. The handler now attaches the routing story to the 503 too (model/by/
+    reason -- no provider/account, since every provider refused or none was
+    available), so a curl -i on the failure surfaces it the way a 200 already
+    does on every success path (chat, responses and messages).
+    """
+    import app as app_mod
+
+    ids = sorted({m.id for m in app_mod.catalog.free()})
+    assert len(ids) >= 1, "expected at least one routable free model"
+    primary = ids[0]
+
+    def exhaust(messages, model_id, providers, **kwargs):
+        # A non-retryable 400 propagates from the egress-wait wrapper without
+        # parking (nothing to cool, nothing to wait for), so the handler reaches
+        # its AllFailedError branch at once rather than after the wait budget.
+        raise executor.AllFailedError(UpstreamError(400, "bad shape", "opencode"), [])
+
+    orig_exec = app_mod.executor.execute_nonstream
+    # No fallback: the handler's else-branch raises the single-model 503, so the
+    # assertion targets the primary's prelude routing story (user / "user
+    # requested") rather than a fallback that never happened.
+    orig_fb = app_mod.dispatcher.fallback_model
+    app_mod.executor.execute_nonstream = exhaust
+    app_mod.dispatcher.fallback_model = (
+        lambda catalog, has_images, exclude=None, messages=None: None
+    )
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": primary,
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+        })
+        assert r.status_code == 503, r.text
+        assert r.headers["X-Lingling-Routed-Model"] == primary, (
+            r.headers.get("X-Lingling-Routed-Model"))
+        assert r.headers["X-Lingling-Routed-By"] == "user", (
+            r.headers.get("X-Lingling-Routed-By"))
+        assert r.headers["X-Lingling-Reason"] == "user requested", (
+            r.headers.get("X-Lingling-Reason"))
+    finally:
+        app_mod.executor.execute_nonstream = orig_exec
+        app_mod.dispatcher.fallback_model = orig_fb
+
+
 def test_unit_catalog_serves_last_good_list_through_a_fetch_failure():
     """A transient /models outage must not empty the catalog.
 
