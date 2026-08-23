@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 
 # Isolated data dir: these tests must never touch the real ledger or key store.
@@ -70,8 +71,13 @@ except ImportError:      # running the file directly, without pytest
     pass
 
 
-class SkipTest(Exception):
-    """Raised by a test to mark itself skipped."""
+class SkipTest(unittest.SkipTest):
+    """Raised by a test to mark itself skipped.
+
+    Subclasses ``unittest.SkipTest`` so pytest reports the test as ``skipped``
+    natively (rather than as an error) while the script runner's
+    ``except SkipTest`` still catches it.
+    """
 
 
 class _QuietLog:
