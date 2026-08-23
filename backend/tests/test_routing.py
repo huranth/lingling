@@ -3661,6 +3661,74 @@ def test_unit_per_reason_cooldown_parks_blocked_exits_longer_than_transient():
     assert not after.in_cooldown()
 
 
+def test_unit_cooldown_transitions_are_logged():
+    """Each cooldown transition emits a greppable log line.
+
+    The three transitions an operator tails to debug the "429 prison" and a
+    slow-to-heal lane -- park (mark_failure on a retryable status), extend
+    (extend_cooldown, the upstream-Retry-After + probe-verdict path) and heal
+    (mark_success of a previously-parked lane) -- each log under the
+    ``providers.proxy_pool`` logger. A non-retryable status cools nothing and
+    stays silent, and a steady-state success (nothing was parked) does not
+    re-heal-log, so the log names only real state changes.
+    """
+    import logging
+    from providers.proxy_pool import ProxyPool
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records: list[str] = []
+
+        def emit(self, rec):
+            self.records.append(rec.getMessage())
+
+    handler = _Capture()
+    pl = logging.getLogger("providers.proxy_pool")
+    pl.addHandler(handler)
+    prev_level, prev_prop = pl.level, pl.propagate
+    pl.setLevel(logging.INFO)
+    pl.propagate = False
+    try:
+        pool = ProxyPool.from_list([{"id": "warp-1", "url": "socks5://127.0.0.1:51001"}])
+        px = pool.get_by_id("warp-1")
+
+        # A non-retryable status cools nothing and logs nothing.
+        pool.mark_failure(px, 404)
+        assert handler.records == [], handler.records
+
+        # Park: a 429 logs the blocked park with the status and the streak.
+        pool.mark_failure(px, 429)
+        assert any(
+            "warp-1" in m and "parked" in m and "429" in m and "blocked" in m
+            for m in handler.records
+        ), handler.records
+
+        # Extend (the Retry-After / probe-verdict path) logs the extension and
+        # the remaining park.
+        pool.extend_cooldown(px, 30.0)
+        assert any(
+            "warp-1" in m and "extended" in m for m in handler.records
+        ), handler.records
+
+        # Heal: a success of a parked lane logs the recovery.
+        pool.mark_success(px)
+        assert any(
+            "warp-1" in m and "healed" in m for m in handler.records
+        ), handler.records
+
+        # A follow-up success on the now-clean lane must not re-log a heal.
+        healed = [m for m in handler.records if "healed" in m]
+        pool.mark_success(px)
+        assert [m for m in handler.records if "healed" in m] == healed, (
+            "a steady-state success must not re-log a heal"
+        )
+    finally:
+        pl.removeHandler(handler)
+        pl.setLevel(prev_level)
+        pl.propagate = prev_prop
+
+
 def test_unit_pick_keeps_per_ip_balance_on_an_idle_pool():
     """The tie-break deliberately does NOT alternate egress families on a tied
     (idle) pool. A flat cursor gives every proxy an equal turn -- per-IP

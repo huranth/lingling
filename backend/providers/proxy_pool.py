@@ -16,12 +16,15 @@ Selection is *proactive* load balancing:
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from core import config
+
+log = logging.getLogger(__name__)
 
 # Half-life (seconds) for the rolling load window. A request counts for ~half
 # its weight after this long. Two minutes = "load over the last few minutes"
@@ -460,12 +463,19 @@ class ProxyPool:
     # -- feedback ----------------------------------------------------------
     def mark_success(self, proxy: Proxy) -> None:
         with self._lock:
+            # The half-open -> closed transition: a parked lane (a real request
+            # 429'd, or a probe verdict gated it) just served a real call, so it
+            # is back in rotation. Log only the recovery -- mark_success runs on
+            # the hot path and a steady-state success never parked anything.
+            was_parked = proxy.consecutive_failures > 0 or proxy.cooldown_until > 0.0
             proxy.consecutive_failures = 0
             proxy.cooldown_until = 0.0
             proxy.total_requests += 1
             now = time.time()
             proxy.window_load = proxy.decayed_load(now) + 1.0
             proxy.last_used_ts = now
+            if was_parked:
+                log.info("pool: %-16s healed -- back in rotation", proxy.id)
 
     def mark_failure(self, proxy: Proxy, status_code: int) -> float:
         """Apply cooldown backoff for rate-limit / auth / server failures.
@@ -518,6 +528,11 @@ class ProxyPool:
             max_s = config.PROXY_COOLDOWN_MAX_MS / 1000.0
             delay = min(max_s, base_s * (2 ** (proxy.consecutive_failures - 1)))
             proxy.cooldown_until = max(proxy.cooldown_until, now + delay)
+            log.info(
+                "pool: %-16s parked %.2fs on %d (consec=%d%s)",
+                proxy.id, delay, status_code, proxy.consecutive_failures,
+                " blocked" if blocked else "",
+            )
             return delay
 
     # -- lookup ------------------------------------------------------------
@@ -562,8 +577,17 @@ class ProxyPool:
         to ``max(remaining, now + seconds)`` and leaves the failure tally alone.
         """
         with self._lock:
-            target = time.time() + max(0.0, float(seconds))
-            proxy.cooldown_until = max(proxy.cooldown_until, target)
+            now = time.time()
+            seconds = max(0.0, float(seconds))
+            proxy.cooldown_until = max(proxy.cooldown_until, now + seconds)
+            # Caller-neutral: this is the probe-verdict side (park a known-burned
+            # exit until the next sampler pass re-evaluates it) AND the executor's
+            # upstream-Retry-After honor. The mark_failure log names the request
+            # status when one preceded this; here only the extension is logged.
+            log.info(
+                "pool: %-16s extended %.2fs (now parked %.1fs)",
+                proxy.id, seconds, proxy.cooldown_remaining(now),
+            )
 
     def get_all_proxies(self) -> List[Proxy]:
         """Thread-safe snapshot of all proxies (returns a copy)."""
