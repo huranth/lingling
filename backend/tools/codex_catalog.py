@@ -3,8 +3,11 @@
     python tools/codex_catalog.py
 
 Dumps the installed Codex binary's own catalog for a template, reads Lingling's
-live free models, and writes ``~/.codex/lingling_models.json``. Prints the
-``config.toml`` line that activates it.
+live free models, and writes ``~/.codex/lingling_models.json``. By default it
+also wires the file into ``~/.codex/config.toml`` (applying the
+``model_catalog_json`` line there) and opens the API-key setup window; pass
+``--no-write-config`` to just print the config line, or ``--no-key-setup`` to
+suppress the window (useful for scripted runs).
 
 Codex only accepts a filesystem path for ``model_catalog_json`` -- a URL is
 treated as a path and fails ("The filename, directory name, or volume label

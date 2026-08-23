@@ -35,7 +35,7 @@ CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 KEY_ENV = "LINGLING_API_KEY"
 # The gateway root (health/models live here). Codex's provider base_url must be
 # this + "/v1", which codex_base_url() derives -- we keep the root here so the
-# API calls (auth_required, existing_key, mint) hit the right paths.
+# API calls (auth_required, existing_key, mint_key) hit the right paths.
 DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 
 
