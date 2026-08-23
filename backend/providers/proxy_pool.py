@@ -278,6 +278,16 @@ class ProxyPool:
 
         if best:
             if len(best) > 1:
+                # A flat cursor over the tied set gives every proxy an equal
+                # turn -- per-IP balanced, so each exit burns at the same rate.
+                # A 50/50 *family* alternation would hand the minority family
+                # half the traffic and burn each of its IPs faster (the opposite
+                # imbalance). The case that needs Tor (a model cooked on the
+                # WARP exits) is handled in the executor's ``_pick_proxy``
+                # ``pick_kind("tor")`` bias on an empty sampler set, and the
+                # decayed-load comparison above already routes to the lighter
+                # family under traffic -- so a kind-aware cursor here would
+                # trade per-IP fairness for no real gain.
                 self._cursor = (self._cursor + 1) % len(best)
                 return best[self._cursor % len(best)]
             return best[0]

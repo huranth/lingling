@@ -3612,6 +3612,57 @@ def test_unit_per_reason_cooldown_parks_blocked_exits_longer_than_transient():
     assert not after.in_cooldown()
 
 
+def test_unit_pick_keeps_per_ip_balance_on_an_idle_pool():
+    """The tie-break deliberately does NOT alternate egress families on a tied
+    (idle) pool. A flat cursor gives every proxy an equal turn -- per-IP
+    balanced, so each exit burns at the same rate; a 50/50 family alternation
+    would hand the minority family (e.g. 3 Tor beside 10 WARP) ~half the
+    traffic and burn each Tor IP ~3x faster, the opposite imbalance. The case
+    that actually needs Tor -- a model cooked on the WARP exits -- is already
+    handled by ``_pick_proxy``'s ``pick_kind("tor")`` bias on an empty sampler
+    set, and the decayed-load balancer dynamically routes to the lighter
+    family under traffic. Lock the per-IP balance so a later "kind-aware
+    cursor" does not silently regress it.
+    """
+    from collections import Counter
+    pool = ProxyPool.from_list([
+        {"id": "warp-1", "url": "socks5://127.0.0.1:51001"},
+        {"id": "warp-2", "url": "socks5://127.0.0.1:51002"},
+        {"id": "tor-1", "url": "socks5://127.0.0.1:52001"},
+    ])
+    picks = Counter(pool.pick().id for _ in range(3 * 20))
+    counts = sorted(picks.values())
+    assert counts[-1] - counts[0] <= 1, picks          # every proxy, an equal turn
+    assert set(picks) == {"warp-1", "warp-2", "tor-1"}, picks
+
+
+def test_unit_pick_favors_tor_when_warp_carries_more_load():
+    """The real Tor-protection is the decayed-load balancer, not a kind cursor:
+    the moment the WARP exits carry more recent load than Tor, pick() lands on
+    Tor even though WARP outnumbers it. A flat cursor biases by COUNT only on a
+    fully-tied (idle) pool -- under divergent load it routes to the lighter
+    family. Lock this too, so Tor is reached exactly when WARP is the hotter
+    family."""
+    pool = ProxyPool.from_list([
+        {"id": "warp-1", "url": "socks5://127.0.0.1:51001"},
+        {"id": "warp-2", "url": "socks5://127.0.0.1:51002"},
+        {"id": "tor-1", "url": "socks5://127.0.0.1:52001"},
+    ])
+    # Burden both WARP exits (mark_success bumps the decayed load); Tor stays at
+    # zero, so the least-loaded available proxy is the Tor lane.
+    for pid in ("warp-1", "warp-2"):
+        px = pool.get_by_id(pid)
+        for _ in range(5):
+            pool.mark_success(px)
+    assert pool.pick().id == "tor-1"
+    # And once Tor carries the load too, the tie-break spreads across all three
+    # again rather than pinning Tor.
+    for _ in range(5):
+        pool.mark_success(pool.get_by_id("tor-1"))
+    picks = {pool.pick().id for _ in range(6)}
+    assert picks == {"warp-1", "warp-2", "tor-1"}, picks
+
+
 def test_unit_a_healthy_pool_does_not_delay_a_mid_stream_retry():
     """Recovery must stay instant for every failure that is not exhaustion.
 
