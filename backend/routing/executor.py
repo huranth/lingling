@@ -8,8 +8,9 @@ provider whose stream yields a chunk (mid-stream failover lives in stream_guard)
 
 from __future__ import annotations
 
+import time
 from itertools import chain
-from typing import Any, Dict, FrozenSet, Generator, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Generator, List, Optional, Tuple
 
 from core import config
 from providers.base import Provider, UpstreamError  # noqa: F401
@@ -63,7 +64,9 @@ def _pick_proxy(
     ``ok_set`` (from the post-heal sampler) routes a model onto the subset of
     exits the sampler proved serve it (per-IP burn avoidance). None = no fresh
     sampler data -> normal selection; empty set = cooked -> the caller's
-    fail-fast cap governs, and the single attempt picks normally.
+    fail-fast cap governs, and the single attempt prefers a Tor lane (a fresh
+    exit whose route re-picks on restart, bypassing WARP's per-IP burn) before
+    falling back to normal selection.
     """
     if proxy_pool is None or len(proxy_pool) == 0:
         return None
@@ -71,6 +74,20 @@ def _pick_proxy(
         return None
     if ok_set:
         return proxy_pool.pick_from(ok_set, session_id=session_id)
+    if ok_set is not None and not ok_set:
+        # Empty sampler set = the model is cooked / every probed exit 429-ing.
+        # The sampler's green exits are WARP-dominated, and Tor lanes re-pick
+        # their route on restart (a fresh IP that bypasses OpenCode's per-IP
+        # burn), so the single fail-fast attempt should land on a Tor lane
+        # before the request is abandoned to the dispatcher's model fallback.
+        # An empty frozenset is falsy, so without this branch the cooked case
+        # falls through to plain ``pick()`` over the whole pool (~77% WARP),
+        # re-hits the burned WARP exit, and never reaches the Tor lanes
+        # uniquely able to serve it. ``pick_kind`` returns None when no Tor lane
+        # is fresh, in which case normal selection (sticky/pick) takes over.
+        tor = proxy_pool.pick_kind("tor", session_id=session_id)
+        if tor is not None:
+            return tor
     if config.PROXY_STICKY_SESSIONS and session_id:
         return proxy_pool.pick_sticky(session_id)
     return proxy_pool.pick()
@@ -95,9 +112,9 @@ def execute_nonstream(
     attempt uses a different proxy.
 
     ``timeout`` is the per-attempt httpx transport timeout (applies to the
-    connection, not the JSON body).  Extracted from ``**params`` explicitly so
-    callers (e.g. the dispatcher) can set it without it being swallowed into
-    the upstream request body.
+    connection, not the JSON body). Exposed as a named parameter (kept out of
+    ``**params``) so callers -- e.g. the dispatcher in ``app.py`` -- can set it
+    without it being forwarded into the upstream request body.
     """
     if not providers:
         raise NoProviderError(f"no provider serves model '{model_id}'")
@@ -198,6 +215,7 @@ def execute_stream(
     proxy_pool: Optional[ProxyPool] = None,
     session_id: str = "",
     timeout: Optional[float] = None,
+    on_attempt: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     **params: Any,
 ) -> Tuple[Generator[bytes, None, None], Provider, Any, List[Dict[str, Any]]]:
     """Open a native stream and obtain its first chunk before replying to client.
@@ -211,6 +229,17 @@ def execute_stream(
     transport, *not* the request body (avoids the **params swallowing bug
     where a ``timeout`` kwarg went into the JSON body instead of the
     client kwargs).
+
+    ``on_attempt`` is an optional lifecycle callback fired per inner retry
+    attempt: ``"dispatch"`` right before calling the provider (with the
+    proxy picked for this attempt), ``"first_token"`` once a chunk arrives
+    (so the caller can confirm the lane is live — otherwise minutes of
+    silent first-chunk waiting across burned exit IPs produce *zero* log
+    lines and the only summary fires after ``execute_stream`` returns),
+    ``"failure"`` on a non-token outcome, with the status code so the
+    caller can see *why* a burned IP burned. ``None`` skips the callbacks
+    entirely (the executor's own log lines stay silent), which is the
+    behavior every test exercises.
     """
     if not providers:
         raise NoProviderError(f"no provider serves model '{model_id}'")
@@ -240,6 +269,13 @@ def execute_stream(
             key = None if not prov.requires_key() else prov.keys.pick()
             if prov.requires_key() and key is None:
                 break
+            attempt_n = len(attempts)
+            if on_attempt is not None:
+                on_attempt("dispatch", {
+                    "n": attempt_n, "prov": prov.id,
+                    "proxy": proxy.id if proxy else None, "model": model_id,
+                })
+            dispatch_t = time.time()
             failure: Optional[UpstreamError] = None
             try:
                 stream = prov.stream_chat(
@@ -253,6 +289,12 @@ def execute_stream(
                     proxy_pool.mark_success(proxy)
                 if key is not None:
                     prov.keys.mark_success(key)
+                if on_attempt is not None:
+                    on_attempt("first_token", {
+                        "n": attempt_n, "prov": prov.id,
+                        "proxy": proxy.id if proxy else None,
+                        "elapsed_ms": (time.time() - dispatch_t) * 1000.0,
+                    })
                 return chain((first,), stream), prov, key, attempts
             except StopIteration:
                 failure = UpstreamError(502, "upstream closed stream before its first chunk", prov.id)
@@ -268,6 +310,13 @@ def execute_stream(
                 "status": failure.status_code, "proxy": proxy.id if proxy else None,
             })
             last_error = failure
+            if on_attempt is not None:
+                on_attempt("failure", {
+                    "n": attempt_n, "prov": prov.id,
+                    "proxy": proxy.id if proxy else None,
+                    "elapsed_ms": (time.time() - dispatch_t) * 1000.0,
+                    "status": failure.status_code,
+                })
             if failure.status_code not in _RETRYABLE:
                 raise AllFailedError(failure, attempts)
     raise AllFailedError(last_error, attempts)

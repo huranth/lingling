@@ -153,12 +153,27 @@ def _parse_models(override: Optional[List[str]]) -> List[str]:
 
 
 def _canary_ok_ids(canary_summary: Any) -> List[str]:
-    """Proxy ids where the canary probe returned ``ok`` (the green pool)."""
+    """Proxy ids the canary probe considers alive (the green pool).
+
+    A lane the heal just refreshed -- a WARP tunnel re-rolled off a burned
+    exit (``_reroll_until_clean``) or a Tor lane whose route a restart just
+    re-picked (``rotate_burned_tor_lanes``) -- sits in the transient ``healed``
+    state, not ``ok``: the dashboard shows an orange "healed" pill so an
+    operator can see a lane was freshly graduated rather than always-healthy.
+    But the sampler's job is to re-probe and attribute per-(model, exit), so
+    excluding ``healed`` lanes left a freshly-rotated Tor exit -- the one exit
+    that bypasses WARP's per-IP burn -- out of the sweep, and ``ok_exits()``
+    never learned it serves a model the request path then read as cooked.
+    Sweeping ``healed`` lanes re-verifies them on the spot: one that came back
+    dead is recounted dead, one that serves the model is attributed ok, and the
+    dashboard's graduated "healed" UX is untouched (the probe pass that follows
+    still graduates survivors to ``ok``).
+    """
     if canary_summary is None:
         return []
     out: List[str] = []
     for r in getattr(canary_summary, "results", []) or []:
-        if getattr(r, "status", "") == "ok":
+        if getattr(r, "status", "") in ("ok", "healed"):
             pid = getattr(r, "proxy_id", "")
             if pid and pid not in out:
                 out.append(pid)

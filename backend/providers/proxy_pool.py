@@ -73,10 +73,29 @@ class Proxy:
             return self.window_load
         return self.window_load * (0.5 ** (elapsed / _WINDOW_HALF_LIFE_S))
 
+    @property
+    def kind(self) -> str:
+        """The egress family this lane belongs to: ``warp`` / ``tor`` / ``manual``.
+
+        Inferred from the id prefix -- WARP identities are ``warp-{i}``, Tor
+        lanes ``tor-{i}`` and operator-added proxies ``proxy-{N}`` -- so the
+        pool needs no per-merge-site plumbing to tag lanes with their source.
+        The request path reads this to bias failover (a cooked model's single
+        attempt goes to a Tor lane, which re-picks its route and bypasses
+        OpenCode's per-IP burn) instead of trusting the free-text ``label``,
+        which no pick path reads.
+        """
+        if self.id.startswith("warp-"):
+            return "warp"
+        if self.id.startswith("tor-"):
+            return "tor"
+        return "manual"
+
     def status(self) -> Dict[str, Any]:
         now = time.time()
         return {
             "id": self.id,
+            "kind": self.kind,
             "label": self.label or self.id,
             "url": _redact(self.url),
             "in_cooldown": self.in_cooldown(now),
@@ -211,7 +230,9 @@ class ProxyPool:
         with self._lock:
             return self._pick_locked(time.time())
 
-    def _pick_locked(self, now: float) -> Optional[Proxy]:
+    def _pick_locked(
+        self, now: float, cands: Optional[List[Proxy]] = None,
+    ) -> Optional[Proxy]:
         """The body of :meth:`pick`, for callers that already hold the lock.
 
         Single pass, but preserves the round-robin tie-break: when several
@@ -220,8 +241,13 @@ class ProxyPool:
         concurrent requests spread across the tied exits instead of all piling
         onto the first one. Without that, a burst of simultaneous requests
         would burn one WARP IP's quota while the rest sat idle.
+
+        ``cands`` restricts selection to a subset (the sampler-proven exits of
+        a model via :meth:`pick_from`, or one egress family via
+        :meth:`pick_kind`); ``None`` (the default) considers the whole pool.
         """
-        if not self.proxies:
+        pool = cands if cands is not None else self.proxies
+        if not pool:
             return None
 
         best: List[Proxy] = []
@@ -229,7 +255,7 @@ class ProxyPool:
         soonest_cooling: Optional[Proxy] = None
         min_cooldown = float('inf')
 
-        for px in self.proxies:
+        for px in pool:
             if not px.in_cooldown(now):
                 load = px.decayed_load(now)
                 if load < best_load:
@@ -363,6 +389,31 @@ class ProxyPool:
                 self._remember(session_id, chosen.id)
             return chosen
 
+    def pick_kind(self, kind: str, session_id: str = "") -> Optional[Proxy]:
+        """Least-loaded *available* proxy of one egress family, for failover tiering.
+
+        Returns ``None`` when no proxy of ``kind`` is in the pool or every one of
+        them is in cooldown -- callers (the cooked-model fail-fast path in the
+        executor) fall through to normal selection rather than parking the turn
+        on a known-burned lane. Unlike :meth:`pick`, this deliberately does not
+        return the soonest-cooling proxy: a failover-tier preference is for a
+        *fresh* exit (a Tor lane that just re-picked its route), not a parked
+        one. Used to route an OpenCode-cooked model's single attempt to Tor,
+        whose rotating exit bypasses OpenCode's per-IP burn, before the request
+        is abandoned to the dispatcher's model fallback.
+        """
+        with self._lock:
+            if not self.proxies:
+                return None
+            now = time.time()
+            cands = [
+                p for p in self.proxies
+                if p.kind == kind and not p.in_cooldown(now)
+            ]
+            if not cands:
+                return None
+            return self._pick_locked(now, cands)
+
     def _remember(self, session_id: str, proxy_id: str) -> None:
         """Record a session's proxy, bounding the map so it cannot grow forever.
 
@@ -492,10 +543,20 @@ class ProxyPool:
         with self._lock:
             now = time.time()
             available = sum(1 for p in self.proxies if not p.in_cooldown(now))
+            available_warp = sum(
+                1 for p in self.proxies
+                if p.kind == "warp" and not p.in_cooldown(now)
+            )
+            available_tor = sum(
+                1 for p in self.proxies
+                if p.kind == "tor" and not p.in_cooldown(now)
+            )
             return {
                 "total": len(self.proxies),
                 "available": available,
                 "in_cooldown": len(self.proxies) - available,
+                "available_warp": available_warp,
+                "available_tor": available_tor,
                 "proxies": [p.status() for p in self.proxies],
             }
 
