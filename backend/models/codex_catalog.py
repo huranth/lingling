@@ -61,6 +61,29 @@ _LEVEL_DESCRIPTIONS: Dict[str, str] = {
 # of them, the published set wins and this disappears on the next run.
 _DEFAULT_LEVEL = "default"
 
+# OpenCode's free relay rejects any request whose input exceeds ~262K tokens with
+# HTTP 400 ``[400] This endpoint's maximum context length is 262144 tokens``,
+# regardless of the underlying model's own context window -- laguna-s-2.1's
+# endpoint reported exactly that number, and the other endpoints behaved the
+# same on observed over-cap turns (muse-spark returned an empty ``chat.completion``
+# stub wrapped in 400 where laguna returned the explicit text, but both 400'd).
+#
+# This makes models.dev's per-model ``context_length`` -- which describes the
+# upstream model's *paper* context (muse-spark 1M, nemotron-3-ultra 1M,
+# x-preview-f 1M) -- a *lie* about what Codex can actually send through the free
+# relay. Codex 0.146 read the larger advertised window from `lingling_models.json`,
+# never triggered its own session-truncator, sent an ~870K-token session, and the
+# relay 400'd every free model attempted in turn.
+#
+# Clamping the advertised window here lets Codex compact sessions against the
+# budget the free relay actually has: ``effective_context_window_percent`` (95%)
+# below this cap leaves a workable input budget plus a headroom reserve for the
+# response, and sessions bigger than the relay can host are truncated by Codex
+# *before* they cross the wire. ``min(context_length, cap)`` leaves sub-cap
+# models (hy3-free's real 190K, mimo's 200K, etc.) advertised exactly as models.dev
+# publishes them.
+FREE_TIER_RELAY_CONTEXT_CAP = 262144
+
 # Fields Codex's parser demands. A caller passing a hand-made template gets a
 # clear failure here instead of an "expected value at line 1 column N" from the
 # Rust side after the file is written.
@@ -167,6 +190,13 @@ def entry_for(
     if description:
         entry["description"] = description
     if context_length:
+        # The free relay's per-request token cap (see ``FREE_TIER_RELAY_CONTEXT_CAP``)
+        # is smaller than what models.dev publishes for several free models, so
+        # advertising models.dev's number verbatim would tell Codex it can send
+        # far more than the relay will accept. Clamp the advertised window to
+        # the relay's actual ceiling; ``min`` keeps every sub-cap model advertised
+        # at its real published value.
+        context_length = min(int(context_length), FREE_TIER_RELAY_CONTEXT_CAP)
         entry["context_window"] = context_length
         entry["max_context_window"] = context_length
     return entry
