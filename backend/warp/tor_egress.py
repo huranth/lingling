@@ -17,6 +17,7 @@ Bootstrap cost: the first instance downloads the Tor directory consensus
 from __future__ import annotations
 
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -46,6 +47,9 @@ class TorInstance:
     def __init__(self, index: int, port: int, data_dir: Path) -> None:
         self.index = index
         self.port = port
+        # Control port sits one block above SOCKS (52xxx -> 53xxx) so the two
+        # ports of a lane read at a glance and never collide with WARP (51xxx).
+        self.control_port = port + 1000
         self.data_dir = data_dir
         self.proxy_url = f"socks5://127.0.0.1:{port}"
         self.process: Optional[subprocess.Popen] = None
@@ -177,9 +181,15 @@ class TorEgressManager:
     def _torrc(self, inst: TorInstance) -> str:
         return (
             f"SocksPort 127.0.0.1:{inst.port}\n"
+            # Localhost-only control port with cookie auth, so only this process
+            # can issue SIGNAL NEWNYM -- drop the current circuits and build new
+            # ones -- to rotate the exit IP without a kill+relaunch. The cookie
+            # is written to the DataDirectory on boot.
+            f"ControlPort 127.0.0.1:{inst.control_port}\n"
+            "CookieAuthentication 1\n"
             f"DataDirectory {inst.data_dir.as_posix()}\n"
-            # Quiet: no control port, no client DNS, no socks-on-localhost
-            # exceptions. No ExitNodes pin -- see module docstring.
+            # No ExitNodes pin -- see module docstring. No client DNS, no
+            # socks-on-localhost exceptions.
             "SafeSocks 0\n"
             "TestSocks 0\n"
             "Log notice stderr\n"
@@ -291,23 +301,98 @@ class TorEgressManager:
                     failed += 1
             return {"started": started, "failed": failed}
 
-    def restart_instance(self, inst: TorInstance, log: Callable[..., Any] = print) -> bool:
-        """Kill and relaunch one lane — its route is re-picked, so a burned
-        exit IP is replaced by a fresh one in seconds."""
-        with self._lock:
-            if inst.process is not None:
-                try:
-                    inst.process.kill()
-                    inst.process.wait(timeout=5)
-                except Exception:  # noqa: BLE001
-                    pass
-                inst.process = None
-            try:
-                self._spawn(inst, log)
+    def _send_newnym(self, inst: TorInstance, log: Callable[..., Any] = print) -> bool:
+        """Tell this lane's tor to drop its circuits and build fresh ones
+        (``SIGNAL NEWNYM``) over its localhost control port.
+
+        One NEWNYM re-picks the path -- and therefore the exit IP -- without the
+        ~5-10s kill+relaunch below, so a burned Tor lane heals in under a second
+        instead of serialising under the heal lock (the live run's "6 rolls" /
+        heal-rate-limit struggle). Each lane owns its own control port, so
+        rotating several lanes does not trip Tor's per-connection NEWNYM
+        throttle. The lane keeps its SOCKS port *and* its process: only the
+        egress IP changes.
+
+        Returns False (caller falls back to kill+relaunch) when the control port
+        is not configured, not open, or the cookie is missing -- e.g. a lane
+        started by a build whose torrc predates ``ControlPort``, or a dead
+        process -- so pool membership never depends on the fast path.
+        """
+        if inst.control_port <= 0 or inst.process is None:
+            return False
+        try:
+            cookie = (inst.data_dir / "control_auth_cookie").read_bytes()
+        except OSError:
+            return False
+        if not cookie:
+            return False
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", inst.control_port), timeout=2,
+            ) as s:
+                s.settimeout(2.0)
+                reader = s.makefile("rb")
+
+                def _send(line: str) -> str:
+                    """Send a control command, drain continuation lines, return
+                    the final status line (``NNN<space>...``)."""
+                    s.sendall((line + "\r\n").encode("ascii"))
+                    while True:
+                        raw = reader.readline()
+                        if not raw:
+                            raise ConnectionError("control port closed mid-reply")
+                        text = raw.decode("ascii", "replace")
+                        if len(text) >= 4 and text[3] == " ":
+                            return text
+                        # ``NNN-`` is a continuation line; keep reading.
+
+                auth = _send(f"AUTHENTICATE {cookie.hex()}")
+                if not auth.startswith("250"):
+                    log("[tor] NEWNYM auth rejected on %s: %s", inst.pid, auth.strip())
+                    return False
+                sig = _send("SIGNAL NEWNYM")
+                if not sig.startswith("250"):
+                    log("[tor] NEWNYM rejected on %s: %s", inst.pid, sig.strip())
+                    return False
+                _send("QUIT")
+                log("[tor] NEWNYM rotated %s to a fresh exit", inst.pid)
                 return True
-            except Exception as exc:  # noqa: BLE001
-                log(f"[tor] restart failed for #{inst.index}: {exc}")
-                return False
+        except OSError as exc:
+            log("[tor] NEWNYM control-port miss on %s (%s); respawning", inst.pid, exc)
+            return False
+
+    def _kill_and_respawn(self, inst: TorInstance, log: Callable[..., Any] = print) -> bool:
+        """Kill and relaunch one lane -- the slow fallback to NEWNYM."""
+        if inst.process is not None:
+            try:
+                inst.process.kill()
+                inst.process.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+            inst.process = None
+        try:
+            self._spawn(inst, log)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log(f"[tor] restart failed for #{inst.index}: {exc}")
+            return False
+
+    def restart_instance(self, inst: TorInstance, log: Callable[..., Any] = print) -> bool:
+        """Replace this lane's exit IP.
+
+        Prefers ``SIGNAL NEWNYM`` over the per-lane control port (sub-second:
+        tor drops its current circuits and builds new ones, so the lane keeps
+        its SOCKS port and process but egresses from a fresh IP) and falls back
+        to kill+relaunch when the control port is not reachable (a lane started
+        by a build whose torrc predates ControlPort, or a dead process). The
+        public contract -- "a burned Tor lane is rotated to a fresh exit" -- is
+        unchanged; callers and tests that previously asserted a respawn now run
+        it only on the fallback path.
+        """
+        with self._lock:
+            if self._send_newnym(inst, log):
+                return True
+            return self._kill_and_respawn(inst, log)
 
     def stop_all(self) -> Dict[str, Any]:
         stopped = 0
@@ -350,7 +435,8 @@ class TorEgressManager:
                 "running": running,
                 "base_port": self.base_port,
                 "instances": [
-                    {"index": i.index, "port": i.port, "running": i.is_running()}
+                    {"index": i.index, "port": i.port,
+                     "control_port": i.control_port, "running": i.is_running()}
                     for i in self.instances
                 ],
             }

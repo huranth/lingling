@@ -59,6 +59,9 @@ def test_torrc_pins_port_and_dir_and_no_country():
     mgr = _manager(1)
     rc = mgr._torrc(mgr.instances[0])
     assert "SocksPort 127.0.0.1:52001" in rc
+    # A localhost, cookie-authed control port for fast NEWNYM rotation.
+    assert "ControlPort 127.0.0.1:53001" in rc
+    assert "CookieAuthentication 1" in rc
     assert "DataDirectory" in rc
     # Country pins stalled first circuits in live testing; they must stay out.
     assert "ExitNodes" not in rc
@@ -137,6 +140,11 @@ def test_clone_cache_skips_locked_files_without_failing():
 
 
 def test_restart_rotates_exit_by_respawning():
+    """When the control port is unavailable (no cookie / a lane started by a
+    build whose torrc predates ControlPort / a dead process), the NEWNYM fast
+    path falls back to kill+relaunch: the old process is killed and a new one
+    takes its place. Hermetic -- no socket is opened because no cookie exists.
+    """
     mgr = _running(_manager(1))
     old = mgr.instances[0].process
     with mock.patch("warp.tor_egress.subprocess.Popen", return_value=FakeProc()), \
@@ -144,6 +152,32 @@ def test_restart_rotates_exit_by_respawning():
         assert mgr.restart_instance(mgr.instances[0], log=lambda *a, **k: None) is True
     assert old._alive is False                 # killed ...
     assert mgr.instances[0].process is not old  # ... and replaced
+
+
+def test_send_newnym_returns_false_without_a_cookie():
+    """No control_auth_cookie -> NEWNYM cannot authenticate, so restart must
+    fall back to kill+relaunch instead of holding the heal lock on a socket
+    timeout. Returns False before any socket is opened (hermetic, no network)."""
+    mgr = _running(_manager(1))
+    inst = mgr.instances[0]
+    assert inst.control_port == inst.port + 1000   # 53001, one block above SOCKS
+    # process is up, control port configured, but no cookie was ever written.
+    assert mgr._send_newnym(inst, log=lambda *a, **k: None) is False
+
+
+def test_newnym_rotates_exit_without_respawning():
+    """SIGNAL NEWNYM rotates the exit IP without killing the lane: the SOCKS
+    port and process stay up, so a burned Tor lane heals in under a second
+    instead of the ~5-10s kill+relaunch serialized under the heal lock."""
+    mgr = _running(_manager(1))
+    inst = mgr.instances[0]
+    old = inst.process
+    with mock.patch.object(mgr, "_send_newnym", return_value=True) as nm, \
+         mock.patch.object(mgr, "_kill_and_respawn") as respawn:
+        assert mgr.restart_instance(inst, log=lambda *a, **k: None) is True
+    nm.assert_called_once()
+    respawn.assert_not_called()
+    assert inst.process is old and old._alive is True
 
 
 def test_sync_to_pool_adds_running_lanes_once():
