@@ -55,6 +55,15 @@ PROXIES_ENV = os.getenv("LINGLING_PROXIES", "")
 PROXY_STICKY_SESSIONS = os.getenv("LINGLING_PROXY_STICKY", "0") not in ("0", "false", "False", "")
 PROXY_COOLDOWN_BASE_MS = int(os.getenv("LINGLING_PROXY_COOLDOWN_BASE_MS", "1000"))
 PROXY_COOLDOWN_MAX_MS = int(os.getenv("LINGLING_PROXY_COOLDOWN_MAX_MS", "60000"))
+# Per-reason base: a 429 / 401 / 403 means the *exit IP* is barred from serving
+# us (per-IP rate window, or region/blocklist), not a transient server hiccup.
+# The old uniform 1s base re-selected that lane next turn and re-burned the
+# failover budget for nothing -- the "429 prison" where warp-7 and warp-9
+# 429'd back-to-back while fresh lanes sat idle. A longer base parks a barred
+# exit out of selection so pick() pivots onto a fresh lane; it still escalates
+# under the shared MAX_MS cap (10, 20, 40, 60, ...), so a lane that keeps
+# burning reaches the cap fast and hands off to the heal/probe rotator.
+PROXY_COOLDOWN_BLOCKED_BASE_MS = int(os.getenv("LINGLING_PROXY_COOLDOWN_BLOCKED_BASE_MS", "10000"))
 # A single request must not wait through the whole pool; cool one failed proxy
 # and let later requests use another.
 PROXY_MAX_ATTEMPTS_PER_REQUEST = int(os.getenv("LINGLING_PROXY_MAX_ATTEMPTS", "5"))

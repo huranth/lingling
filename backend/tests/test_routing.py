@@ -3255,7 +3255,9 @@ def test_unit_an_exhausted_pool_waits_for_an_exit_instead_of_failing():
         parking.wait_for_egress(pool, budget_s=120.0, log=_QuietLog(), sleep=fake_sleep)
     )
     assert waited > 0, "an exhausted pool must be waited out, not failed"
-    # It waits for warp-1 (one failure, ~1s) rather than warp-2 (two, ~2s).
+    # It waits for warp-1 (one failure, the BLOCKED base) rather than
+    # warp-2 (two, twice that): the waiter quotes the soonest exit, not the
+    # last one it touched.
     assert slept and abs(slept[0] - soonest) < 0.05, (slept, soonest)
     assert slept[0] < pool.get_by_id("warp-2").cooldown_remaining()
 
@@ -3493,6 +3495,58 @@ def test_unit_the_stream_hold_releases_the_worker_and_skips_usage():
     for frame in frames:
         app_mod._harvest_stream_usage(frame, seen)
     assert seen == {}, seen
+
+
+def test_unit_per_reason_cooldown_parks_blocked_exits_longer_than_transient():
+    """A 429/401/403 bars the *exit IP* (rate window or region/blocklist); a 5xx
+    or contract-shape failure is a transient hiccup. mark_failure used to apply
+    one uniform base for every retryable status, so a rate-limited lane cooled
+    for the same 1s as a server hiccup and was re-selected next turn -- re-burned
+    it and the failover budget, the warp-7/warp-9 back-to-back 429 run. The
+    per-reason table parks a barred exit under the longer BLOCKED base so pick()
+    pivots onto a fresh lane, while a transient failure keeps the short base and
+    retries sooner. Both still escalate to the shared cap.
+    """
+    pool = ProxyPool.from_list([
+        {"id": "rate", "url": "socks5://127.0.0.1:51001"},
+        {"id": "auth", "url": "socks5://127.0.0.1:51002"},
+        {"id": "forbid", "url": "socks5://127.0.0.1:51003"},
+        {"id": "transient", "url": "socks5://127.0.0.1:51004"},
+    ])
+    blocked = config.PROXY_COOLDOWN_BLOCKED_BASE_MS / 1000.0
+    base = config.PROXY_COOLDOWN_BASE_MS / 1000.0
+    cap = config.PROXY_COOLDOWN_MAX_MS / 1000.0
+
+    # First failure per lane: each reason picks its own base (factor 2^0 = 1).
+    delay_429 = pool.mark_failure(pool.get_by_id("rate"), 429)
+    delay_401 = pool.mark_failure(pool.get_by_id("auth"), 401)
+    delay_403 = pool.mark_failure(pool.get_by_id("forbid"), 403)
+    delay_504 = pool.mark_failure(pool.get_by_id("transient"), 504)
+    assert delay_429 == blocked and delay_401 == blocked and delay_403 == blocked
+    assert delay_504 == base
+    assert blocked > base, "blocked base must exceed the transient base"
+
+    # A barred exit is actually cooling longer than a transient one.
+    assert pool.get_by_id("rate").in_cooldown()
+    assert pool.get_by_id("transient").in_cooldown()
+    assert pool.get_by_id("rate").cooldown_remaining() > \
+        pool.get_by_id("transient").cooldown_remaining()
+
+    # Escalation doubles under the BLOCKED base, not the short base.
+    delay_429_again = pool.mark_failure(pool.get_by_id("rate"), 429)
+    assert delay_429_again == min(cap, blocked * 2)
+
+    # The cap still bounds a lane that keeps burning (10, 20, 40, 60, ...).
+    px = pool.get_by_id("rate")
+    for _ in range(4):
+        pool.mark_failure(px, 429)
+    assert pool.mark_failure(px, 429) == cap
+
+    # reset_counters clears a re-rolled exit's slate regardless of reason.
+    pool.reset_counters("rate")
+    after = pool.get_by_id("rate")
+    assert after.consecutive_failures == 0 and after.cooldown_until == 0.0
+    assert not after.in_cooldown()
 
 
 def test_unit_a_healthy_pool_does_not_delay_a_mid_stream_retry():

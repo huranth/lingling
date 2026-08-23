@@ -32,6 +32,13 @@ _WINDOW_HALF_LIFE_S = 120.0
 # sessions are switched on; bounded because session ids are unbounded.
 _MAX_SESSIONS = 2048
 
+# Statuses that mean the *exit IP* is barred from serving us (per-IP rate
+# window, or a 401/403 region/blocklist), as opposed to a transient server or
+# request-shape failure. mark_failure parks these under the longer
+# PROXY_COOLDOWN_BLOCKED_BASE_MS so pick() pivots onto a fresh lane instead of
+# re-selecting a burned IP next turn and re-burning the failover budget.
+_BLOCKED_STATUS_CODES = frozenset({429, 401, 403})
+
 
 def _redact(url: str) -> str:
     """Strip credentials from a proxy URL for safe display."""
@@ -462,6 +469,12 @@ class ProxyPool:
         re-shorten its park. The exponential backoff stays meaningful: the
         streak grows on every request, the cooldown just never shrinks back
         to a value the operator already benched the lane for.
+
+        The base is per-reason: a 429/401/403 bars the exit IP itself, so it
+        parks under ``PROXY_COOLDOWN_BLOCKED_BASE_MS`` (long) and lets a fresh
+        lane take over rather than re-selecting the burned IP next turn; a 5xx
+        or contract-shape failure is transient and keeps ``PROXY_COOLDOWN_BASE_MS``
+        (short) so the exit retries sooner. Both escalate under the shared cap.
         """
         with self._lock:
             proxy.total_requests += 1
@@ -482,7 +495,16 @@ class ProxyPool:
                                    500, 502, 503, 504):
                 return 0.0
             proxy.consecutive_failures += 1
-            base_s = config.PROXY_COOLDOWN_BASE_MS / 1000.0
+            # Per-reason base: a 429/401/403 bars the *exit IP* (rate window or
+            # region/blocklist), so it parks long and lets fresh lanes take over;
+            # a 5xx / contract-shape failure is a transient hiccup and keeps the
+            # short base so the exit retries sooner. Both escalate under the
+            # shared cap, so a lane that keeps burning reaches it and hands off
+            # to the heal/probe rotator.
+            blocked = status_code in _BLOCKED_STATUS_CODES
+            base_ms = (config.PROXY_COOLDOWN_BLOCKED_BASE_MS if blocked
+                       else config.PROXY_COOLDOWN_BASE_MS)
+            base_s = base_ms / 1000.0
             max_s = config.PROXY_COOLDOWN_MAX_MS / 1000.0
             delay = min(max_s, base_s * (2 ** (proxy.consecutive_failures - 1)))
             proxy.cooldown_until = max(proxy.cooldown_until, now + delay)
