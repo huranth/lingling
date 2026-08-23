@@ -274,12 +274,21 @@ SAMPLER_MODELS = [
 # Minimum time between sampler passes. The sampler piggybacks on the heal cycle,
 # so this is a *skip-if-too-recent* gate rather than its own timer; a value >= the
 # heal cadence means at most one sampler pass per heal cycle. 0 means every heal.
-SAMPLER_INTERVAL_S = float(os.getenv("LINGLING_SAMPLER_INTERVAL_S", "300"))
-# How long the request path trusts a sampler result. >= INTERVAL_S so the data is
-# always fresh while the sampler is running, but a sampler that stops (disabled at
+# Default 600s (10 min), not 300s: each pass probes every model across the green
+# pool -- the live log showed one pass at ~68s -- so a 5-min cadence had the sampler
+# eating a large slice of OpenCode's free tier on its own and feeding the same 429
+# exhaustion it was built to detect. 10 min roughly halves that self-load;
+# real-time per-request cooldowns (mark_failure / extend_cooldown) still catch a
+# freshly-burned exit between passes, so model-level detection lagging up to one
+# interval costs steering freshness, not availability. Tune via the env if the
+# tier is generous enough to want fresher green-sets.
+SAMPLER_INTERVAL_S = float(os.getenv("LINGLING_SAMPLER_INTERVAL_S", "600"))
+# How long the request path trusts a sampler result. Kept at 2x INTERVAL_S so the
+# data stays fresh across a whole skipped pass (a sampler that misses one heal
+# cycle still has the previous verdict) while a sampler that stops (disabled at
 # runtime, or a long OpenCode outage that empties the green pool) does not pin a
 # stale "cooked" flag on a model forever. 0 means trust indefinitely (not advised).
-SAMPLER_TTL_S = float(os.getenv("LINGLING_SAMPLER_TTL_S", "600"))
+SAMPLER_TTL_S = float(os.getenv("LINGLING_SAMPLER_TTL_S", "1200"))
 # When the sampler proves a model is OpenCode-side cooked, cap the per-request
 # per-egress attempt budget to this many exits so the request fails (and falls
 # back) instead of burning the whole pool retrying IPs that cannot fix a
