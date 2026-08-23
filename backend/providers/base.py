@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional
 
 import httpx
@@ -80,9 +80,6 @@ class ProviderModel:
     # `desc` of strengths. The routing dispatcher reads `desc` verbatim so it
     # routes on real capabilities rather than guessing from the model id.
     capabilities: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
 
 
 class Provider(ABC):

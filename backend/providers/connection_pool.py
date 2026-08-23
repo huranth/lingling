@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Generator, Optional
 from collections import deque
 
@@ -26,8 +26,6 @@ class PooledClient:
     proxy_id: str
     proxy_url: str
     last_used: float = 0.0
-    request_count: int = 0
-    created_at: float = field(default_factory=time.time)
     
     def is_healthy(self) -> bool:
         """Check if the underlying connection is still usable."""
@@ -39,7 +37,6 @@ class PooledClient:
     def touch(self) -> None:
         """Mark this client as recently used."""
         self.last_used = time.time()
-        self.request_count += 1
 
 
 class ConnectionPool:
@@ -204,16 +201,6 @@ class ConnectionPool:
                     except Exception:
                         pass
             self._clients.clear()
-    
-    def stats(self) -> Dict[str, Any]:
-        """Return pool statistics."""
-        total_clients = 0
-        per_proxy: Dict[str, int] = {}
-        for proxy_id, pool in self._clients.items():
-            count = len(pool)
-            total_clients += count
-            per_proxy[proxy_id] = count
-        return {"total_clients": total_clients, "proxies": per_proxy}
 
 
 # Global connection pool singleton
