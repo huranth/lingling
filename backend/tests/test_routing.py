@@ -2014,6 +2014,33 @@ def test_unit_exhausted_503_carries_provenance_headers():
         app_mod.dispatcher.fallback_model = orig_fb
 
 
+def test_unit_sampler_status_surfaces_pacing_and_active_streams():
+    """/api/sampler is the dashboard's one poll for pool-health, so it surfaces
+    the routing snapshots the request path consumes but the UI could not see:
+    pacing_reasoning (ids pacing_memory learned reason -- a hidden reasoner's
+    longer thinking patience is now effective, not just internal) and
+    active_streams (in-flight counts per egress id -- busy vs idle lane). Both
+    are present and correctly typed even on a fresh, idle boot, and they mirror
+    the live module values (not a stale copy), so a learned model materialises in
+    the next poll and the frontend can render the keys unconditionally.
+    """
+    import app as app_mod
+
+    r = client.get("/api/sampler")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # The sampler's core keys survive the enrichment (additive, not replaced),
+    # in either the live branch or the disabled/pending envelope.
+    assert {"enabled", "models", "canary_ok_exits"} <= set(body.keys()), body.keys()
+    # The two surfaced snapshots are present and correctly typed -- empty on a
+    # fresh, idle boot but never missing, so the frontend renders unconditionally.
+    assert isinstance(body.get("pacing_reasoning"), list), body.get("pacing_reasoning")
+    assert isinstance(body.get("active_streams"), dict), body.get("active_streams")
+    # They read the live module state the endpoint imports, not a stale copy.
+    assert body["pacing_reasoning"] == app_mod.pacing_memory.snapshot()
+    assert body["active_streams"] == app_mod.active_streams.snapshot()
+
+
 def test_unit_catalog_serves_last_good_list_through_a_fetch_failure():
     """A transient /models outage must not empty the catalog.
 

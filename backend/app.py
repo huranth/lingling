@@ -46,6 +46,7 @@ from claudecode import thinking as cc_thinking
 from models import vision_bridge
 from models.catalog import UnifiedCatalog
 from providers import registry
+from providers import active_streams
 from providers.base import extract_assistant_text, extract_usage
 from usage.store import UsageStore
 from warp.manager import WarpManager, _port_is_open
@@ -1087,19 +1088,30 @@ def warp_probe_run() -> Dict[str, Any]:
 
 @app.get("/api/sampler")
 def sampler_status() -> Dict[str, Any]:
-    """Post-heal multi-model sampler state for the dashboard.
+    """Post-heal sampler state plus the live routing snapshots the dashboard
+    polls this endpoint for alongside it.
 
-    The latest per-(model, exit) pass, or an empty disabled envelope when the
-    sampler has not run. The request path reads the same state via
-    ``routing.sampler.ok_exits`` to route a model onto its sampler-green exits
-    and fail fast on an OpenCode-side outage; this endpoint is its read-only
-    mirror for the UI.
+    The sampler blob (the latest per-(model, exit) pass, or a disabled/pending
+    envelope) is the read-only mirror of what the request path consumes via
+    ``routing.sampler.ok_exits`` to route a model onto its green exits and fail
+    fast on an OpenCode-side outage. Two siblings are surfaced here so the
+    dashboard renders the whole pool-health view from one poll:
+
+    * ``pacing_reasoning`` -- model ids pacing_memory has *learned* reason (a
+      hidden-reasoning model whose longer thinking patience is now effective),
+      so the learned set is visible rather than only consumed by _stream_pacing.
+    * ``active_streams`` -- in-flight stream counts per egress id (the load the
+      pool is carrying right now), so a stuck/busy lane is distinguishable from
+      an idle one without tailing the log.
     """
     snap = sampler.latest()
-    return snap or {
+    state = snap if snap is not None else {
         "enabled": config.SAMPLER_ENABLED, "models": [], "canary_ok_exits": [],
         "skipped_reason": "disabled" if not config.SAMPLER_ENABLED else "pending",
     }
+    state["pacing_reasoning"] = pacing_memory.snapshot()
+    state["active_streams"] = active_streams.snapshot()
+    return state
 
 
 @app.post("/api/warp/formation")
