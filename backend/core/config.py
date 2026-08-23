@@ -64,6 +64,13 @@ PROXY_COOLDOWN_MAX_MS = int(os.getenv("LINGLING_PROXY_COOLDOWN_MAX_MS", "60000")
 # under the shared MAX_MS cap (10, 20, 40, 60, ...), so a lane that keeps
 # burning reaches the cap fast and hands off to the heal/probe rotator.
 PROXY_COOLDOWN_BLOCKED_BASE_MS = int(os.getenv("LINGLING_PROXY_COOLDOWN_BLOCKED_BASE_MS", "10000"))
+# Upper bound on honoring an upstream Retry-After hint. A 429/503 that
+# advertises Retry-After parks the proxy for the advised window (clamped here)
+# instead of the heuristic exponential, so a lane does not get re-selected
+# before the rate window clears and re-burn the failover budget; a hostile or
+# clock-drifted huge value cannot park a lane for hours. 600s covers most
+# free-tier rate windows; longer ones still fall through to escalation + probe.
+PROXY_COOLDOWN_RETRY_AFTER_MAX_MS = int(os.getenv("LINGLING_PROXY_COOLDOWN_RETRY_AFTER_MAX_MS", "600000"))
 # A single request must not wait through the whole pool; cool one failed proxy
 # and let later requests use another.
 PROXY_MAX_ATTEMPTS_PER_REQUEST = int(os.getenv("LINGLING_PROXY_MAX_ATTEMPTS", "5"))

@@ -50,11 +50,47 @@ def strip_lone_surrogates(obj: Any) -> Any:
 class UpstreamError(Exception):
     """Raised when an upstream provider returns a non-success status."""
 
-    def __init__(self, status_code: int, detail: str = "", provider_id: str = "") -> None:
+    def __init__(self, status_code: int, detail: str = "", provider_id: str = "",
+                 retry_after: Optional[float] = None) -> None:
         super().__init__(f"[{provider_id}] upstream HTTP {status_code}: {detail[:300]}")
         self.status_code = status_code
         self.detail = detail
         self.provider_id = provider_id
+        # Parsed upstream ``Retry-After`` (seconds), when the status carried one.
+        # The executor extends the proxy's cooldown to honor the explicit backoff
+        # ask instead of the heuristic exponential -- see ``_honor_retry_after``.
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds(headers: Any) -> Optional[float]:
+    """Parse an HTTP ``Retry-After`` header into seconds, or None.
+
+    The header may be delta-seconds (``"120"`` / ``"30.5"``) or an HTTP-date
+    (``Wed, 21 Oct 2026 07:28:00 GMT``). A back-dated or unparseable value
+    yields 0.0 / None so the caller keeps the heuristic base. Honored only where
+    the executor can extend a proxy's cooldown: a 429/503 advertising it parks the
+    lane for the upstream-advised window (clamped by the caller) instead of the
+    exponential guess, which would otherwise re-select the lane before the rate
+    window clears and re-burn the failover budget.
+    """
+    raw = headers.get("retry-after") if hasattr(headers, "get") else None
+    if not raw:
+        return None
+    raw = raw.strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    from email.utils import parsedate_to_datetime
+    import datetime
+    try:
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    now = datetime.datetime.now(dt.tzinfo)
+    return max(0.0, (dt - now).total_seconds())
 
 
 def _prettify(model_id: str) -> str:
@@ -251,7 +287,10 @@ class OpenAICompatibleProvider(Provider):
             except httpx.HTTPError as exc:
                 raise UpstreamError(504, str(exc), self.id) from exc
             if resp.status_code >= 400:
-                raise UpstreamError(resp.status_code, resp.text, self.id)
+                raise UpstreamError(
+                    resp.status_code, resp.text, self.id,
+                    retry_after=_retry_after_seconds(resp.headers),
+                )
             return resp.json()
         finally:
             active_streams.dec(egress_id)
@@ -295,7 +334,10 @@ class OpenAICompatibleProvider(Provider):
                     ) as resp:
                         if resp.status_code >= 400:
                             detail = resp.read().decode("utf-8", "replace")
-                            raise UpstreamError(resp.status_code, detail, self.id)
+                            raise UpstreamError(
+                                resp.status_code, detail, self.id,
+                                retry_after=_retry_after_seconds(resp.headers),
+                            )
                         for line in resp.iter_lines():
                             if line:
                                 yield line.encode("utf-8") if isinstance(line, str) else line

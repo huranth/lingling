@@ -93,6 +93,26 @@ def _pick_proxy(
     return proxy_pool.pick()
 
 
+def _honor_retry_after(
+    proxy_pool: Optional[ProxyPool], proxy: Any, exc: UpstreamError,
+) -> None:
+    """Extend this proxy's cooldown to honor an upstream Retry-After hint.
+
+    A 429/503 advertising ``Retry-After`` is an explicit backoff ask; honoring it
+    (clamped to ``PROXY_COOLDOWN_RETRY_AFTER_MAX_MS`` so a hostile or
+    clock-drifted value cannot park a lane for hours) beats the heuristic
+    exponential, which would otherwise re-select the lane before the rate window
+    clears and re-burn the failover budget. ``extend_cooldown`` only ever
+    *extends* (``max(remaining, now + seconds)``), so a Retry-After shorter than
+    the exponential park is a no-op, and it leaves the failure tally alone.
+    """
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after is None or proxy is None or proxy_pool is None:
+        return
+    cap = config.PROXY_COOLDOWN_RETRY_AFTER_MAX_MS / 1000.0
+    proxy_pool.extend_cooldown(proxy, min(float(retry_after), cap))
+
+
 def execute_nonstream(
     messages: List[Dict[str, Any]],
     model_id: str,
@@ -162,6 +182,7 @@ def execute_nonstream(
                 except UpstreamError as exc:
                     if proxy is not None and proxy_pool is not None:
                         proxy_pool.mark_failure(proxy, exc.status_code)
+                        _honor_retry_after(proxy_pool, proxy, exc)
                     attempts.append(
                         {"provider": prov.id, "key": None, "status": exc.status_code,
                          "proxy": proxy.id if proxy else None}
@@ -197,6 +218,7 @@ def execute_nonstream(
                 prov.keys.mark_failure(key, exc.status_code)
                 if proxy is not None and proxy_pool is not None:
                     proxy_pool.mark_failure(proxy, exc.status_code)
+                    _honor_retry_after(proxy_pool, proxy, exc)
                 attempts.append(
                     {"provider": prov.id, "key": key.id, "status": exc.status_code,
                      "proxy": proxy.id if proxy else None}
@@ -303,6 +325,7 @@ def execute_stream(
             assert failure is not None
             if proxy is not None and proxy_pool is not None:
                 proxy_pool.mark_failure(proxy, failure.status_code)
+                _honor_retry_after(proxy_pool, proxy, failure)
             if key is not None:
                 prov.keys.mark_failure(key, failure.status_code)
             attempts.append({

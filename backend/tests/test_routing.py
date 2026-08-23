@@ -198,6 +198,69 @@ def test_unit_all_fail():
         raise AssertionError("expected AllFailedError when all providers fail")
 
 
+def test_unit_retry_after_parses_seconds_and_http_dates():
+    """Retry-After is either delta-seconds or an HTTP-date; both must parse so
+    the real backoff ask is honored, a back-dated header clamps to 0, and a
+    missing/unparseable one yields None so the caller keeps the heuristic base."""
+    import datetime
+    from providers.base import _retry_after_seconds
+    assert _retry_after_seconds({"retry-after": "120"}) == 120.0
+    assert _retry_after_seconds({"retry-after": "30.5"}) == 30.5
+    # A back-dated HTTP-date does not park the lane for a negative window.
+    assert _retry_after_seconds({"retry-after": "Wed, 21 Oct 2010 07:28:00 GMT"}) == 0.0
+    # A future HTTP-date yields a positive delta around the requested wait.
+    future = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=90)
+    httpdate = future.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    assert 80.0 < _retry_after_seconds({"retry-after": httpdate}) <= 95.0
+    # Missing or unparseable -> None (the executor skips the extension).
+    assert _retry_after_seconds({}) is None
+    assert _retry_after_seconds({"retry-after": "later"}) is None
+
+
+def test_unit_retry_after_extends_cooldown_past_heuristic_base():
+    """A 429 carrying Retry-After parks the proxy for the upstream-advised
+    window (clamped), not the heuristic exponential base. Re-tried early, the
+    lane just 429s again and re-burns the failover budget; the upstream's
+    explicit ask beats the guess. extend_cooldown never bumps the tally."""
+    bad = FakeProvider(
+        "keyless",
+        UpstreamError(429, "rate limited", "keyless", retry_after=30),
+        use_proxy=True,
+    )
+    pool = ProxyPool.from_list([{"id": "px", "url": "socks5://127.0.0.1:1"}])
+    try:
+        executor.execute_nonstream(
+            [{"role": "user", "content": "hi"}], "m", [bad], proxy_pool=pool
+        )
+    except executor.AllFailedError:
+        pass
+    px = pool.get_by_id("px")
+    # mark_failure(429) parks ~10s (BLOCKED base); honoring Retry-After extends
+    # it to ~30s. A 10s-only park would mean the header was ignored.
+    assert px.cooldown_remaining() > 20.0, px.cooldown_remaining()
+    assert px.consecutive_failures == 1   # extend_cooldown leaves the tally alone
+
+
+def test_unit_retry_after_honored_on_stream_before_first_token():
+    """A pre-200 stream 429 with Retry-After parks the originating proxy for the
+    advised window too -- the failure surfaces before first token, so the stream
+    path cools the proxy exactly like non-stream. ``good`` is a direct provider
+    (no proxy) so the burned lane deterministically owns the single pool exit."""
+    bad = FakeProvider(
+        "keyless", UpstreamError(429, "rate limited", "keyless", retry_after=45),
+        use_proxy=True,
+    )
+    good = FakeProvider("keyless2", iter([b'data: {"choices":[]}', b"data: [DONE]"]))
+    pool = ProxyPool.from_list([{"id": "px", "url": "socks5://127.0.0.1:1"}])
+    stream, prov, key, attempts = executor.execute_stream(
+        [{"role": "user", "content": "hi"}], "m", [bad, good], proxy_pool=pool
+    )
+    assert prov is good
+    px = pool.get_by_id("px")
+    assert px.cooldown_remaining() > 35.0, (px.cooldown_remaining(), attempts)
+    assert px.consecutive_failures == 1
+
+
 def test_unit_stream_first_chunk_failover():
     """A pre-first-token proxy/provider failure retries before HTTP 200 is sent."""
     bad = FakeProvider("bad", UpstreamError(504, "proxy unreachable", "bad"))

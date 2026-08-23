@@ -56,8 +56,11 @@ class _FakeResp:
     """Stands in for the httpx streaming response inside client.stream()."""
 
     def __init__(self, lines=None, status_code=200, exc=None,
-                 read_body=b"", on_iter=None):
+                 read_body=b"", on_iter=None, headers=None):
         self.status_code = status_code
+        # Mirrors the real httpx streaming response: stream_chat reads
+        # ``.headers`` to honor an upstream Retry-After on a 4xx/5xx.
+        self.headers = headers if headers is not None else {}
         self._lines = lines or []
         self._exc = exc
         self._read_body = read_body
