@@ -801,6 +801,67 @@ def test_unit_stream_guard_no_retry_after_completion():
     assert outcome.error is None
 
 
+def test_unit_stream_guard_heartbeat_logs_a_long_stream(monkeypatch):
+    """A stream still emitting frames across many seconds logs a heartbeat.
+
+    The silence watchdog catches a hidden-reasoning model that never speaks;
+    the heartbeat complements it for a stream that keeps flowing -- an operator
+    tailing the log sees "still streaming" every _HEARTBEAT_INTERVAL_S and can
+    tell a long live reasoning token from a hung connection without crossing
+    into the ledger. A short stream that completes inside the interval streams
+    quietly (no heartbeat)."""
+    from routing import stream_guard
+
+    class _CaptureLog:
+        def __init__(self):
+            self.records = []
+
+        def info(self, fmt, *a, **k):
+            try:
+                self.records.append(fmt % a if a else fmt)
+            except Exception:
+                self.records.append(fmt)
+
+        warning = info  # noqa: E702 - mirror the logger interface
+
+    def gen(n):
+        for _ in range(n):
+            yield b'data: {"choices":[{"delta":{"content":"chunk"}}]}'
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+        yield b"data: [DONE]"
+
+    def noop_open():
+        yield b"data: [DONE]"
+
+    # Interval cranked to zero so every frame fires a heartbeat (no real sleeps).
+    monkeypatch.setattr(stream_guard, "_HEARTBEAT_INTERVAL_S", 0.0)
+    cap = _CaptureLog()
+    outcome = stream_guard.StreamOutcome()
+    list(stream_guard.guarded_stream(
+        open_stream=noop_open, first=gen(5), outcome=outcome,
+        on_chunk=lambda raw: None, log=cap,
+        model_id="muse-spark-1.2-contributor-free",
+    ))
+    beats = [m for m in cap.records if "still streaming" in m]
+    assert beats, cap.records
+    assert any(
+        "muse-spark-1.2-contributor-free" in m and "attempt=1" in m for m in beats
+    ), beats
+    assert outcome.completed is True
+
+    # A short stream under a large interval completes before any heartbeat fires.
+    monkeypatch.setattr(stream_guard, "_HEARTBEAT_INTERVAL_S", 9999.0)
+    cap2 = _CaptureLog()
+    outcome2 = stream_guard.StreamOutcome()
+    list(stream_guard.guarded_stream(
+        open_stream=noop_open, first=gen(2), outcome=outcome2,
+        on_chunk=lambda raw: None, log=cap2,
+        model_id="muse-spark-1.2-contributor-free",
+    ))
+    assert not any("still streaming" in m for m in cap2.records), cap2.records
+    assert outcome2.completed is True
+
+
 def test_unit_stream_guard_opencode_usage_frame_is_terminal():
     """OpenCode's free stream (MuseSpark) ends without finish_reason or [DONE]:
     content chunks carry finish_reason:null, then a `choices:[]`+`usage` frame

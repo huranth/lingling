@@ -15,6 +15,7 @@ without dying is not covered. One response's text is held in memory meanwhile.
 from __future__ import annotations
 
 import json
+import time
 from json import JSONDecodeError
 from typing import Any, Callable, Dict, Generator, Optional
 
@@ -22,6 +23,14 @@ from routing import pacing_memory, stream_idle
 
 # A frame carrying this key tells a client to discard everything rendered so far.
 RESET_KEY = "lingling_reset"
+
+# Wall-clock between "still streaming" heartbeats on a live stream. Complements
+# the silence watchdog (which catches a hidden-reasoning model that never
+# speaks) by confirming a stream that keeps emitting frames across many seconds
+# is alive, not stuck -- an operator tailing the log can tell a long reasoning
+# token from a hung connection without crossing into the ledger. A stream that
+# completes inside the interval streams quietly.
+_HEARTBEAT_INTERVAL_S = 30.0
 
 
 def _parse_sse(raw: bytes) -> Optional[Dict[str, Any]]:
@@ -192,6 +201,14 @@ def guarded_stream(
     """
     source = first
     attempt = 1
+    # Heartbeat cadence: log "still streaming" every _HEARTBEAT_INTERVAL_S of
+    # wall-clock while frames flow, so a long reasoning stream is visibly alive
+    # rather than indistinguishable from a hung connection in the log. elapsed
+    # is measured from stream start (kept across the single retry); frames reset
+    # per attempt so the count names the attempt currently on the wire.
+    started_at = time.monotonic()
+    heartbeat_at = started_at + _HEARTBEAT_INTERVAL_S
+    frames = 0
 
     while True:
         broke: Optional[Exception] = None
@@ -216,6 +233,15 @@ def guarded_stream(
                         pacing_memory.mark_reasoning(model_id)
                 on_chunk(raw)
                 yield raw + b"\n\n"
+                frames += 1
+                now_mono = time.monotonic()
+                if now_mono >= heartbeat_at:
+                    log.info(
+                        "stream: still streaming model=%s attempt=%d frames=%d chars=%d elapsed=%.0fs",
+                        model_id, attempt, frames, outcome.text_chars,
+                        now_mono - started_at,
+                    )
+                    heartbeat_at = now_mono + _HEARTBEAT_INTERVAL_S
         except Exception as exc:  # noqa: BLE001 - any transport failure is a break
             broke = exc
 
@@ -272,6 +298,8 @@ def guarded_stream(
         attempt += 1
         outcome.attempts = attempt
         outcome.text_chars = 0
+        frames = 0
+        heartbeat_at = time.monotonic() + _HEARTBEAT_INTERVAL_S
         # Tell the client to discard the partial answer before the new one lands.
         moved = retry_model() if retry_model is not None else None
         yield reset_frame(reason, attempt, moved) + b"\n\n"
