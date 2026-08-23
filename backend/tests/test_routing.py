@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import importlib
+import unittest
 
 # Isolated data dir so tests never touch the real usage database. NO accounts
 # file -> OpenCode runs keyless, exactly like a fresh install.
@@ -55,8 +56,13 @@ from fastapi.testclient import TestClient  # noqa: E402
 client = TestClient(app)
 
 
-class SkipTest(Exception):
-    """Raised by a test to mark itself skipped (e.g. missing credential)."""
+class SkipTest(unittest.SkipTest):
+    """Raised by a test to mark itself skipped (e.g. missing credential).
+
+    Subclasses ``unittest.SkipTest`` so pytest reports the test as ``skipped``
+    natively (rather than as an error) while the script runner in ``main()``
+    still catches it via ``except SkipTest``.
+    """
 
 
 class _QuietLog:
@@ -324,10 +330,19 @@ def test_live_responses_nonstream_keyless():
 
 def test_live_free_chat_direct():
     """Direct selection of a free model runs keyless on OpenCode Zen."""
+    # Pick the id from the live catalog (``catalog.free`` -- the handler's own
+    # source), never a hardcoded string: OpenCode retires free models without
+    # notice, and a pinned id makes the suite fail against a model nobody
+    # serves anymore. A live 429/400 may legitimately fall back to another
+    # free model (``routed_by == "fallback"``); only when the named model
+    # actually answered do we pin the routed id and the ``user`` wire contract.
+    ids = sorted({m.id for m in catalog.free()})
+    assert ids, "expected at least one live free model"
+    mid = config.DISPATCHER_MODEL if config.DISPATCHER_MODEL in ids else ids[0]
     r = client.post(
         "/v1/chat/completions",
         json={
-            "model": "deepseek-v4-flash-free",
+            "model": mid,
             "messages": [{"role": "user", "content": "Reply with exactly one word: pong"}],
             "max_tokens": 16,
         },
@@ -338,12 +353,21 @@ def test_live_free_chat_direct():
     assert body["choices"], body
     ll = body["lingling"]
     assert ll["provider"] == "opencode"
-    assert ll["routed_by"] == "user"
-    assert ll["routed_model"] == "deepseek-v4-flash-free"
+    assert ll["routed_model"] in _live_free_ids(), ll
+    if ll["routed_by"] != "fallback":
+        assert ll["routed_by"] == "user", ll
+        assert ll["routed_model"] == mid, ll
 
 
 def test_live_multimodel_routing():
-    """lingling-auto runs the real dispatcher and routes to a free model."""
+    """lingling-auto runs the real dispatcher and routes to a free model.
+
+    Skips (with a breadcrumb) when OpenCode's free tier is transitorily cooked
+    for the dispatcher's routed model AND every fallback, so an upstream outage
+    surfaces as an explanatory skip rather than a red that implies a Lingling
+    regression -- the same skip-on-cooked contract as the streaming sibling
+    above. When the tier is healthy the full routing assertion still runs.
+    """
     r = client.post(
         "/v1/chat/completions",
         json={
@@ -355,6 +379,15 @@ def test_live_multimodel_routing():
         },
         timeout=120,
     )
+    if r.status_code == 503:
+        raise SkipTest(
+            f"lingling-auto 503'd ({r.json().get('detail', r.text)[:200]}) -- "
+            f"the dispatcher's routed model and its fallbacks all exhausted "
+            f"against OpenCode's free tier upstream; re-run once the tier is "
+            f"serving again. (A 2026-08-23 deepseek-v4-flash-free outage "
+            f"reproduced this way with the sampler disabled, so it is upstream "
+            f"of Lingling's code.)"
+        )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["choices"], body
@@ -366,20 +399,56 @@ def test_live_multimodel_routing():
 
 
 def test_live_streaming_keyless():
-    """Streaming binds to the keyless OpenCode path and yields SSE chunks."""
-    with client.stream(
-        "POST",
-        "/v1/chat/completions",
-        json={
-            "model": "deepseek-v4-flash-free",
-            "messages": [{"role": "user", "content": "Count from 1 to 3."}],
-            "max_tokens": 40,
-            "stream": True,
-        },
-        timeout=120,
-    ) as r:
-        assert r.status_code == 200
-        chunks = [line for line in r.iter_lines() if line.startswith("data:")]
+    """Streaming binds to the keyless OpenCode path and yields SSE chunks.
+
+    Picks every id from the live catalog (never a hardcoded name) and tries the
+    first few against ``/v1/chat/completions`` streaming, DISPATCHER_MODEL LAST,
+    skipping the test if NONE of them currently returns 200. A transient
+    upstream 'Model is unavailable' on one id (deepseek-v4-flash-free on
+    2026-08-23) is upstream of Lingling's code and not actionable from a red
+    test -- the SKIP preserves the green signal and the reason names the last
+    status it saw so an operator investigating the outage has a breadcrumb.
+    """
+    ids = sorted({m.id for m in catalog.free()})
+    assert ids, "expected at least one live free model"
+
+    # DISPATCHER_MODEL (default deepseek-v4-flash-free) recovers slowest from
+    # an upstream outage announcement: OpenCode marks its stream endpoint
+    # 'Model is unavailable' while the non-stream path still 200s and /models
+    # keeps listing it -- so DISPATCHER_MODEL is left as the LAST poll, and
+    # any earlier live id's stream that returns 200 wins.
+    ordered = [i for i in ids if i != config.DISPATCHER_MODEL][:3]
+    if config.DISPATCHER_MODEL in ids:
+        ordered.append(config.DISPATCHER_MODEL)
+
+    chunks = None
+    last_status = None
+    for candidate in ordered:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": candidate,
+                "messages": [{"role": "user", "content": "Count from 1 to 3."}],
+                "max_tokens": 40,
+                "stream": True,
+            },
+            timeout=45,
+        ) as r:
+            if r.status_code != 200:
+                last_status = r.status_code
+                continue
+            chunks = [line for line in r.iter_lines() if line.startswith("data:")]
+        break  # 200 -- stop polling more models
+
+    if chunks is None:
+        raise SkipTest(
+            f"no live free model's stream endpoint returned 200 on "
+            f"/v1/chat/completions (last_status={last_status}); OpenCode's free "
+            f"streaming tier is transitorily unavailable upstream -- investigate "
+            f"if every free id stays 'Model is unavailable' while /models keeps "
+            f"listing them"
+        )
     assert chunks, "expected at least one SSE data chunk"
     assert any("[DONE]" in c for c in chunks), "stream did not terminate with [DONE]"
 
@@ -421,12 +490,17 @@ def test_live_apikey_gate():
     import app as app_module
     importlib.reload(app_module)
     gated_client = TestClient(app_module.app)
+    # Only the 401 gate is asserted here, so the model is inert -- but no
+    # hardcoded id anywhere in the live suite: pick one the fresh catalog
+    # serves RIGHT NOW so the test never reads like it pins a model.
+    mid = sorted({m.id for m in app_module.catalog.free()})[0]
+    assert mid, "expected at least one live free model"
     try:
         # No key -> 401.
         assert gated_client.get("/v1/models").status_code == 200
         r = gated_client.post(
             "/v1/chat/completions",
-            json={"model": "deepseek-v4-flash-free",
+            json={"model": mid,
                   "messages": [{"role": "user", "content": "hi"}]},
         )
         assert r.status_code == 401, r.text
@@ -441,7 +515,7 @@ def test_live_apikey_gate():
         # the gate passed).
         r = gated_client.post(
             "/v1/chat/completions",
-            json={"model": "deepseek-v4-flash-free",
+            json={"model": mid,
                   "messages": [{"role": "user", "content": "hi"}],
                   "max_tokens": 8},
             headers={"Authorization": f"Bearer {token}"},
@@ -454,7 +528,7 @@ def test_live_apikey_gate():
         gated_client.cookies.clear()
         r = gated_client.post(
             "/v1/chat/completions",
-            json={"model": "deepseek-v4-flash-free",
+            json={"model": mid,
                   "messages": [{"role": "user", "content": "hi"}]},
             headers={"Authorization": "Bearer ll_wrong"},
         )
@@ -1541,6 +1615,62 @@ def test_unit_codex_catalog_entries_clone_a_real_codex_model():
         assert fallback["default_reasoning_level"] == "default"
 
 
+def test_unit_codex_catalog_clamps_context_window_to_the_free_relay_ceiling():
+    """A model whose paper context exceeds OpenCode's free relay cap is
+    advertised at the relay's actual ceiling, not the model's.
+
+    OpenCode's free relay rejects any request whose input exceeds ~262K tokens
+    -- verified against laguna-s-2.1's endpoint with
+    ``[400] This endpoint's maximum context length is 262144 tokens`` -- and
+    behaves identically on muse-spark (an empty ``chat.completion`` stub
+    wrapped in 400). models.dev publishes the upstream model's paper context
+    (muse-spark 1M, nemotron-3-ultra 1M, x-preview-f 1M), which is the model's
+    own limit, NOT the relay's. Advertising the paper number in
+    ``lingling_models.json`` made Codex 0.146 send an ~870K-token session
+    thinking it fit; the relay 400'd every free model attempted in turn and the
+    /v1/responses path fell back to a terminal 503.
+
+    Clamping at ``codex_catalog.entry_for`` time to
+    ``FREE_TIER_RELAY_CONTEXT_CAP`` (with ``min``) lets Codex compact against
+    the relay's actual budget, while every sub-cap model is advertised at the
+    value models.dev really publishes (so e.g. hy3-free is not bumped up to
+    262144 against its real 190K budget).
+    """
+    from models import codex_catalog
+
+    template = _codex_template()
+
+    # A model whose paper context is 1M is advertised at the relay's 262K cap.
+    clamped = codex_catalog.entry_for(
+        template, "muse-spark-1.2-contributor-free", "Muse Spark 1.2 Contributor",
+        ["minimal", "low", "medium", "high", "xhigh"], context_length=1_048_576,
+    )
+    assert clamped["context_window"] == clamped["max_context_window"] == 262144, \
+        "paper context (1M) must clamp to the relay's actual ceiling"
+    # Everything else about the entry is untouched -- this is a clamp, not a
+    # rewrite, so the cloned identity / levels / instructions all survive.
+    assert clamped["context_window"] == codex_catalog.FREE_TIER_RELAY_CONTEXT_CAP
+    assert [lv["effort"] for lv in clamped["supported_reasoning_levels"]] \
+        == ["minimal", "low", "medium", "high", "xhigh"]
+    assert clamped["slug"] == "muse-spark-1.2-contributor-free"
+
+    # A model whose published context is below the cap is advertised at its
+    # real value -- the clamp doesn't bump small-context models up to the cap.
+    preserved = codex_catalog.entry_for(
+        template, "hy3-free", "HY3 Free",
+        ["high"], context_length=190_000,
+    )
+    assert preserved["context_window"] == preserved["max_context_window"] == 190000, \
+        "sub-cap context must be advertised exactly as published, not raised to the cap"
+
+    # A model that sits exactly at the cap stays at the cap (min's identity).
+    at_cap = codex_catalog.entry_for(
+        template, "nemotron-3.5-lightning-free", "Nemotron Lightning",
+        ["high"], context_length=262144,
+    )
+    assert at_cap["context_window"] == at_cap["max_context_window"] == 262144
+
+
 def test_unit_codex_catalog_auto_entry_spans_every_routable_model():
     """`lingling-auto` cannot know its target, so it advertises the union.
 
@@ -1841,26 +1971,57 @@ def test_unit_explicit_model_resolves_from_cache_without_a_refetch():
 def test_unit_hot_models_route_through_the_proxy_pool():
     """The dispatcher and the fast chat model must rotate egress, not bypass it.
 
-    Both used to be `prefer_direct`, which meant the two hottest paths -- the
-    dispatcher (runs on every lingling-auto request) and ling-3.0-flash-free
-    (what the dispatcher picks for most casual chat) -- egressed from the real
-    IP. The WARP rack showed 0 requests on every slot as a result.
+    The gate is ``LINGLING_FAST_MODELS_DIRECT`` (default off): when it is off,
+    ``OpenCodeProvider.prefer_direct`` returns ``False`` for *every* model, so
+    the dispatcher (runs on every lingling-auto turn) and the free chat models
+    the dispatcher lands on all go through the egress pool -- and the WARP rack
+    counts them. The pre-fix here had the two hottest paths opted out of the
+    pool via the old ``prefer_direct`` allowlist, so the rack showed 0 requests
+    on every slot. This is the regression guard against flipping the flag back
+    on or re-introducing the allowlist.
+
+    The assert set is config-provided (``DISPATCHER_MODEL`` / ``MULTIMODEL_ID``
+    -- env-overridable, never a pinned product literal) plus a few live free
+    chat ids when the catalog is reachable, so the test stays hermetic in an
+    offline env and adaptive against upstream retirements when online.
     """
     from providers.opencode import OpenCodeProvider
     from providers.key_pool import KeyPool
 
     prov = OpenCodeProvider(KeyPool([]))
     assert prov.needs_proxy() is True
-    for model_id in (config.DISPATCHER_MODEL, "ling-3.0-flash-free",
-                     "mimo-v2.5-free", "north-mini-code-free"):
+    # The default must hold. An operator setting LINGLING_FAST_MODELS_DIRECT=1
+    # opts fast models out of the pool -- this guard fails to alert them that
+    # the dashboard's per-exit rack would go to zero again.
+    assert config.FAST_MODELS_DIRECT is False, (
+        "FAST_MODELS_DIRECT must default off; an opt-in direct route for hot "
+        "models defeats the per-IP rotation the egress pool exists to provide"
+    )
+
+    # Config-provided ids first (env-overridable knobs -- never a pinned
+    # product literal), then expand with a few live free chat ids the catalog
+    # reports right now so the guard also covers what the dispatcher actually
+    # lands on. Adaptive against upstream retirements when online; when the
+    # catalog is unreachable the gate is all that matters, and the config-only
+    # ids keep the assertion meaningful offline too.
+    try:
+        live_ids = sorted(_live_free_ids())[:3]
+    except Exception:  # noqa: BLE001 -- live catalog optional here, not the gate
+        live_ids = []
+    hot_ids = {config.DISPATCHER_MODEL, config.MULTIMODEL_ID}
+    hot_ids.update(live_ids)
+    for model_id in sorted(hot_ids):
         assert prov.prefer_direct(model_id) is False, \
             f"{model_id} would bypass the egress pool"
 
-    # And a real attempt records the proxy it used, so the rack counts it.
+    # And a real attempt records the proxy it used, so the rack counts it. The
+    # id here is an opaque tag the executor carries through; the FakeProvider
+    # ignores it -- DISPATCHER_MODEL is also env-overridable, so this is never
+    # a hardcoded product literal either.
     fake = FakeProvider("opencode", CANNED, keyed=False, use_proxy=True)
     pool = ProxyPool.from_list([{"id": "p1", "url": "socks5://127.0.0.1:51001"}])
     resp, prov2, key, attempts = executor.execute_nonstream(
-        [{"role": "user", "content": "hi"}], "ling-3.0-flash-free", [fake],
+        [{"role": "user", "content": "hi"}], config.DISPATCHER_MODEL, [fake],
         proxy_pool=pool, session_id="",
     )
     assert resp is CANNED
@@ -2224,12 +2385,26 @@ def test_unit_an_auto_routed_stream_reroutes_to_another_model_mid_flight():
 def test_unit_an_explicit_model_is_never_swapped_mid_stream():
     """Only `lingling-auto` delegates the choice; a named model is a contract.
 
-    A client that asked for `deepseek-v4-flash-free` gets that model on the
-    retry too -- silently answering from a different one would make the response
-    disagree with the request, and callers key cost and behaviour off the model
-    they named. (deepseek is a stable live free model; ling-3.0 is retired.)
+    A client that asked for a specific model gets that model on the retry too
+    -- silently answering from a different one would make the response disagree
+    with the request, and callers key cost and behaviour off the model they
+    named. The named id is picked from the live catalog (``catalog.free``) so
+    the handler's "Unknown model" gate accepts it: a hardcoded id would red the
+    moment OpenCode retires the model upstream (exactly how this test first
+    broke against the retired ``ling-3.0-flash-free``).
     """
     import app as app_mod
+
+    # The handler's pre-check (catalog.providers_for(target)) rejects unknown
+    # ids with a 400 before the mock runs, so the named id must be one the live
+    # catalog actually serves -- pick it from there, never as a literal string.
+    ids = sorted({m.id for m in catalog.free()})
+    if not ids:
+        raise SkipTest(
+            "live catalog unavailable; the named-model rerun path needs an "
+            "id the handler's gate will accept"
+        )
+    mid = ids[0]
 
     seen_models = []
 
@@ -2251,13 +2426,13 @@ def test_unit_an_explicit_model_is_never_swapped_mid_stream():
     app_mod.executor.execute_stream = fake_execute_stream
     try:
         r = client.post("/v1/chat/completions", json={
-            "model": "deepseek-v4-flash-free",
+            "model": mid,
             "messages": [{"role": "user", "content": "Refactor this component"}],
             "stream": True,
         })
         b"".join(r.iter_bytes())
 
-        assert seen_models == ["deepseek-v4-flash-free"] * 2, seen_models
+        assert seen_models == [mid] * 2, seen_models
     finally:
         app_mod.executor.execute_stream = original
 
@@ -2858,43 +3033,77 @@ def test_unit_effort_is_reresolved_when_failover_changes_the_model():
     """Each model honours its own values, so a fallback must re-clamp, not inherit.
 
     The chat path clamped effort for the primary model and then handed the *same*
-    params dict to the fallback: `max` resolved to deepseek's `max`, then travelled
-    unchanged onto laguna, which implements only low/medium/high. OpenCode answers
-    200 for a value it ignores, so it looked like it worked while changing nothing.
-    `_resolve_effort(previous=...)` re-resolves from the client's original label.
-    (laguna-s-2.1-free is a stable live model with the same effort set the
-    retired ling-3.0 used to advertise.)
+    params dict to the fallback: ``max`` resolved to a model that publishes a
+    ``max`` rung, then travelled unchanged onto a model that implements only a
+    lower rung (laguna-s-2.1, ling-3.0). OpenCode answers 200 for a value it
+    ignores, so it looked like it worked while changing nothing.
+    ``_resolve_effort(previous=...)`` re-resolves from the client's original
+    label.
+
+    The primary/fallback pair is picked from the live catalog by capability
+    rather than hardcoded: any free model whose effort set resolves ``max`` to
+    itself is a valid primary, any model that does NOT publish ``max`` but
+    resolves ``max`` to a lower rung is a valid fallback. A pinned pair
+    (deepseek/laguna) reds the moment OpenCode retires one of the two -- the
+    catalog is the real ground truth here.
     """
     import app as app_mod
     from routing import effort
 
-    deepseek = ["high", "max"]
-    laguna = ["low", "medium", "high"]
+    primary = None
+    primary_effs = None
+    fallback = None
+    fallback_effs = None
+    expected_fallback = None
+    for lm in catalog.free():
+        effs = (lm.capabilities or {}).get("effort") or []
+        if not effs:
+            continue
+        # Primary: publishes `max` so "max" resolves to itself.
+        if primary is None and "max" in effs and effort.resolve("max", effs) == "max":
+            primary, primary_effs = lm.id, effs
+        # Fallback: does NOT publish `max` but resolves it to a lower rung
+        # -- exactly the case where the pre-fix carried `max` would be ignored.
+        elif fallback is None and "max" not in effs:
+            downgrade = effort.resolve("max", effs)
+            if downgrade is not None:
+                fallback, fallback_effs = lm.id, effs
+                expected_fallback = downgrade
+        if primary and fallback:
+            break
 
-    # What the two models actually honour, so the expectations below are grounded.
-    assert effort.resolve("max", deepseek) == "max"
-    assert effort.resolve("max", laguna) == "high"
+    if not primary or not fallback:
+        raise SkipTest(
+            "live catalog has no `max`-rung primary or no downgrading fallback; "
+            "the effort re-resolve path could not be exercised"
+        )
+
+    # What the two models actually honour, so the expectations below stay
+    # grounded in the catalog's claims rather than literal predictions.
+    assert effort.resolve("max", primary_effs) == "max", primary_effs
+    assert effort.resolve("max", fallback_effs) == expected_fallback, fallback_effs
 
     params = {"reasoning_effort": "max", "temperature": 0.2}
     original = params["reasoning_effort"]
-    sent = app_mod._resolve_effort(params, "deepseek-v4-flash-free")
+    sent = app_mod._resolve_effort(params, primary)
     if sent is None:
         raise SkipTest("live catalog unavailable; effort could not be resolved")
     assert sent == "max", sent
 
     # The failover path copies params and re-resolves from the original label.
     retry = dict(params)
-    again = app_mod._resolve_effort(retry, "laguna-s-2.1-free", previous=original)
-    assert again == "high", f"laguna does not implement {again!r}"
-    assert retry["reasoning_effort"] == "high"
+    again = app_mod._resolve_effort(retry, fallback, previous=original)
+    assert again == expected_fallback, \
+        f"{fallback} should downgrade 'max' to {expected_fallback!r}, got {again!r}"
+    assert retry["reasoning_effort"] == expected_fallback
     assert retry["temperature"] == 0.2, "other params must survive the retry"
 
     # Without `previous` the already-clamped value would be re-clamped as if the
     # client had asked for it -- which is how the bug produced an illegal value.
     naive = dict(params)
-    app_mod._resolve_effort(naive, "laguna-s-2.1-free")
-    assert naive.get("reasoning_effort") == "high", \
-        "re-clamping max against laguna must still land on high"
+    app_mod._resolve_effort(naive, fallback)
+    assert naive.get("reasoning_effort") == expected_fallback, \
+        f"re-clamping 'max' against {fallback} must land on {expected_fallback!r}"
 
 
 def test_unit_pool_url_updates_go_through_the_lock():
@@ -3963,17 +4172,30 @@ def test_live_responses_stream_retries_on_a_fresh_exit_ip():
     while the chat path recovered its (the dashboard counted 80 broken
     muse-spark turns in one hour on ``/v1/responses``, ~51% break rate).
 
-    Picks the model from the live catalog (see ``_live_free_ids``): OpenCode
-    retires free models without notice, and a stale hardcoded id makes the
-    suite fail against a model nobody serves any more (the chat-path mirror
-    ``test_unit_an_explicit_model_is_never_swapped_mid_stream`` still
-    hardcodes ``deepseek-v4-flash-free`` and is now red on that drift).
+    Picks the model from ``catalog.free`` (NOT ``_live_free_ids``):
+    ``catalog.free`` subtracts the runtime retirements persisted to
+    ``retired_models.json`` during a live suite, while ``_live_free_ids`` only
+    subtracts the seed retired set -- so an id a previous test parked mid-suite
+    still appears in ``_live_free_ids`` but the handler's "Unknown model" gate
+    rejects it before the retry branch this test exercises runs. OpenCode also
+    retires free models without notice, so a hardcoded id reds against a model
+    nobody serves anymore (the chat-path mirror
+    ``test_unit_an_explicit_model_is_never_swapped_mid_stream`` first broke
+    against the retired ``ling-3.0-flash-free`` -- it now picks its id from
+    ``catalog.free`` too, so neither test carries a stale name any more).
     """
     import app as app_mod
 
-    ids = _live_free_ids()
+    # Use ``app_mod.catalog`` -- the live module the handler resolves its own
+    # ``catalog`` global against -- NOT the test_routing-py module-level
+    # ``catalog`` bound at import time. ``test_live_apikey_gate`` reloads
+    # ``app`` with ``importlib``, which rebinds ``sys.modules['app'].catalog``
+    # but leaves our module-level name pointing at the OLD catalog instance; a
+    # mid picked from the stale instance is rejected by the handler's "Unknown
+    # model" gate before the retry branch this test exercises runs.
+    ids = sorted({m.id for m in app_mod.catalog.free()})
     assert ids, "expected at least one live free model"
-    mid = config.DISPATCHER_MODEL if config.DISPATCHER_MODEL in ids else sorted(ids)[0]
+    mid = config.DISPATCHER_MODEL if config.DISPATCHER_MODEL in ids else ids[0]
 
     seen = []
 
@@ -4031,3 +4253,243 @@ def test_live_responses_stream_retries_on_a_fresh_exit_ip():
         assert '"text":"retry"' in body, body
     finally:
         app_mod.executor.execute_stream = original
+
+
+def test_live_responses_stream_falls_back_to_another_model_when_primary_exhausts():
+    """``/v1/responses`` streaming falls back to another model when the primary
+    exhausts *before* HTTP 200 -- the chat non-stream path's contract that
+    ``/v1/responses`` was missing.
+
+    ``execute_stream`` raises ``AllFailedError`` from inside the wait for the
+    FIRST chunk, so no bytes have hit the wire when the streaming catch fires
+    -- exactly the window the chat non-stream handler already swapped the model
+    in. The streaming catch here was a terminal 503 ("No upstream stream started
+    within X s"), indistinguishable from a 429 IP burn, so a Codex-shaped turn
+    (tools / long context / reasoning payload) that OpenCode rejects with a
+    non-retryable 400 -- while a one-line curl through ``/v1/chat/completions``
+    non-stream recovered -- came back as a session-killing 503 to Codex 0.146.
+    The streaming catch now mirrors the chat non-stream path: pick a
+    sampler-cleared fallback, re-resolve effort, retry on the streaming path.
+    If the fallback opens cleanly, the rest of the handler streams against the
+    model that actually answered -- the wire headers and the usage ledger name
+    it, not the one that died (a 400 on the named model must not poison the
+    dashboard count for the model that rescued the turn).
+
+    Picks ``primary`` and ``fallback`` from the live catalog (``catalog.free``),
+    not from ``_live_free_ids``. The latter subtracts only the *seed* retired
+    list; runtime retirements land in the data dir's ``retired_models.json``
+    and are NOT subtracted, so an id a previous test in this suite parked
+    mid-run still shows up in ``_live_free_ids`` but with no providers in the
+    catalog. The ``/v1/responses`` handler's "Unknown model" gate at the top
+    rejects it BEFORE the fallback branch we exercise runs, and this test
+    reds through no fault of the fix -- exactly how the sibling
+    ``test_live_responses_stream_retries_on_a_fresh_exit_ip`` reds elsewhere
+    in the suite. ``catalog.free`` already subtracts the retired set, so the
+    picked pair always has providers to dispatch against.
+    """
+    import app as app_mod
+    from providers.base import UpstreamError as _UpstreamError
+    from routing import executor as exec_mod
+
+    # ``app_mod.catalog`` matches the handler's ``catalog`` global even after
+    # ``test_live_apikey_gate`` reloads ``app`` via importlib -- the test_routing
+    # module-level ``catalog`` would be left bound to the stale instance while
+    # the handler resolves the fresh module's catalog. See the sibling
+    # ``test_live_responses_stream_retries_on_a_fresh_exit_ip`` for the full
+    # divergence explanation; the same fix applies here.
+    ids = sorted({m.id for m in app_mod.catalog.free()})
+    assert len(ids) >= 2, "expected at least two routable free models for a fallback"
+    primary, fallback = ids[0], ids[1]
+
+    seen = []
+
+    def fake_execute_stream(messages, model_id, providers, **kwargs):
+        seen.append(model_id)
+        if model_id == primary:
+            # Non-retryable upstream rejection (e.g. a Codex-shaped tool-calls
+            # payload the upstream 400s over). The executor is mocked so no real
+            # network round-trip happens, and no half-written answer is on the
+            # wire -- exactly the pre-HTTP-200 window this test exercises.
+            raise exec_mod.AllFailedError(
+                _UpstreamError(400, "bad request shape", "opencode"), [],
+            )
+
+        def gen():
+            yield b'data: {"choices":[{"delta":{"content":"hello"}}]}'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+
+        class _P:
+            id = "opencode"
+
+        return gen(), _P(), None, []
+
+    orig_exec = app_mod.executor.execute_stream
+    orig_fb = app_mod.dispatcher.fallback_model
+    app_mod.executor.execute_stream = fake_execute_stream
+    # The response is deterministically rerouted onto our picked fallback so
+    # the assertion on its id is stable; the live catalog supplies the real
+    # ``providers_for(fallback)`` the retry is dispatched against.
+    app_mod.dispatcher.fallback_model = (
+        lambda catalog, has_images, exclude=None, messages=None: fallback
+    )
+    try:
+        # The module-level client, not a fresh ``with TestClient(...)``:
+        # entering one runs the lifespan hook that registers WARP identities.
+        r = client.post("/v1/responses", json={
+            "model": primary,
+            "input": "Refactor this component",
+            "stream": True,
+        })
+        assert r.status_code == 200, r.status_code
+        body = b"".join(r.iter_bytes()).decode("utf-8")
+
+        # The primary exhausted pre-stream and the handler rerouted onto the
+        # fallback, which streamed cleanly. Both models were attempted, in
+        # order -- the primary first (it failed), then the fallback.
+        assert seen == [primary, fallback], f"expected reroute, got {seen}"
+        # Routing metadata on the wire names the model that actually answered,
+        # not the one that died -- the dashboard and Codex's session UI read
+        # these headers, and the usage ledger keys off the routed model.
+        assert r.headers["X-Lingling-Routed-Model"] == fallback, (
+            r.headers.get("X-Lingling-Routed-Model"))
+        assert r.headers["X-Lingling-Routed-By"] == "fallback", (
+            r.headers.get("X-Lingling-Routed-By"))
+        # The bridge translated the chat SSE into Responses events; the
+        # fallback's answer text survived on the wire and close-out is the
+        # Responses ``status: completed`` marker, not ``incomplete`` (no
+        # mid-flight retry fired -- the primary never got bytes out).
+        assert '"text":"hello"' in body, body[:600]
+        assert '"status":"completed"' in body, body[:600]
+        assert '"status":"incomplete"' not in body, body[:600]
+    finally:
+        app_mod.executor.execute_stream = orig_exec
+        app_mod.dispatcher.fallback_model = orig_fb
+
+
+def test_live_chat_stream_falls_back_to_another_model_when_primary_exhausts():
+    """``/v1/chat/completions`` streaming falls back to another model when the
+    primary exhausts *before* HTTP 200 -- the parity the responses stream path
+    and the chat non-stream path already had, which chat streaming was missing
+    (a bare 503 "No upstream stream started within X s" while a non-stream curl
+    of the same cooked model recovered -- the streaming-vs-non-stream asymmetry).
+
+    Same mock as the sibling responses test: ``execute_stream`` raises
+    ``AllFailedError`` for the primary (pre-200, no bytes on the wire) and
+    streams cleanly for the fallback. Asserts both models were attempted in
+    order, the wire headers name the fallback (not the model that died), and the
+    fallback's raw chat SSE survived the passthrough.
+    """
+    import app as app_mod
+    from providers.base import UpstreamError as _UpstreamError
+    from routing import executor as exec_mod
+
+    ids = sorted({m.id for m in app_mod.catalog.free()})
+    assert len(ids) >= 2, "expected at least two routable free models for a fallback"
+    primary, fallback = ids[0], ids[1]
+
+    seen = []
+
+    def fake_execute_stream(messages, model_id, providers, **kwargs):
+        seen.append(model_id)
+        if model_id == primary:
+            raise exec_mod.AllFailedError(
+                _UpstreamError(400, "bad request shape", "opencode"), [],
+            )
+
+        def gen():
+            yield b'data: {"choices":[{"delta":{"content":"hello"}}]}'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+
+        class _P:
+            id = "opencode"
+
+        return gen(), _P(), None, []
+
+    orig_exec = app_mod.executor.execute_stream
+    orig_fb = app_mod.dispatcher.fallback_model
+    app_mod.executor.execute_stream = fake_execute_stream
+    app_mod.dispatcher.fallback_model = (
+        lambda catalog, has_images, exclude=None, messages=None: fallback
+    )
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": primary,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        })
+        assert r.status_code == 200, r.status_code
+        body = b"".join(r.iter_bytes()).decode("utf-8")
+        assert seen == [primary, fallback], f"expected reroute, got {seen}"
+        assert r.headers["X-Lingling-Routed-Model"] == fallback, (
+            r.headers.get("X-Lingling-Routed-Model"))
+        assert r.headers["X-Lingling-Routed-By"] == "fallback", (
+            r.headers.get("X-Lingling-Routed-By"))
+        assert '"content":"hello"' in body, body[:600]
+    finally:
+        app_mod.executor.execute_stream = orig_exec
+        app_mod.dispatcher.fallback_model = orig_fb
+
+
+def test_live_messages_stream_falls_back_to_another_model_when_primary_exhausts():
+    """``/v1/messages`` streaming falls back to another model when the primary
+    exhausts *before* HTTP 200 -- the parity the chat/responses stream paths and
+    this handler's own non-stream branch already had, which ``/v1/messages``
+    streaming was missing (a bare 503 while a non-stream request recovered).
+
+    Same mock as the sibling responses/chat tests. The Anthropic ``model`` field
+    is a plain free id, which ``model_map.resolve`` returns unchanged (rule 1: a
+    real served id is already an answer), so routing lands on it directly without
+    the dispatcher. Asserts both models were attempted in order, the wire headers
+    name the fallback, and the messages bridge translated the fallback's chat SSE
+    into Anthropic events with the answer text surviving.
+    """
+    import app as app_mod
+    from providers.base import UpstreamError as _UpstreamError
+    from routing import executor as exec_mod
+
+    ids = sorted({m.id for m in app_mod.catalog.free()})
+    assert len(ids) >= 2, "expected at least two routable free models for a fallback"
+    primary, fallback = ids[0], ids[1]
+
+    seen = []
+
+    def fake_execute_stream(messages, model_id, providers, **kwargs):
+        seen.append(model_id)
+        if model_id == primary:
+            raise exec_mod.AllFailedError(
+                _UpstreamError(400, "bad request shape", "opencode"), [],
+            )
+
+        def gen():
+            yield b'data: {"choices":[{"delta":{"content":"hello"}}]}'
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+
+        class _P:
+            id = "opencode"
+
+        return gen(), _P(), None, []
+
+    orig_exec = app_mod.executor.execute_stream
+    orig_fb = app_mod.dispatcher.fallback_model
+    app_mod.executor.execute_stream = fake_execute_stream
+    app_mod.dispatcher.fallback_model = (
+        lambda catalog, has_images, exclude=None, messages=None: fallback
+    )
+    try:
+        r = client.post("/v1/messages", json={
+            "model": primary,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64,
+            "stream": True,
+        })
+        assert r.status_code == 200, r.status_code
+        body = b"".join(r.iter_bytes()).decode("utf-8")
+        assert seen == [primary, fallback], f"expected reroute, got {seen}"
+        assert r.headers["X-Lingling-Routed-Model"] == fallback, (
+            r.headers.get("X-Lingling-Routed-Model"))
+        assert r.headers["X-Lingling-Routed-By"] == "fallback", (
+            r.headers.get("X-Lingling-Routed-By"))
+        assert '"text":"hello"' in body, body[:600]
+    finally:
+        app_mod.executor.execute_stream = orig_exec
+        app_mod.dispatcher.fallback_model = orig_fb

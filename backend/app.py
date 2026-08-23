@@ -197,6 +197,22 @@ def _bootstrap_tor() -> None:
                         "rotated %d burned Tor lanes",
                         tor_summary.total, tor_rotated,
                     )
+                # Re-run the sampler over the now-full pool so Tor lanes feed
+                # ok_exits() right away. Without this, ok_exits() for every
+                # sampled model still reflects the WARP-only pool the
+                # WARP-startup sampler snapshotted before Tor bootstrapped, so a
+                # model burned on WARP but served by a fresh Tor lane reads
+                # "cooked" (empty ok_set -> fail-fast on WARP) for up to the
+                # SAMPLER_INTERVAL_S it takes the daemon's first sampler cycle to
+                # catch up. The sampler shares ``tor_summary`` (the full-pool
+                # canary) so the canary is not re-probed.
+                if config.SAMPLER_ENABLED:
+                    try:
+                        sampler.sample_models(
+                            proxy_pool, catalog, tor_summary, log=log.info,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("sampler: post-Tor pass failed (%s)", exc)
             except Exception as exc:  # noqa: BLE001
                 log.warning("probe: Tor-join snapshot refresh failed (%s)", exc)
     except Exception as exc:  # noqa: BLE001
@@ -413,15 +429,12 @@ app.router.lifespan_context = lifespan
 # raised TypeError -> HTTP 500. `timeout` is the realistic one: a plausible
 # field for a client to send, and it killed the streaming path while the
 # non-streaming path survived (different call shape).
-# OpenAI-compatible fields Lingling manages itself, excluded from passthrough.
-# `**params` is splatted into the executor and provider calls, so a body field
-# colliding with a positional/keyword arg there raised TypeError -> 500.
-# `timeout` was the realistic one: a plausible field to send, and it killed the
-# streaming path while the non-streaming path survived (different call shape).
 _PASSTHROUGH_EXCLUDE = frozenset({
     "model", "messages", "stream", "lingling", "session_id", "lingling_recover",
     # executor.execute_nonstream / execute_stream signature
     "model_id", "providers", "proxy_pool", "timeout",
+    # execute_stream-only: per-attempt lifecycle callback (see _log_stream_attempt)
+    "on_attempt",
     # provider stream_chat / chat_completions signature (bound explicitly by the
     # executor, so a client-supplied value would collide and raise TypeError)
     "proxy_url", "proxy_id", "secret", "self",
@@ -569,11 +582,13 @@ def _sync_warp_to_pool() -> int:
 def _start_warp_at_startup() -> Dict[str, Any]:
     """Auto-start existing WARP identities and sync them to the proxy pool.
 
-    Returns the number of *new* WARP proxies added to the pool. Existing
-    ``warp-N`` entries have their URL refreshed in place so port migrations are
-    reflected immediately.
+    Returns a status dict: ``started`` (bool); ``reason`` set on early-out when
+    tools are missing, no identities are registered, or ``start_all`` raises;
+    ``pool`` (proxy-pool snapshot); and on success ``synced_to_pool`` -- the
+    count of new ``warp-N`` entries added. Existing entries get their URL
+    refreshed in place so port migrations are reflected immediately.
     """
-    if not warp_manager.tools_ready() or warp_manager.status()["identities_registered"] == 0:
+    if not warp_manager.tools_ready():
         return {"started": False, "reason": "tools not ready", "pool": proxy_pool.status()}
     status = warp_manager.status()
     if status["identities_registered"] == 0:
@@ -701,9 +716,11 @@ def get_models(refresh: int = 0) -> Dict[str, Any]:
 def v1_info() -> Dict[str, Any]:
     """Small compatibility landing page for clients pointed at `/v1`.
 
-    Codex/Cline and other OpenAI-compatible clients normally call `/v1/models` and
-    `/v1/chat/completions`; this makes a browser/manual probe of the base URL
-    less confusing.
+    OpenAI-compatible clients normally call `/v1/models` and either
+    `/v1/chat/completions` (Codex < 0.144, Cline, etc.) or `/v1/responses`
+    (Codex >= 0.144); Anthropic-shaped clients like Claude Code use
+    `/v1/messages`. Surfacing all three keeps a browser/manual probe of the
+    base URL honest about what's actually served.
     """
     return {
         "object": "api.info",
@@ -712,6 +729,8 @@ def v1_info() -> Dict[str, Any]:
         "endpoints": {
             "models": "/v1/models",
             "chat_completions": "/v1/chat/completions",
+            "responses": "/v1/responses",
+            "messages": "/v1/messages",
         },
     }
 
@@ -871,7 +890,7 @@ def warp_stop() -> Dict[str, Any]:
 
 
 @app.get("/api/warp/health")
-def warp_health(probe: bool = False) -> Dict[str, Any]:
+def warp_health_status(probe: bool = False) -> Dict[str, Any]:
     """Health check: TCP-connect each WARP SOCKS5 port (optional HTTP probe).
 
     The HTTP probe uses opencode.ai as target to verify the tunnel is actually
@@ -1410,6 +1429,42 @@ def _flag_model_retired(exc: Exception, model_id: str) -> bool:
     return True
 
 
+def _log_stream_attempt(event: str, data: Dict[str, Any]) -> None:
+    """Per-attempt stream lifecycle log, fired inside ``execute_stream``'s retry loop.
+
+    The responses handler's only post-arrival line used to fire *after*
+    ``execute_stream`` returned -- by which point minutes of silent
+    first-chunk waiting across burned exit IPs were invisible in the
+    backend log, indistinguishable from a client that never sent a
+    request at all. Each retry now emits a ``dispatch`` line (with the
+    proxy picked, so a wait that turns silent is no longer
+    indistinguishable from "no request was ever sent"), then either a
+    ``first_token`` line confirming the lane is live or a ``failure``
+    line with the status code naming why an IP burned. A typical
+    succeed-first turn is 2 lines; a burn-and-retry turn is 3 lines per
+    burned attempt plus a survivor pair -- a heartbeat the previous
+    single-after-the-fact summary never had.
+    """
+    proxy = data.get("proxy") or "direct"
+    n = data.get("n", "?")
+    prov = data.get("prov")
+    if event == "dispatch":
+        log.info(
+            "stream attempt: dispatched #%d prov=%s proxy=%s model=%s",
+            n, prov, proxy, data.get("model"),
+        )
+    elif event == "first_token":
+        log.info(
+            "stream attempt: first_token #%d after %.0fms prov=%s proxy=%s",
+            n, data.get("elapsed_ms", -1), prov, proxy,
+        )
+    elif event == "failure":
+        log.info(
+            "stream attempt: failed #%d after %.0fms status=%s prov=%s proxy=%s",
+            n, data.get("elapsed_ms", -1), data.get("status"), prov, proxy,
+        )
+
+
 async def _execute_with_egress_wait(fn, *args, **kwargs):
     """Run an executor call, waiting out a fully-cooled egress pool once.
 
@@ -1607,15 +1662,99 @@ async def chat_completions(request: Request):
         stream_iter, prov, key, attempts = await _execute_with_egress_wait(
             executor.execute_stream,
             messages, target, target_providers, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=stream_read_to, **params
+            session_id=session_id, timeout=stream_read_to,
+            on_attempt=_log_stream_attempt, **params
         )
     except (executor.AllFailedError, executor.NoProviderError) as exc:
+        # Surface the actual upstream rejection (status + detail), so the
+        # dashboard, the log and the returned 503 name the real cause rather than
+        # the generic "No upstream stream started within X s" every exhaustion
+        # used to read as.
         error = str(getattr(exc, "last_error", exc))
-        usage_store.log(
-            requested, target, routed_by, reason, status="exhausted",
-            had_images=had_images, error=error[:300],
+        last_status = getattr(getattr(exc, "last_error", None), "status_code", None)
+        log.warning(
+            "chat stream: all upstream attempts failed target=%s last_status=%s error=%s",
+            target, last_status, error[:300],
         )
-        raise HTTPException(503, f"No upstream stream started within {stream_read_to:g}s for '{target}'.")
+
+        # Pre-HTTP-200 fallback: mirror the chat non-stream path's contract (and
+        # the /v1/responses stream path). execute_stream raises while still
+        # waiting for the first chunk, so no bytes are on the wire yet -- a model
+        # swap is safe and invisible to the client, exactly the window the chat
+        # non-stream handler already fell back in. Without this the stream path
+        # returned a bare 503 on a transiently-exhausted model while a one-line
+        # curl through the non-stream branch recovered -- the streaming-vs-non-
+        # stream fallback asymmetry upstream tracks as LiteLLM #25843. Only route
+        # onto a model the sampler has not proven cooked, so a model every green
+        # exit already refused is not churned again.
+        fallback = dispatcher.fallback_model(
+            catalog, had_images,
+            exclude={target} | set(sampler.cooked_models()), messages=messages,
+        )
+        fallback_providers = catalog.providers_for(fallback) if fallback else None
+        if not (fallback and fallback != target and fallback_providers):
+            usage_store.log(
+                requested, target, routed_by, reason, status="exhausted",
+                had_images=had_images, error=error[:300],
+            )
+            raise HTTPException(
+                503,
+                f"No upstream stream started within {stream_read_to:g}s for '{target}' "
+                f"(last upstream status {last_status}).",
+            )
+        log.warning(
+            "chat stream rerouting %s -> %s (primary exhausted, last_status=%s)",
+            target, fallback, last_status,
+        )
+        retry_params = dict(params)
+        _resolve_effort(retry_params, fallback, previous=original_effort)
+        retry_messages = _messages_for_model(messages, fallback, had_images)
+        # The retry may land on a non-reasoning model whose thinking patience is
+        # shorter than the primary's -- re-derive pacing so the idle watchdog is
+        # not tuned for the dead model.
+        retry_idle_budget, retry_read_to = _stream_pacing(fallback, body)
+        try:
+            stream_iter, prov, key, attempts2 = await _execute_with_egress_wait(
+                executor.execute_stream,
+                retry_messages, fallback, fallback_providers, proxy_pool=proxy_pool,
+                session_id=session_id, timeout=retry_read_to,
+                on_attempt=_log_stream_attempt, **retry_params
+            )
+        except (executor.AllFailedError, executor.NoProviderError) as fallback_exc:
+            fb_error = str(getattr(fallback_exc, "last_error", fallback_exc))
+            fb_last_status = getattr(
+                getattr(fallback_exc, "last_error", None), "status_code", None,
+            )
+            log.warning(
+                "chat stream: fallback %s also exhausted target=%s last_status=%s "
+                "error=%s",
+                fallback, target, fb_last_status, fb_error[:300],
+            )
+            usage_store.log(
+                requested, target, routed_by, reason, status="exhausted",
+                had_images=had_images,
+                error=f"{error[:150]} || {fb_error[:150]}",
+            )
+            raise HTTPException(
+                503,
+                f"All providers exhausted for '{target}' "
+                f"(primary last status {last_status}; fallback {fallback} last "
+                f"status {fb_last_status}).",
+            )
+        # The fallback opened cleanly -- rebind routing metadata the rest of the
+        # handler streams against (the row opened below, `_reopen`, the idle
+        # watchdog and the finalize envelope must all name the model the answer
+        # actually came from). Same rewrite the chat non-stream path does on a
+        # successful fallback, plus re-derived pacing so streaming recovery / idle
+        # budgets match the model now riding the wire.
+        attempts = list(getattr(exc, "attempts", [])) + list(attempts2)
+        target = fallback
+        target_providers = fallback_providers
+        params = retry_params
+        stream_idle_budget, stream_read_to = retry_idle_budget, retry_read_to
+        reason = f"primary stream failed ({getattr(exc, 'last_error', exc)}); " \
+                 f"fell back to {fallback}"
+        routed_by = "fallback"
 
     account_id = key.id if key is not None else None  # keyless -> no account
     # Log at first chunk so a stream that dies mid-flight still leaves a record;
@@ -1680,7 +1819,7 @@ async def chat_completions(request: Request):
         again, _prov, _key, _attempts = executor.execute_stream(
             retry_messages, retry_model, providers_for_retry, proxy_pool=proxy_pool,
             session_id=session_id, timeout=retry_read_to,
-            **retry_params
+            on_attempt=_log_stream_attempt, **retry_params
         )
         return stream_idle.with_idle_timeout(again, retry_idle_budget, log)
 
@@ -1804,6 +1943,10 @@ async def responses(request: Request):
         raise HTTPException(400, str(exc))
 
     stream = bool(body.get("stream"))
+    log.info(
+        "responses: received POST requested=%s stream=%s",
+        requested, stream,
+    )
     session_id = request.headers.get("session-id") or body.get("prompt_cache_key", "")
     if not isinstance(session_id, str):
         session_id = ""
@@ -1909,23 +2052,112 @@ async def responses(request: Request):
     # `lingling_recover: false` or via LINGLING_STREAM_RECOVERY. Without it, a
     # break here was terminal `stream_broken` (the dashboard counted 80 lost
     # muse-spark turns in one hour on this path while the chat path recovered
-    # its 2 -- the bridge literally commented "There is no Responses equivalent
-    # of the chat path's lingling_reset, so this reports rather than retries").
+    # its 2). The Responses wire has no chat-path `lingling_reset` to discard
+    # rendered deltas; the bridge flushes in-flight items with `.done`
+    # (status `incomplete`) and the fresh-egress retry opens new
+    # `response.output_item.added` events.
     recover = bool(body.get("lingling_recover", config.STREAM_RECOVERY))
     started = time.time()
     try:
         stream_iter, prov, key, attempts = await _execute_with_egress_wait(
             executor.execute_stream,
             messages, target, target_providers, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=stream_read_to, **params
+            session_id=session_id, timeout=stream_read_to,
+            on_attempt=_log_stream_attempt, **params
         )
     except (executor.AllFailedError, executor.NoProviderError) as exc:
+        # Surface the actual upstream rejection. The 503 message and the usage
+        # ledger never show it today -- every exhaustion reads as the same
+        # generic "No upstream stream started within X s" -- so a Codex-shaped
+        # turn that OpenCode answers with, say, a 400 over a tool-calls payload
+        # is indistinguishable from a 429 IP burn. The status + detail here let
+        # the dashboard, the log and the returned 503 all name the real cause.
         error = str(getattr(exc, "last_error", exc))
-        usage_store.log(
-            requested, target, routed_by, reason, status="exhausted",
-            had_images=had_images, error=error[:300],
+        last_status = getattr(getattr(exc, "last_error", None), "status_code", None)
+        log.warning(
+            "responses stream: all upstream attempts failed target=%s last_status=%s "
+            "error=%s",
+            target, last_status, error[:300],
         )
-        raise HTTPException(503, f"No upstream stream started within {stream_read_to:g}s for '{target}'.")
+
+        # Pre-HTTP-200 fallback: mirror the chat non-stream path's contract. The
+        # streaming catch is fired *before* any bytes are on the wire (execute_stream
+        # raises AllFailedError while waiting for the first chunk), so there is no
+        # half-written answer to discard and a model swap is safe -- exactly the
+        # window the chat non-stream handler already fell back in. The streaming
+        # path had no analogue, so Codex 0.146 took the terminal 503 here as a
+        # session-killing error while a one-line curl through /v1/chat/completions
+        # (whose non-stream branch falls back) recovered. Only route onto a model
+        # the sampler has not proven cooked -- retrying onto a model every green
+        # exit already refused would just exhaust again.
+        fallback = dispatcher.fallback_model(
+            catalog, had_images,
+            exclude={target} | set(sampler.cooked_models()), messages=messages,
+        )
+        fallback_providers = catalog.providers_for(fallback) if fallback else None
+        if not (fallback and fallback != target and fallback_providers):
+            usage_store.log(
+                requested, target, routed_by, reason, status="exhausted",
+                had_images=had_images, error=error[:300],
+            )
+            raise HTTPException(
+                503,
+                f"No upstream stream started within {stream_read_to:g}s for '{target}' "
+                f"(last upstream status {last_status}).",
+            )
+        log.warning(
+            "responses stream rerouting %s -> %s (primary exhausted, last_status=%s)",
+            target, fallback, last_status,
+        )
+        retry_params = dict(params)
+        _resolve_effort(retry_params, fallback, previous=original_effort)
+        retry_messages = _messages_for_model(messages, fallback, had_images)
+        # The retry may land on a non-reasoning model whose thinking patience is
+        # shorter than muse-spark's -- re-derive pacing so the idle watchdog is
+        # not tuned for the dead model.
+        retry_idle_budget, retry_read_to = _stream_pacing(fallback, body)
+        try:
+            stream_iter, prov, key, attempts2 = await _execute_with_egress_wait(
+                executor.execute_stream,
+                retry_messages, fallback, fallback_providers, proxy_pool=proxy_pool,
+                session_id=session_id, timeout=retry_read_to,
+                on_attempt=_log_stream_attempt, **retry_params
+            )
+        except (executor.AllFailedError, executor.NoProviderError) as fallback_exc:
+            fb_error = str(getattr(fallback_exc, "last_error", fallback_exc))
+            fb_last_status = getattr(
+                getattr(fallback_exc, "last_error", None), "status_code", None,
+            )
+            log.warning(
+                "responses stream: fallback %s also exhausted target=%s "
+                "last_status=%s error=%s",
+                fallback, target, fb_last_status, fb_error[:300],
+            )
+            usage_store.log(
+                requested, target, routed_by, reason, status="exhausted",
+                had_images=had_images,
+                error=f"{error[:150]} || {fb_error[:150]}",
+            )
+            raise HTTPException(
+                503,
+                f"All providers exhausted for '{target}' "
+                f"(primary last status {last_status}; fallback {fallback} last "
+                f"status {fb_last_status}).",
+            )
+        # The fallback opened cleanly -- rebind routing metadata the rest of the
+        # handler streams against (its own headers, ledger, _reopen, watchdog
+        # frames must name the model the answer actually came from). The same
+        # rewrite the chat non-stream path does on a successful fallback, plus
+        # re-derived pacing so streaming recovery / idle-timeout budgets match
+        # the model now riding the wire.
+        attempts = list(getattr(exc, "attempts", [])) + list(attempts2)
+        target = fallback
+        target_providers = fallback_providers
+        params = retry_params
+        stream_idle_budget, stream_read_to = retry_idle_budget, retry_read_to
+        reason = f"primary stream failed ({getattr(exc, 'last_error', exc)}); " \
+                 f"fell back to {fallback}"
+        routed_by = "fallback"
 
     account_id = key.id if key is not None else None
     row_id = usage_store.log(
@@ -1988,7 +2220,7 @@ async def responses(request: Request):
         again, _prov, _key, _attempts = executor.execute_stream(
             retry_messages, retry_model, providers_for_retry,
             proxy_pool=proxy_pool, session_id=session_id, timeout=retry_read_to,
-            **retry_params
+            on_attempt=_log_stream_attempt, **retry_params
         )
         return stream_idle.with_idle_timeout(again, retry_idle_budget, log)
 
@@ -2225,15 +2457,99 @@ async def messages(request: Request):
         stream_iter, prov, key, attempts = await _execute_with_egress_wait(
             executor.execute_stream,
             messages_in, target, target_providers, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=stream_read_to, **params
+            session_id=session_id, timeout=stream_read_to,
+            on_attempt=_log_stream_attempt, **params
         )
     except (executor.AllFailedError, executor.NoProviderError) as exc:
+        # Surface the actual upstream rejection so the 503 and the ledger name
+        # the real cause (matches the chat/responses stream paths).
         error = str(getattr(exc, "last_error", exc))
-        usage_store.log(
-            requested, target, routed_by, reason, status="exhausted",
-            had_images=had_images, error=error[:300],
+        last_status = getattr(getattr(exc, "last_error", None), "status_code", None)
+        log.warning(
+            "messages stream: all upstream attempts failed target=%s last_status=%s "
+            "error=%s",
+            target, last_status, error[:300],
         )
-        raise HTTPException(503, f"No upstream stream started within {stream_read_to:g}s for '{target}'.")
+
+        # Pre-HTTP-200 fallback: mirror the chat/responses stream paths and this
+        # handler's own non-stream branch. execute_stream raises before any bytes
+        # are on the wire, so a model swap is invisible to Claude Code. Without
+        # this the stream path bare-503'd on a transiently-exhausted model while
+        # the non-stream branch above recovered -- the streaming-vs-non-stream
+        # fallback asymmetry upstream tracks as LiteLLM #25843. Mid-flight
+        # recovery is deliberately NOT added here: Anthropic's streaming event
+        # model has no "discard rendered deltas" marker and Claude Code honours
+        # no synthetic reset, so reopening on a fresh exit would double-render the
+        # partial answer -- the safe recovery window for Anthropic wire is
+        # pre-200 only.
+        fallback = dispatcher.fallback_model(
+            catalog, had_images,
+            exclude={target} | set(sampler.cooked_models()), messages=messages_in,
+        )
+        fallback_providers = catalog.providers_for(fallback) if fallback else None
+        if not (fallback and fallback != target and fallback_providers):
+            usage_store.log(
+                requested, target, routed_by, reason, status="exhausted",
+                had_images=had_images, error=error[:300],
+            )
+            raise HTTPException(
+                503,
+                f"No upstream stream started within {stream_read_to:g}s for '{target}' "
+                f"(last upstream status {last_status}).",
+            )
+        log.warning(
+            "messages stream rerouting %s -> %s (primary exhausted, last_status=%s)",
+            target, fallback, last_status,
+        )
+        retry_params = dict(params)
+        _resolve_effort(retry_params, fallback, previous=original_effort)
+        retry_messages = _messages_for_model(messages_in, fallback, had_images)
+        # Re-derive pacing so the idle watchdog is tuned to the fallback, not the
+        # dead model (a hidden-reasoning primary's long budget would otherwise
+        # carry onto a normal fallback).
+        retry_idle_budget, retry_read_to = _stream_pacing(fallback, body)
+        try:
+            stream_iter, prov, key, attempts2 = await _execute_with_egress_wait(
+                executor.execute_stream,
+                retry_messages, fallback, fallback_providers, proxy_pool=proxy_pool,
+                session_id=session_id, timeout=retry_read_to,
+                on_attempt=_log_stream_attempt, **retry_params
+            )
+        except (executor.AllFailedError, executor.NoProviderError) as fallback_exc:
+            fb_error = str(getattr(fallback_exc, "last_error", fallback_exc))
+            fb_last_status = getattr(
+                getattr(fallback_exc, "last_error", None), "status_code", None,
+            )
+            log.warning(
+                "messages stream: fallback %s also exhausted target=%s last_status=%s "
+                "error=%s",
+                fallback, target, fb_last_status, fb_error[:300],
+            )
+            usage_store.log(
+                requested, target, routed_by, reason, status="exhausted",
+                had_images=had_images,
+                error=f"{error[:150]} || {fb_error[:150]}",
+            )
+            raise HTTPException(
+                503,
+                f"All providers exhausted for '{target}' "
+                f"(primary last status {last_status}; fallback {fallback} last "
+                f"status {fb_last_status}).",
+            )
+        # The fallback opened cleanly -- rebind the routing metadata the rest of
+        # the handler streams against (the row opened below, the SSE headers and
+        # the finalize must all name the model the answer came from). Same
+        # rewrite the non-stream branch above does on a successful fallback, plus
+        # re-derived pacing so the live stream's idle budget matches the model now
+        # riding the wire.
+        attempts = list(getattr(exc, "attempts", [])) + list(attempts2)
+        target = fallback
+        target_providers = fallback_providers
+        params = retry_params
+        stream_idle_budget, stream_read_to = retry_idle_budget, retry_read_to
+        reason = f"primary stream failed ({getattr(exc, 'last_error', exc)}); " \
+                 f"fell back to {fallback}"
+        routed_by = "fallback"
 
     account_id = key.id if key is not None else None
     row_id = usage_store.log(
@@ -2295,6 +2611,11 @@ async def messages(request: Request):
             "X-Lingling-Reason": _header_safe(reason),
             "X-Lingling-Provider": _header_safe(prov.id),
             "X-Lingling-Account": _header_safe(account_id or ""),
+            # Parity with the chat/responses streams. Always "passthrough" here:
+            # Anthropic's streaming event model has no discard-and-replay marker
+            # and Claude Code honours no synthetic reset, so this path never
+            # mid-flight-retries -- recovery is pre-200 only (see the catch above).
+            "X-Lingling-Stream-Mode": "passthrough",
         },
     )
 
