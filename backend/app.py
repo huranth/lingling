@@ -1527,6 +1527,7 @@ async def _execute_with_egress_wait(fn, *args, **kwargs):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     request_started = time.time()
+    call_type = "chat"
     client = request.client.host if request.client else "unknown"
 
     try:
@@ -1649,6 +1650,10 @@ async def chat_completions(request: Request):
                         requested, target, routed_by, reason, status="exhausted",
                         had_images=had_images,
                         error=str(getattr(fallback_exc, "last_error", fallback_exc))[:300],
+                        call_type=call_type,
+                        attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
+                        last_upstream_status=getattr(getattr(fallback_exc, "last_error", None), "status_code", None),
+                        rerouted=(routed_by == "fallback"),
                     )
                     raise HTTPException(
                         503, f"All providers exhausted for '{target}'.",
@@ -1658,6 +1663,9 @@ async def chat_completions(request: Request):
                 usage_store.log(
                     requested, target, routed_by, reason, status="exhausted",
                     had_images=had_images, error=str(exc.last_error)[:300],
+                    call_type=call_type, attempts=len(getattr(exc, "attempts", [])),
+                    last_upstream_status=getattr(getattr(exc, "last_error", None), "status_code", None),
+                    rerouted=(routed_by == "fallback"),
                 )
                 raise HTTPException(
                     503, f"All providers exhausted for '{target}'.",
@@ -1673,6 +1681,8 @@ async def chat_completions(request: Request):
             reasoning_tokens=usage.get("reasoning_tokens", 0),
             latency_ms=latency, status="ok", had_images=had_images,
             account_id=account_id, provider=prov.id,
+            call_type=call_type, attempts=len(attempts),
+            last_upstream_status=None, rerouted=(routed_by == "fallback"),
         )
         resp["lingling"] = {
             **routing_meta, "provider": prov.id, "account": account_id, "attempts": attempts,
@@ -1738,6 +1748,9 @@ async def chat_completions(request: Request):
             usage_store.log(
                 requested, target, routed_by, reason, status="exhausted",
                 had_images=had_images, error=error[:300],
+                call_type=call_type, attempts=len(getattr(exc, "attempts", [])),
+                last_upstream_status=last_status,
+                rerouted=(routed_by == "fallback"),
             )
             raise HTTPException(
                 503,
@@ -1777,6 +1790,10 @@ async def chat_completions(request: Request):
                 requested, target, routed_by, reason, status="exhausted",
                 had_images=had_images,
                 error=f"{error[:150]} || {fb_error[:150]}",
+                call_type=call_type,
+                attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
+                last_upstream_status=fb_last_status,
+                rerouted=(routed_by == "fallback"),
             )
             raise HTTPException(
                 503,
@@ -1807,7 +1824,8 @@ async def chat_completions(request: Request):
         requested, target, routed_by, reason,
         latency_ms=(time.time() - started) * 1000.0, status="ok_stream",
         had_images=had_images, account_id=account_id, provider=prov.id,
-        streamed=True,
+        streamed=True, call_type=call_type, attempts=len(attempts),
+        last_upstream_status=None, rerouted=(routed_by == "fallback"),
     )
     log.info(
         "chat: streaming requested=%s target=%s provider=%s first_chunk_ms=%.1f",
@@ -1975,6 +1993,7 @@ async def responses(request: Request):
     same dispatcher, executor, proxy pool, and usage ledger as `/v1/chat/completions`.
     """
     request_started = time.time()
+    call_type = "responses"
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -2050,6 +2069,9 @@ async def responses(request: Request):
                 usage_store.log(
                     requested, target, routed_by, reason, status="exhausted",
                     had_images=had_images, error=str(exc.last_error)[:300],
+                    call_type=call_type, attempts=len(getattr(exc, "attempts", [])),
+                    last_upstream_status=getattr(getattr(exc, "last_error", None), "status_code", None),
+                    rerouted=(routed_by == "fallback"),
                 )
                 raise HTTPException(
                     503, f"All providers exhausted for '{target}'.",
@@ -2069,6 +2091,10 @@ async def responses(request: Request):
                     requested, target, routed_by, reason, status="exhausted",
                     had_images=had_images,
                     error=str(getattr(fallback_exc, "last_error", fallback_exc))[:300],
+                    call_type=call_type,
+                    attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
+                    last_upstream_status=getattr(getattr(fallback_exc, "last_error", None), "status_code", None),
+                    rerouted=(routed_by == "fallback"),
                 )
                 raise HTTPException(
                     503, f"All providers exhausted for '{target}'.",
@@ -2086,6 +2112,8 @@ async def responses(request: Request):
             reasoning_tokens=usage.get("reasoning_tokens", 0),
             latency_ms=(time.time() - started) * 1000.0, status="ok",
             had_images=had_images, account_id=account_id, provider=prov.id,
+            call_type=call_type, attempts=len(attempts),
+            last_upstream_status=None, rerouted=(routed_by == "fallback"),
         )
         out = responses_bridge.response_object(resp, requested, target, prov.id)
         out["lingling"].update({
@@ -2152,6 +2180,9 @@ async def responses(request: Request):
             usage_store.log(
                 requested, target, routed_by, reason, status="exhausted",
                 had_images=had_images, error=error[:300],
+                call_type=call_type, attempts=len(getattr(exc, "attempts", [])),
+                last_upstream_status=last_status,
+                rerouted=(routed_by == "fallback"),
             )
             raise HTTPException(
                 503,
@@ -2191,6 +2222,10 @@ async def responses(request: Request):
                 requested, target, routed_by, reason, status="exhausted",
                 had_images=had_images,
                 error=f"{error[:150]} || {fb_error[:150]}",
+                call_type=call_type,
+                attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
+                last_upstream_status=fb_last_status,
+                rerouted=(routed_by == "fallback"),
             )
             raise HTTPException(
                 503,
@@ -2219,7 +2254,8 @@ async def responses(request: Request):
         requested, target, routed_by, reason,
         latency_ms=(time.time() - started) * 1000.0, status="ok_stream",
         had_images=had_images, account_id=account_id, provider=prov.id,
-        streamed=True,
+        streamed=True, call_type=call_type, attempts=len(attempts),
+        last_upstream_status=None, rerouted=(routed_by == "fallback"),
     )
     log.info(
         "responses: streaming requested=%s target=%s provider=%s first_chunk_ms=%.1f attempts=%d",
@@ -2394,6 +2430,7 @@ async def messages(request: Request):
     same machinery -- dispatcher, executor, WARP egress, parking, ledger.
     """
     request_started = time.time()
+    call_type = "messages"
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -2468,6 +2505,9 @@ async def messages(request: Request):
                 usage_store.log(
                     requested, target, routed_by, reason, status="exhausted",
                     had_images=had_images, error=str(exc.last_error)[:300],
+                    call_type=call_type, attempts=len(getattr(exc, "attempts", [])),
+                    last_upstream_status=getattr(getattr(exc, "last_error", None), "status_code", None),
+                    rerouted=(routed_by == "fallback"),
                 )
                 raise HTTPException(
                     503, f"All providers exhausted for '{target}'.",
@@ -2490,6 +2530,10 @@ async def messages(request: Request):
                     requested, target, routed_by, reason, status="exhausted",
                     had_images=had_images,
                     error=str(getattr(fallback_exc, "last_error", fallback_exc))[:300],
+                    call_type=call_type,
+                    attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
+                    last_upstream_status=getattr(getattr(fallback_exc, "last_error", None), "status_code", None),
+                    rerouted=(routed_by == "fallback"),
                 )
                 raise HTTPException(
                     503, f"All providers exhausted for '{target}'.",
@@ -2504,6 +2548,8 @@ async def messages(request: Request):
             reasoning_tokens=usage.get("reasoning_tokens", 0),
             latency_ms=(time.time() - started) * 1000.0, status="ok",
             had_images=had_images, account_id=account_id, provider=prov.id,
+            call_type=call_type, attempts=len(attempts),
+            last_upstream_status=None, rerouted=(routed_by == "fallback"),
         )
         out = messages_response.response_object(
             resp, requested, target, prov.id, show_thinking=show_thinking,
@@ -2555,6 +2601,9 @@ async def messages(request: Request):
             usage_store.log(
                 requested, target, routed_by, reason, status="exhausted",
                 had_images=had_images, error=error[:300],
+                call_type=call_type, attempts=len(getattr(exc, "attempts", [])),
+                last_upstream_status=last_status,
+                rerouted=(routed_by == "fallback"),
             )
             raise HTTPException(
                 503,
@@ -2594,6 +2643,10 @@ async def messages(request: Request):
                 requested, target, routed_by, reason, status="exhausted",
                 had_images=had_images,
                 error=f"{error[:150]} || {fb_error[:150]}",
+                call_type=call_type,
+                attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
+                last_upstream_status=fb_last_status,
+                rerouted=(routed_by == "fallback"),
             )
             raise HTTPException(
                 503,
@@ -2622,7 +2675,8 @@ async def messages(request: Request):
         requested, target, routed_by, reason,
         latency_ms=(time.time() - started) * 1000.0, status="ok_stream",
         had_images=had_images, account_id=account_id, provider=prov.id,
-        streamed=True,
+        streamed=True, call_type=call_type, attempts=len(attempts),
+        last_upstream_status=None, rerouted=(routed_by == "fallback"),
     )
     log.info(
         "messages: streaming requested=%s target=%s provider=%s first_chunk_ms=%.1f",

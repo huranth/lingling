@@ -741,6 +741,110 @@ def test_unit_usage_finalize_and_prune():
         store.close()
 
 
+def test_unit_usage_new_columns_round_trip():
+    """The ledger's routing-detail columns round-trip through log/recent/since.
+
+    The dashboard's "why did this 503 happen" view needs attempts +
+    last_upstream_status (how many exits burnt, and the terminal upstream status),
+    call_type to split the ledger across the chat / responses / messages wire
+    entrypoints, and rerouted to separate fallback answers from primary ones.
+    All four were invisible before -- every exhausted row read identically.
+    """
+    from usage.store import UsageStore
+
+    store = UsageStore(os.path.join(tempfile.mkdtemp(prefix="lingling-cols-"), "u.db"))
+    try:
+        rid = store.log(
+            "req", "rt", "fallback", reason="primary model failed",
+            call_type="chat", attempts=3, rerouted=True,
+            last_upstream_status=429, status="exhausted", error="429 blocked",
+        )
+        row = store.recent(5)[0]
+        assert row["call_type"] == "chat", row
+        assert row["attempts"] == 3, row
+        assert row["rerouted"] == 1, row            # bools persist as int 1/0
+        assert row["last_upstream_status"] == 429, row
+
+        # since() is the dashboard's incremental poll; it must surface the same
+        # columns (a fresh row opened on another entrypoint, this time succeeding).
+        rid2 = store.log(
+            "req", "rt", "user",
+            call_type="responses", attempts=1, rerouted=False, status="ok",
+        )
+        deltas = store.since(rid)
+        assert len(deltas) == 1, deltas
+        d = deltas[0]
+        assert d["id"] == rid2
+        assert d["call_type"] == "responses", d
+        assert d["attempts"] == 1, d
+        assert d["rerouted"] == 0, d
+        assert d["last_upstream_status"] is None, d  # success path leaves it NULL
+    finally:
+        store.close()
+
+
+def test_unit_usage_migration_adds_new_columns():
+    """A ledger created before this commit gains the four new columns on the next
+    open via the idempotent ALTER TABLE loop, so an existing deployment's
+    request_log is upgraded in place rather than wiped.
+
+    The migration must also tolerate a DB that predates the prior migrations
+    (provider/reasoning_tokens/streamed): the same loop adds those too.
+    """
+    import sqlite3
+    from pathlib import Path
+    from usage.store import UsageStore
+
+    tmp = tempfile.mkdtemp(prefix="lingling-migrate-")
+    db = str(Path(tmp) / "usage.db")
+    # The schema as it shipped right before this commit: the CREATE TABLE block
+    # minus the four new columns (provider already in CREATE; reasoning_tokens
+    # and streamed already present from the prior ALTER loop).
+    old = sqlite3.connect(db)
+    old.execute(
+        """
+        CREATE TABLE request_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts              REAL    NOT NULL,
+            requested_model TEXT,
+            routed_model    TEXT,
+            provider        TEXT,
+            routed_by       TEXT,
+            reason          TEXT,
+            tokens_in       INTEGER DEFAULT 0,
+            tokens_out      INTEGER DEFAULT 0,
+            latency_ms      REAL    DEFAULT 0,
+            status          TEXT,
+            had_images      INTEGER DEFAULT 0,
+            account_id      TEXT,
+            error           TEXT,
+            reasoning_tokens INTEGER DEFAULT 0,
+            streamed        INTEGER DEFAULT 0
+        )
+        """
+    )
+    old.execute("INSERT INTO request_log (ts) VALUES (?);", (time.time(),))
+    old.commit()
+    old.close()
+
+    store = UsageStore(db)
+    try:
+        cols = {r[1] for r in store._conn.execute("PRAGMA table_info(request_log)")}
+        assert {"attempts", "last_upstream_status", "call_type", "rerouted"} <= cols, cols
+        # The pre-migration row reads back with column defaults -- the ALTERs
+        # populated existing rows without needing a backfill.
+        row = store.recent(5)[0]
+        assert row["attempts"] == 0, row
+        assert row["rerouted"] == 0, row
+        assert row["last_upstream_status"] is None, row
+        assert row["call_type"] is None, row     # added without DEFAULT -> NULL
+        # And a fresh write on the migrated store still works end-to-end.
+        store.log("m", "m", "user", call_type="messages", attempts=1)
+        assert store.recent(5)[0]["call_type"] == "messages"
+    finally:
+        store.close()
+
+
 def test_unit_stream_guard_recovers_broken_stream():
     """A stream that dies before completing is retried once on a fresh stream.
 

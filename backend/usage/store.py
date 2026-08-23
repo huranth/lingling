@@ -50,7 +50,11 @@ class UsageStore:
                     status          TEXT,
                     had_images      INTEGER DEFAULT 0,
                     account_id      TEXT,
-                    error           TEXT
+                    error           TEXT,
+                    attempts        INTEGER DEFAULT 0,
+                    last_upstream_status INTEGER,
+                    call_type       TEXT,
+                    rerouted        INTEGER DEFAULT 0
                 )
                 """
             )
@@ -60,6 +64,10 @@ class UsageStore:
                 "ALTER TABLE request_log ADD COLUMN provider TEXT",
                 "ALTER TABLE request_log ADD COLUMN reasoning_tokens INTEGER DEFAULT 0",
                 "ALTER TABLE request_log ADD COLUMN streamed INTEGER DEFAULT 0",
+                "ALTER TABLE request_log ADD COLUMN attempts INTEGER DEFAULT 0",
+                "ALTER TABLE request_log ADD COLUMN last_upstream_status INTEGER",
+                "ALTER TABLE request_log ADD COLUMN call_type TEXT",
+                "ALTER TABLE request_log ADD COLUMN rerouted INTEGER DEFAULT 0",
             ):
                 try:
                     self._conn.execute(ddl)
@@ -83,6 +91,10 @@ class UsageStore:
         error: str = "",
         reasoning_tokens: int = 0,
         streamed: bool = False,
+        attempts: int = 0,
+        last_upstream_status: Optional[int] = None,
+        call_type: str = "",
+        rerouted: bool = False,
     ) -> int:
         """Insert a request record. Returns the new row id.
 
@@ -95,13 +107,15 @@ class UsageStore:
                 INSERT INTO request_log (
                     ts, requested_model, routed_model, provider, routed_by, reason,
                     tokens_in, tokens_out, latency_ms, status, had_images,
-                    account_id, error, reasoning_tokens, streamed
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    account_id, error, reasoning_tokens, streamed,
+                    attempts, last_upstream_status, call_type, rerouted
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     time.time(), requested_model, routed_model, provider, routed_by,
                     reason, tokens_in, tokens_out, latency_ms, status,
                     int(had_images), account_id, error, reasoning_tokens, int(streamed),
+                    int(attempts), last_upstream_status, call_type, int(rerouted),
                 ),
             )
             self._conn.commit()
@@ -289,7 +303,8 @@ class UsageStore:
                 """
                 SELECT id, ts, requested_model, routed_model, provider, routed_by,
                        reason, tokens_in, tokens_out, reasoning_tokens, streamed,
-                       latency_ms, status, had_images, account_id, error
+                       latency_ms, status, had_images, account_id, error,
+                       attempts, last_upstream_status, call_type, rerouted
                 FROM request_log ORDER BY id DESC LIMIT ?
                 """,
                 (limit,),
@@ -308,7 +323,8 @@ class UsageStore:
                 """
                 SELECT id, ts, requested_model, routed_model, provider, routed_by,
                        reason, tokens_in, tokens_out, reasoning_tokens, streamed,
-                       latency_ms, status, had_images, account_id, error
+                       latency_ms, status, had_images, account_id, error,
+                       attempts, last_upstream_status, call_type, rerouted
                 FROM request_log WHERE id > ? ORDER BY id ASC LIMIT ?
                 """,
                 (int(after_id), limit),
