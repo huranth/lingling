@@ -251,7 +251,7 @@ check('responsive: charts still render on mobile',
   (await evaluate("document.querySelectorAll('#board canvas').length")) === 2);
 await send('Emulation.clearDeviceMetricsOverride');
 
-/* --- 9. stop button, vision guard, keyboard reorder --- */
+/* --- 8. stop button, vision guard, keyboard reorder --- */
 await evaluate("go('console')");
 await sleep(1000);
 check('console: Send starts in send mode',
@@ -302,7 +302,7 @@ check('keyboard: the move persisted',
 await evaluate('setArranging(false)');
 await sleep(600);
 
-/* --- 8. no page errors anywhere in the run --- */
+/* --- 9. no page errors anywhere in the run --- */
 const unique = [...new Set(pageErrors)];
 check('no console errors, exceptions or 4xx/5xx during the run',
   unique.length === 0, unique.join(' | '));

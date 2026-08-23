@@ -62,7 +62,7 @@ body{
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition-duration:.01ms!important;animation-duration:.01ms!important}}
 
-h1,h2,h3,.display{font-family:var(--font-display);font-weight:600;letter-spacing:-.015em;line-height:1.15;
+h1,h2,h3{font-family:var(--font-display);font-weight:600;letter-spacing:-.015em;line-height:1.15;
   overflow-wrap:break-word}
 .mono{font-family:var(--font-mono);font-variant-ligatures:none}
 .label{font-family:var(--font-mono);font-size:10px;font-weight:500;letter-spacing:.16em;
@@ -212,10 +212,6 @@ h1,h2,h3,.display{font-family:var(--font-display);font-weight:600;letter-spacing
 @keyframes tick{0%{background:var(--accent-wash)}100%{background:transparent}}
 .ticked{animation:tick 900ms var(--ease-out) 1}
 
-
-/* ==========================================================================
-   CATALOG — the capability matrix + spec-sheet detail.
-   ========================================================================== */
 
 /* ==========================================================================
    CATALOG — capability matrix + spec-sheet detail
@@ -750,9 +746,15 @@ h1,h2,h3,.display{font-family:var(--font-display);font-weight:600;letter-spacing
      GET    /api/usage/since/{id}    rows[], summary, live[], server_time
      DELETE /api/usage               cleared, summary
      GET    /api/keys                keys[]
+     POST   /api/keys                create + return the new key
+     DELETE /api/keys/{id}           revoke the named key
      GET    /api/proxies             total, available, in_cooldown, proxies[]
      GET    /api/warp                count, tools_ready, identities_registered,
                                      proxies_running, base_port, instances[]
+     GET    /api/warp/health         per-instance health (with optional
+                                     ?probe=true HTTP tunnel test)
+     POST   /api/warp/start          launch all WARP wireproxies + sync the pool
+     POST   /api/warp/refresh        re-pull WARP instances + refresh pool URLs
      GET    /api/warp/probe          probed, interval_s, server_time,
                                      healthy/rate_limited/dead, results[]
      POST   /api/warp/probe          run the real-model probe + healers now
@@ -1025,7 +1027,7 @@ function spinBtn(btn){
 }
 
 /* ==========================================================================
-   Telemetry rail + the map nodes — both fed by /api/health and /api/proxies
+   Telemetry rail — fed by /api/health and /api/proxies
    ========================================================================== */
 function relAge(ts){
   if (!ts) return '—';
