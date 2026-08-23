@@ -391,6 +391,26 @@ def sample_models(
                 len(ms.error_exits), len(ms.dead_exits), len(green), ms.duration_ms,
             )
 
+    # Per-model status flip vs the previous pass: an operator tailing the
+    # sampler sees the cooked->ok "healed" and ok->cooked "went bad" events as
+    # one-liners rather than re-reading every pass's standing verdict. Models
+    # absent from the previous pass (first sampled, or the model set changed)
+    # are not a flip -- the per-model line above already introduced them.
+    with _lock:
+        prev = _latest
+    prev_status = {
+        ms.model: ms.status
+        for ms in (prev.models if prev and prev.models else [])
+    }
+    for ms in model_samples:
+        old = prev_status.get(ms.model)
+        if old is not None and old != ms.status:
+            log(
+                "sampler: %-34s flipped %s -> %s (%d ok, %d rl)",
+                ms.model, old, ms.status,
+                len(ms.ok_exits), len(ms.rate_limited_exits),
+            )
+
     res = SamplerResult(
         models=model_samples,
         canary_ok_exits=sorted(canary_ok),

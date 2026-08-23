@@ -216,6 +216,65 @@ def test_sample_cooked_model_side_fail_fast(monkeypatch, enabled):
     assert sampler.is_cooked(MUSE) is True
 
 
+def test_sampler_logs_status_flips_between_passes(monkeypatch, enabled):
+    """A model changing verdict between sampler passes logs a one-line flip.
+
+    The cooked->ok "healed" and ok->cooked "went bad" events are what an
+    operator tails the sampler to watch a slow Tor lane come back (or a fresh
+    429-storm take a model down) without re-reading every pass's standing
+    verdict. The first pass (no previous) and a same-status repeat (no change)
+    stay quiet -- only the transition narrates itself.
+    """
+    ids = ["warp-1", "warp-2", "warp-3"]
+    pool = _make_pool(ids)
+    canary = _canary_summary(ids)
+    cat = _Cat({DEEP: _Model(DEEP, reasoning=True)})
+
+    captured = []
+
+    def log(fmt, *a, **k):
+        # The sampler's log is printf-style; format defensively so a bare
+        # literal (no args) does not raise.
+        try:
+            captured.append(fmt % a if a else fmt)
+        except Exception:
+            captured.append(fmt)
+
+    # A mutable table the patched probe reads live: re-patching between passes
+    # would call reset_for_test and wipe _latest (the "previous" verdict), so
+    # the shared table is mutated instead and the memoised probe stays put.
+    table = {}
+
+    def fake(proxy_url, proxy_id, model, base_url, timeout, max_tokens=None):
+        return warp_probe.ProbeResult(
+            proxy_id=proxy_id, status=table.get((proxy_id, model), "ok"),
+            latency_ms=10.0, probed_at=time.time(),
+        )
+
+    monkeypatch.setattr(warp_probe, "_probe_single", fake)
+    sampler.reset_for_test()  # one-time: clear the probe memo + any prior _latest
+
+    # Pass 1: every green exit refused DEEP -> cooked. No previous pass -> the
+    # per-model line names it but no "flipped" line fires.
+    table.update({(p, DEEP): "probe_error" for p in ids})
+    sampler.sample_models(pool, cat, canary, log=log, models=[DEEP])
+    assert not any("flipped" in m for m in captured), captured
+
+    # Pass 2: every green exit serves DEEP -> ok. cooked -> ok is the heal the
+    # operator tails the sampler to see; it must log exactly one flip line.
+    table.clear()
+    sampler.sample_models(pool, cat, canary, log=log, models=[DEEP])
+    flips = [m for m in captured if "flipped" in m]
+    assert len(flips) == 1, captured
+    assert DEEP in flips[0] and "cooked" in flips[0] and "ok" in flips[0], flips[0]
+
+    # Pass 3: still ok. ok -> ok is not a transition, so no new flip line.
+    sampler.sample_models(pool, cat, canary, log=log, models=[DEEP])
+    assert [m for m in captured if "flipped" in m] == flips, (
+        "a same-status repeat must not re-log a flip"
+    )
+
+
 def test_sample_all_rate_limited_is_fail_fast(monkeypatch, enabled):
     ids = ["warp-1", "warp-2", "warp-3"]
     pool = _make_pool(ids)
