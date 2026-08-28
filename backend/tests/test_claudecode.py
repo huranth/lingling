@@ -20,6 +20,8 @@ import os
 import sys
 import tempfile
 import unittest
+
+from typing import List
 from pathlib import Path
 
 # Isolated data dir: these tests must never touch the real ledger or key store.
@@ -27,17 +29,14 @@ os.environ.setdefault("LINGLING_DATA_DIR", tempfile.mkdtemp(prefix="lingling-cc-
 os.environ["LINGLING_ACCOUNTS_FILE"] = os.path.join(
     os.environ["LINGLING_DATA_DIR"], "accounts.json"
 )
-os.environ["LINGLING_API_KEYS_FILE"] = os.path.join(
-    os.environ["LINGLING_DATA_DIR"], "api_keys.json"
-)
-os.environ["LINGLING_REQUIRE_KEY"] = "0"
-os.environ["LINGLING_BOOTSTRAP_WARP"] = "0"
+os.environ["LINGLING_BOOTSTRAP_TOR"] = "0"
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from core import config  # noqa: E402
 from providers.base import Provider  # noqa: E402
 from providers.key_pool import KeyPool  # noqa: E402
+from routing import dispatcher  # noqa: E402
 
 import app as app_mod  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -50,7 +49,7 @@ MODEL = "deepseek-v4-flash-free"
 # what happened once. Restored after every test by the fixture below.
 _REAL_CATALOG = {
     name: getattr(app_mod.catalog, name)
-    for name in ("providers_for", "by_id", "free", "refresh")
+    for name in ("providers_for", "by_id", "free", "refresh", "is_burned", "is_blacklisted", "is_free")
 }
 
 
@@ -72,12 +71,7 @@ except ImportError:      # running the file directly, without pytest
 
 
 class SkipTest(unittest.SkipTest):
-    """Raised by a test to mark itself skipped.
-
-    Subclasses ``unittest.SkipTest`` so pytest reports the test as ``skipped``
-    natively (rather than as an error) while the script runner's
-    ``except SkipTest`` still catches it.
-    """
+    """Raised by a test to mark itself skipped."""
 
 
 class _QuietLog:
@@ -171,6 +165,9 @@ def _install(spy, effort_values=("high", "max"), vision=False):
     })()
     app_mod.catalog.free = lambda: [fake_model()]
     app_mod.catalog.refresh = lambda force=False: None
+    app_mod.catalog.is_burned = lambda mid: False
+    app_mod.catalog.is_blacklisted = lambda mid: False
+    app_mod.catalog.is_free = lambda mid: True if mid == MODEL else None
     return TestClient(app_mod.app)
 
 
@@ -724,91 +721,6 @@ def test_unit_claude_stream_reports_a_truncated_turn():
 # ---------------------------------------------------------------------------
 # 5. Model mapping and Claude Code's own quirks
 # ---------------------------------------------------------------------------
-def test_unit_claude_a_reasoning_only_turn_is_reported_not_dumped():
-    """A model that never answers must be reported, not have its scratch work shown.
-
-    Measured against the real free tier: on an agentic prompt, deepseek at high
-    effort sent 1203 frames carrying 5004 characters of ``reasoning_content`` with
-    an **empty** ``content`` on every single one. An earlier version promoted that
-    reasoning to the answer -- on the theory that an empty turn reads as a refusal
-    -- and buried the terminal in five thousand characters of deliberation.
-
-    So the turn ends with a short factual note and ``stop_reason: max_tokens``,
-    which is what a real Anthropic endpoint reports when the budget ran out. An
-    agent can act on that; it cannot act on a wall of thinking.
-    """
-    from routing import stream_guard
-    from claudecode import messages_stream
-
-    def only_reasons():
-        for _ in range(40):
-            yield (b'data: {"choices":[{"delta":{"content":"",'
-                   b'"reasoning_content":"Let me think about this. "}}]}')
-
-    outcome = stream_guard.StreamOutcome()
-    raw = b"".join(
-        messages_stream.stream_events(only_reasons(), MODEL, outcome)
-    ).decode("utf-8")
-
-    text = "".join(
-        json.loads(ln[len("data: "):])["delta"]["text"]
-        for ln in raw.splitlines()
-        if ln.startswith("data: ") and '"text_delta"' in ln
-    )
-    # A visible turn, but not the reasoning itself.
-    assert text, "the client got nothing at all"
-    assert "Let me think about this" not in text, f"reasoning was dumped: {text[:120]}"
-    assert MODEL in text and "without producing an answer" in text, text
-    # Long enough to be a real complaint, short enough not to be a flood.
-    assert len(text) < 300, f"the note itself is too long: {len(text)}"
-    # And no thinking block, because this client did not ask for one.
-    assert '"type":"thinking"' not in raw
-
-    # stop_reason must say the budget ran out, so an agent can retry rather than
-    # treating a silent failure as a finished turn.
-    delta = [ln for ln in raw.splitlines() if '"message_delta"' in ln][0]
-    assert '"stop_reason":"max_tokens"' in delta, delta
-
-    # Non-streaming path reports the same way.
-    spy = SpyProvider(answer={
-        "choices": [{"finish_reason": "stop", "message": {
-            "content": "", "reasoning_content": "Thinking at length. " * 50}}],
-        "usage": {"prompt_tokens": 30, "completion_tokens": 900},
-    })
-    client = _install(spy)
-    body = client.post("/v1/messages", json={
-        "model": MODEL, "max_tokens": 64,
-        "messages": [{"role": "user", "content": "build me a website"}],
-    }).json()
-
-    assert [b["type"] for b in body["content"]] == ["text"], body["content"]
-    assert "Thinking at length" not in body["content"][0]["text"]
-    assert "without producing an answer" in body["content"][0]["text"]
-    assert body["stop_reason"] == "max_tokens", body["stop_reason"]
-
-    # A turn that produced a tool call but no prose is *not* a failed turn: the
-    # agent has something to run, and the note would be noise.
-    spy2 = SpyProvider(stream_frames=[
-        b'data: {"choices":[{"delta":{"content":"","reasoning_content":"I should read it. "}}]}',
-        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
-        b'"function":{"name":"Read","arguments":"{}"}}]}}]}',
-        b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
-        b"data: [DONE]",
-    ])
-    client = _install(spy2)
-    with client.stream("POST", "/v1/messages", json={
-        "model": MODEL, "max_tokens": 64,
-        "messages": [{"role": "user", "content": "read a.py"}],
-        "stream": True,
-    }) as resp:
-        raw = b"".join(resp.iter_bytes()).decode("utf-8")
-    assert "without producing an answer" not in raw, "a tool call is a real answer"
-    assert '"stop_reason":"tool_use"' in raw
-
-
-# ---------------------------------------------------------------------------
-# 5. Model mapping and Claude Code's own quirks
-# ---------------------------------------------------------------------------
 def test_unit_claude_model_ids_resolve_to_a_real_free_model():
     """Claude Code asks for Anthropic ids; none of them exist here.
 
@@ -1003,7 +915,7 @@ def test_unit_claude_setup_writes_a_config_that_actually_wins():
                          "model": "deepseek-v4-pro"},
         }), encoding="utf-8")
 
-        result = setup_gui.apply("http://127.0.0.1:8000/", "ll_token", MODEL)
+        result = setup_gui.apply("http://127.0.0.1:8000/", MODEL)
         written = json.loads(setup_gui.SETTINGS_FILE.read_text(encoding="utf-8"))
 
         # The block that was overriding everything is gone, and reported.
@@ -1013,7 +925,11 @@ def test_unit_claude_setup_writes_a_config_that_actually_wins():
         # Routing goes in `env`, which the docs say beats a shell export.
         env = written["env"]
         assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8000", env
-        assert env["ANTHROPIC_AUTH_TOKEN"] == "ll_token"
+        # The gateway is keyless, so the credential slot is a local sentinel:
+        # non-empty (Claude Code refuses to send with an empty token) but
+        # never validated by the gateway, and it neutralises any leftover
+        # shell export from another gateway.
+        assert env["ANTHROPIC_AUTH_TOKEN"] == setup_gui.LOCAL_AUTH_TOKEN
 
         # `model` is a starting default only.
         assert written["model"] == MODEL
@@ -1028,7 +944,7 @@ def test_unit_claude_setup_writes_a_config_that_actually_wins():
         assert recovered["provider"]["name"] == "blaze"
 
         # Running it twice must not accumulate anything or lose the choice.
-        setup_gui.apply("http://127.0.0.1:8000", "ll_token", MODEL)
+        setup_gui.apply("http://127.0.0.1:8000", MODEL)
         twice = json.loads(setup_gui.SETTINGS_FILE.read_text(encoding="utf-8"))
         assert twice == written, "apply is not idempotent"
     finally:
@@ -1068,7 +984,7 @@ def test_unit_claude_setup_leaves_model_and_effort_to_the_terminal():
                     "SOMETHING_ELSE": "keep me"},
         }), encoding="utf-8")
 
-        setup_gui.apply("http://127.0.0.1:8000", "ll_token", MODEL)
+        setup_gui.apply("http://127.0.0.1:8000", MODEL)
         written = json.loads(setup_gui.SETTINGS_FILE.read_text(encoding="utf-8"))
         env = written["env"]
 
@@ -1079,7 +995,7 @@ def test_unit_claude_setup_leaves_model_and_effort_to_the_terminal():
 
         # Only endpoint and credential are managed; unrelated vars are preserved.
         assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8000"
-        assert env["ANTHROPIC_AUTH_TOKEN"] == "ll_token"
+        assert env["ANTHROPIC_AUTH_TOKEN"] == setup_gui.LOCAL_AUTH_TOKEN
         assert env["SOMETHING_ELSE"] == "keep me"
 
         # `model` is documented and overridable by /model, so it is safe to write.
@@ -1105,13 +1021,15 @@ def test_unit_claude_setup_survives_a_broken_or_missing_settings_file():
         home = Path(tf.mkdtemp(prefix="cc-fresh-"))
         setup_gui.SETTINGS_DIR = home / ".claude"
         setup_gui.SETTINGS_FILE = setup_gui.SETTINGS_DIR / "settings.json"
-        result = setup_gui.apply("http://127.0.0.1:8000", "", MODEL)
+        result = setup_gui.apply("http://127.0.0.1:8000", MODEL)
         written = json.loads(setup_gui.SETTINGS_FILE.read_text(encoding="utf-8"))
         assert result["backup"] is None
         assert written["model"] == MODEL
-        # An empty token is written as "" rather than omitted: the docs define that
-        # as "treat as unset", which also neutralises a leftover shell export.
-        assert written["env"]["ANTHROPIC_AUTH_TOKEN"] == ""
+        # A fixed non-empty local sentinel fills the credential slot: Claude
+        # Code treats a present-but-empty token as "not logged in" and refuses
+        # to send, while a fixed value keeps apply idempotent and still
+        # neutralises a leftover shell export from another gateway.
+        assert written["env"]["ANTHROPIC_AUTH_TOKEN"] == setup_gui.LOCAL_AUTH_TOKEN
         assert written["$schema"].endswith("claude-code-settings.json")
 
         # Corrupt file: reported, still fixed, original preserved.
@@ -1120,7 +1038,7 @@ def test_unit_claude_setup_survives_a_broken_or_missing_settings_file():
         setup_gui.SETTINGS_FILE = setup_gui.SETTINGS_DIR / "settings.json"
         setup_gui.SETTINGS_DIR.mkdir(parents=True)
         setup_gui.SETTINGS_FILE.write_text('{"model": "sonnet", trunc', encoding="utf-8")
-        result = setup_gui.apply("http://127.0.0.1:8000", "", MODEL)
+        result = setup_gui.apply("http://127.0.0.1:8000", MODEL)
         assert result["warning"] and "valid JSON" in result["warning"]
         assert result["backup"] and Path(result["backup"]).exists()
         written = json.loads(setup_gui.SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -1167,18 +1085,21 @@ def test_live_claude_effort_changes_what_the_model_spends():
     them. Free models are noisy, so this asserts only that the two runs differ,
     not by how much.
     """
-    # A fresh module-level app is already wired to the real OpenCode provider;
-    # this test must not run against the spy catalog another test installed.
-    import importlib
+    # The module-level app is already wired to the real OpenCode provider; the
+    # autouse ``_catalog_isolation`` fixture guarantees no spy catalog from a
+    # hermetic test is installed. (An earlier version reloaded the module here
+    # to dodge spy stubs -- but reload re-executes app.py, which builds a NEW
+    # UnifiedCatalog, and the fixture then binds the ORIGINAL catalog's methods
+    # onto the new instance. Every later test that mutated ``_logical`` and
+    # checked ``is_burned()`` read two different objects and saw the burn
+    # vanish. The fixture already restores the real catalog, so the reload is
+    # both unnecessary and harmful.)
+    live = TestClient(app_mod.app)
 
-    import app as fresh
-    importlib.reload(fresh)
-    live = TestClient(fresh.app)
-
-    fresh.catalog.refresh(force=True)
+    app_mod.catalog.refresh(force=True)
     dialled = [
         (m.id, (getattr(m, "capabilities", None) or {}).get("effort") or [])
-        for m in fresh.catalog.free()
+        for m in app_mod.catalog.free()
     ]
     dialled = [(mid, values) for mid, values in dialled if len(values) >= 2]
     if not dialled:
@@ -1231,14 +1152,14 @@ def test_live_claude_streaming_turn_against_the_real_tier():
     chunk boundaries, reasoning fields, an empty first delta -- and checks the
     translated lifecycle still holds together.
     """
-    import importlib
+    # Same reasoning as the effort live test above: the module-level app is
+    # already on the real provider, the fixture restores the real catalog, and
+    # reloading the module would orphan the catalog methods every later test
+    # relies on.
+    live = TestClient(app_mod.app)
 
-    import app as fresh
-    importlib.reload(fresh)
-    live = TestClient(fresh.app)
-
-    fresh.catalog.refresh(force=True)
-    free = fresh.catalog.free()
+    app_mod.catalog.refresh(force=True)
+    free = app_mod.catalog.free()
     if not free:
         raise SkipTest("the free catalog is empty")
 
@@ -1263,88 +1184,204 @@ def test_live_claude_streaming_turn_against_the_real_tier():
             json.loads(line[len("data: "):])
 
 
-def test_unit_claude_setup_fetches_a_key_so_nobody_retypes_one():
-    """The window must obtain a key itself; making the user paste one is the bug.
 
-    The gateway runs on the same machine, so it can be asked. Three cases matter:
-    auth switched off (no key needed at all), a key already issued (reuse it
-    rather than littering the keyring), and none yet (mint one).
+
+def test_unit_claude_reasoning_never_reaches_a_client_that_did_not_ask():
+    """Unrequested reasoning must not appear in the response at all.
+
+    Two wrong answers were tried before this one. Folding reasoning into the
+    answer's text block ran them together on screen -- "...No need for
+    tools.Hi! How can I help you today?" -- so the model's deliberation read as
+    its reply. Giving it its own thinking block was worse: Anthropic's docs say
+    thinking is "redacted by the API and shown as a collapsed stub", and Claude
+    Code relies on that redaction rather than hiding anything itself. Lingling has
+    no signature and no encryption, so an unrequested block gets rendered in full
+    and a long think buries the answer under pages of scratch work.
+
+    The client did not ask for thinking, so it does not get any.
     """
-    from claudecode import setup_gui
-
-    spy = SpyProvider()
+    spy = SpyProvider(answer={
+        "choices": [{"finish_reason": "stop", "message": {
+            "content": "Hi! How can I help you today?",
+            "reasoning_content": 'The user just said "hi". No need for tools.'}}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 12},
+    })
     client = _install(spy)
 
-    class _Resp:
-        """Minimal stand-in for what urlopen returns."""
+    body = client.post("/v1/messages", json={
+        "model": MODEL, "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).json()
 
-        def __init__(self, body):
-            self._body = json.dumps(body).encode("utf-8")
+    assert [b["type"] for b in body["content"]] == ["text"], body["content"]
+    assert body["content"][0]["text"] == "Hi! How can I help you today?"
+    # The exact symptom, in both directions: no deliberation in the reply, and no
+    # thinking block smuggled alongside it.
+    assert "No need for tools" not in json.dumps(body)
 
-        def read(self):
-            return self._body
+    # Streaming: the reasoning is consumed and dropped, not turned into frames.
+    spy2 = SpyProvider(stream_frames=[
+        b'data: {"choices":[{"delta":{"reasoning_content":"The user said hi. "}}]}',
+        b'data: {"choices":[{"delta":{"reasoning_content":"No tools needed."}}]}',
+        b'data: {"choices":[{"delta":{"content":"Hi! "}}]}',
+        b'data: {"choices":[{"delta":{"content":"How can I help?"},"finish_reason":"stop"}]}',
+        b"data: [DONE]",
+    ])
+    client = _install(spy2)
+    with client.stream("POST", "/v1/messages", json={
+        "model": MODEL, "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    }) as resp:
+        raw = b"".join(resp.iter_bytes()).decode("utf-8")
 
-        def __enter__(self):
-            return self
+    starts = [json.loads(ln[len("data: "):]) for ln in raw.splitlines()
+              if ln.startswith("data: ") and '"content_block_start"' in ln]
+    assert [s["content_block"]["type"] for s in starts] == ["text"], starts
+    assert "No tools needed" not in raw, "reasoning leaked into the stream"
+    assert '"type":"thinking_delta"' not in raw
+    # The answer still arrives intact, and the lifecycle stays well-formed.
+    assert '"text":"Hi! "' in raw
+    events = _events(raw)
+    assert events.count("content_block_start") == events.count("content_block_stop") == 1
+    assert events[-1] == "message_stop"
 
-        def __exit__(self, *exc):
-            return False
 
-    calls = []
+def test_unit_claude_reasoning_is_shown_when_thinking_is_requested():
+    """A client that asks for thinking gets it, in its own block.
 
-    def fake_urlopen(request, timeout=None):
-        # Route the helper's HTTP through the TestClient, so the real endpoints
-        # answer rather than a hand-written fixture.
-        url = request if isinstance(request, str) else request.full_url
-        path = url.split("127.0.0.1:8000", 1)[-1]
-        method = "GET" if isinstance(request, str) else request.get_method()
-        calls.append(f"{method} {path}")
-        if method == "GET":
-            return _Resp(client.get(path).json())
-        return _Resp(client.post(path, content=request.data,
-                                 headers={"Content-Type": "application/json"}).json())
+    ``thinking: {"type": "enabled"|"adaptive"}`` is the opt-in. Then the reasoning
+    is legitimate output and belongs in a ``thinking`` block -- never concatenated
+    into the answer, which is what made the two run together on screen.
+    """
+    for asked in ({"type": "enabled", "budget_tokens": 4000}, {"type": "adaptive"}):
+        spy = SpyProvider(answer={
+            "choices": [{"finish_reason": "stop", "message": {
+                "content": "The answer is 4.",
+                "reasoning_content": "2+2 is 4."}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 8},
+        })
+        client = _install(spy)
+        body = client.post("/v1/messages", json={
+            "model": MODEL, "max_tokens": 64,
+            "messages": [{"role": "user", "content": "2+2?"}],
+            "thinking": asked,
+        }).json()
 
-    saved = setup_gui.urllib.request.urlopen
-    setup_gui.urllib.request.urlopen = fake_urlopen
-    try:
-        # This app runs with LINGLING_REQUIRE_KEY=0, so /api/health reports
-        # required=false. The right answer is an empty token and no minting.
-        assert client.get("/api/health").json()["auth"]["required"] is False
-        before = len(client.get("/api/keys").json()["keys"])
+        kinds = [b["type"] for b in body["content"]]
+        assert kinds == ["thinking", "text"], (asked, kinds)
+        assert body["content"][0]["thinking"] == "2+2 is 4."
+        assert body["content"][1]["text"] == "The answer is 4."
+        # Separate blocks, so the deliberation is not inside the reply.
+        assert "2+2 is 4." not in body["content"][1]["text"]
 
-        token, error = setup_gui.fetch_or_mint_key("http://127.0.0.1:8000")
-        assert error is None, error
-        assert token == "", "a keyless gateway needs no key"
-        assert calls == ["GET /api/health"], calls
-        assert len(client.get("/api/keys").json()["keys"]) == before, \
-            "a key was minted for a gateway that does not want one"
+    # Streaming, with thinking asked for: two blocks, Anthropic's own delta types.
+    spy2 = SpyProvider(stream_frames=[
+        b'data: {"choices":[{"delta":{"reasoning_content":"Adding two and two. "}}]}',
+        b'data: {"choices":[{"delta":{"content":"4"},"finish_reason":"stop"}]}',
+        b"data: [DONE]",
+    ])
+    client = _install(spy2)
+    with client.stream("POST", "/v1/messages", json={
+        "model": MODEL, "max_tokens": 64,
+        "messages": [{"role": "user", "content": "2+2?"}],
+        "thinking": {"type": "adaptive"},
+        "stream": True,
+    }) as resp:
+        raw = b"".join(resp.iter_bytes()).decode("utf-8")
 
-        # Now the auth-on path: an existing key must be reused, not duplicated.
-        minted = client.post("/api/keys", json={"label": "existing"}).json()["created"]
-        health_body = client.get("/api/health").json()
+    starts = [json.loads(ln[len("data: "):]) for ln in raw.splitlines()
+              if ln.startswith("data: ") and '"content_block_start"' in ln]
+    assert [s["content_block"]["type"] for s in starts] == ["thinking", "text"], starts
+    assert [s["index"] for s in starts] == [0, 1], starts
+    assert '"type":"thinking_delta"' in raw
+    assert '"thinking":"Adding two and two. "' in raw
+    # Reasoning must not also arrive as a text delta.
+    text_deltas = [json.loads(ln[len("data: "):]) for ln in raw.splitlines()
+                   if ln.startswith("data: ") and '"text_delta"' in ln]
+    assert "Adding two and two" not in "".join(d["delta"]["text"] for d in text_deltas)
 
-        def fake_health(request, timeout=None):
-            # The same gateway, reporting auth as required -- the only difference
-            # that matters to the helper.
-            return _Resp({**health_body, "auth": {"required": True}})
 
-        setup_gui.urllib.request.urlopen = fake_health
-        token, error = setup_gui.fetch_or_mint_key("http://127.0.0.1:8000")
-        assert error is None, error
-        assert token == minted["token"], "an existing key should be reused, not replaced"
+def test_unit_claude_a_reasoning_only_turn_is_reported_not_dumped():
+    """A model that never answers must be reported, not have its scratch work shown.
 
-        # With the store emptied, one is minted rather than the user being asked.
-        for entry in client.get("/api/keys").json()["keys"]:
-            client.delete(f"/api/keys/{entry['id']}")
-        token, error = setup_gui.fetch_or_mint_key("http://127.0.0.1:8000")
-        assert error is None, error
-        assert token.startswith("ll_"), token
-        assert len(client.get("/api/keys").json()["keys"]) == 1
-    finally:
-        setup_gui.urllib.request.urlopen = saved
-        for entry in client.get("/api/keys").json()["keys"]:
-            client.delete(f"/api/keys/{entry['id']}")
+    Measured against the real free tier: on an agentic prompt, deepseek at high
+    effort sent 1203 frames carrying 5004 characters of ``reasoning_content`` with
+    an **empty** ``content`` on every single one. An earlier version promoted that
+    reasoning to the answer -- on the theory that an empty turn reads as a refusal
+    -- and buried the terminal in five thousand characters of deliberation.
 
+    So the turn ends with a short factual note and ``stop_reason: max_tokens``,
+    which is what a real Anthropic endpoint reports when the budget ran out. An
+    agent can act on that; it cannot act on a wall of thinking.
+    """
+    from routing import stream_guard
+    from claudecode import messages_stream
+
+    def only_reasons():
+        for _ in range(40):
+            yield (b'data: {"choices":[{"delta":{"content":"",'
+                   b'"reasoning_content":"Let me think about this. "}}]}')
+
+    outcome = stream_guard.StreamOutcome()
+    raw = b"".join(
+        messages_stream.stream_events(only_reasons(), MODEL, outcome)
+    ).decode("utf-8")
+
+    text = "".join(
+        json.loads(ln[len("data: "):])["delta"]["text"]
+        for ln in raw.splitlines()
+        if ln.startswith("data: ") and '"text_delta"' in ln
+    )
+    # A visible turn, but not the reasoning itself.
+    assert text, "the client got nothing at all"
+    assert "Let me think about this" not in text, f"reasoning was dumped: {text[:120]}"
+    assert MODEL in text and "without producing an answer" in text, text
+    # Long enough to be a real complaint, short enough not to be a flood.
+    assert len(text) < 300, f"the note itself is too long: {len(text)}"
+    # And no thinking block, because this client did not ask for one.
+    assert '"type":"thinking"' not in raw
+
+    # stop_reason must say the budget ran out, so an agent can retry rather than
+    # treating a silent failure as a finished turn.
+    delta = [ln for ln in raw.splitlines() if '"message_delta"' in ln][0]
+    assert '"stop_reason":"max_tokens"' in delta, delta
+
+    # Non-streaming path reports the same way.
+    spy = SpyProvider(answer={
+        "choices": [{"finish_reason": "stop", "message": {
+            "content": "", "reasoning_content": "Thinking at length. " * 50}}],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 900},
+    })
+    client = _install(spy)
+    body = client.post("/v1/messages", json={
+        "model": MODEL, "max_tokens": 64,
+        "messages": [{"role": "user", "content": "build me a website"}],
+    }).json()
+
+    assert [b["type"] for b in body["content"]] == ["text"], body["content"]
+    assert "Thinking at length" not in body["content"][0]["text"]
+    assert "without producing an answer" in body["content"][0]["text"]
+    assert body["stop_reason"] == "max_tokens", body["stop_reason"]
+
+    # A turn that produced a tool call but no prose is *not* a failed turn: the
+    # agent has something to run, and the note would be noise.
+    spy2 = SpyProvider(stream_frames=[
+        b'data: {"choices":[{"delta":{"content":"","reasoning_content":"I should read it. "}}]}',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+        b'"function":{"name":"Read","arguments":"{}"}}]}}]}',
+        b'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+        b"data: [DONE]",
+    ])
+    client = _install(spy2)
+    with client.stream("POST", "/v1/messages", json={
+        "model": MODEL, "max_tokens": 64,
+        "messages": [{"role": "user", "content": "read a.py"}],
+        "stream": True,
+    }) as resp:
+        raw = b"".join(resp.iter_bytes()).decode("utf-8")
+    assert "without producing an answer" not in raw, "a tool call is a real answer"
+    assert '"stop_reason":"tool_use"' in raw
 
 
 def test_unit_claude_reasoning_never_reaches_a_client_that_did_not_ask():
@@ -1996,4 +2033,250 @@ def test_unit_a_slow_consumer_cannot_be_flooded_by_a_fast_upstream():
     assert not [t for t in _threading.enumerate()
                 if t.name == "lingling-stream-reader"], \
         "a reader blocked on a full queue never noticed the consumer had gone"
+
+
+# ---------------------------------------------------------------------------
+# Recycler (Claude Code side) -- pin model_map.resolve's two rules under a
+# burn, plus an end-to-end burned-reroute over /v1/messages.
+#
+# The contract this pins is honest about the leak:
+#   * Rule 1: a burned REAL explicit id passes through unchanged, because
+#     `catalog.providers_for` is provider-layer bookkeeping and does NOT
+#     consult burn state. The messages-handler burned-reroute exists *since*
+#     rule 1 -- a fix here would paper over the contract.
+#   * Rule 2: an Anthropic alias (`claude-3-5-haiku` etc.) walks its size-class
+#     preference list against `catalog.free()`, which is the recycler's burn
+#     filter. So the alias routes AROUND a burned first-preference to the
+#     next-down one -- the alias-chain side of the "remove from everywhere"
+#     guarantee.
+# ---------------------------------------------------------------------------
+def _cc_recycler_catalog(*entries):
+    """Hermetic UnifiedCatalog injected with synthetic LogicalModels (no network).
+
+    Mirrors tests/test_routing.py's burn-bookkeeping helper here so
+    test_claudecode cannot reach across files. A synthetic provider returns
+    the listed ids on every refresh, so catalog.refresh() materialises fresh
+    LogicalModels the same way the live OpenCode fetch does across a dynamic
+    /models poll, with burn state preserved from the prior catalog state.
+
+    Each entry is either a bare model id or an ``(id, capabilities)`` tuple;
+    the latter attaches the curated provider desc the size-class deriver in
+    model_map reads, exactly the way ``providers.opencode.FREE_MODEL_CAPS``
+    enriches the live roster.
+    """
+    from models.catalog import UnifiedCatalog
+    from providers.base import ProviderModel
+
+    model_ids: List = []
+
+    def _build(mid, caps=None):
+        return ProviderModel(id=mid, provider_id="oc", name=mid, free=True,
+                             vision=False, reasoning=False,
+                             context_length=8192, max_output=4096,
+                             capabilities=caps or {})
+
+    class _FakeProv:
+        display_name = "oc"
+        last_fetch_ok = True
+        priority = 100  # base Provider's default; providers_for sorts on this
+
+        def __init__(self, entries):
+            self._entries = entries
+
+        def list_models(self):
+            out = []
+            for entry in self._entries:
+                if isinstance(entry, tuple):
+                    mid, caps = entry
+                    out.append(_build(mid, caps))
+                else:
+                    out.append(_build(entry))
+            return out
+
+        def is_configured(self):
+            return True
+
+    cat = UnifiedCatalog({"oc": _FakeProv(entries)})
+    cat.refresh(force=True)
+    return cat
+
+
+def test_unit_model_map_resolve_returns_a_burned_explicit_pick():
+    """resolve() rule 1: a burned real id passes through unchanged, by design.
+
+    The Claude Code chain's rule 1 explicitly returns a real OpenCode id when
+    ``catalog.providers_for(name)`` knows it -- and ``providers_for`` is the
+    provider layer's bookkeeping, so it does NOT consult burn state. A burned
+    explicit id therefore leaks through resolve, and the later burned-reroute
+    in app.py's messages handler is what eventually intercepts it -- not a
+    second burn-aware branch grafted onto resolve.
+
+    This test pins the leak deliberately: the contract is that resolve trusts
+    the provider-availability layer, not the recycler's burn pile, and the
+    messages-handler burned-reroute exists *because* of rule 1.
+    """
+    from claudecode import model_map
+    cat = _cc_recycler_catalog("alpha-free")
+    # Sanity: while live, resolve returns the explicit id (rule 1).
+    assert model_map.resolve("alpha-free", catalog=cat) == "alpha-free"
+
+    while cat.record_model_failure("alpha-free") is False:
+        pass
+    assert cat.is_burned("alpha-free") is True
+    assert "alpha-free" not in {m.id for m in cat.free()}
+
+    # Rule 1 still fires -- providers_for knows the id and does not consult
+    # burn state, so the burned id resolves to itself. That's the contract:
+    # the leak is the whole reason the messages-handler burned-reroute exists.
+    chosen = model_map.resolve("alpha-free", catalog=cat)
+    assert chosen == "alpha-free", (
+        "resolve's rule-1 leak is the contract that justifies the "
+        "messages-handler burned-reroute; do not 'fix' it here"
+    )
+
+
+def test_unit_model_map_resolve_routes_an_alias_around_a_burned_preference():
+    """resolve() rule 2: an Anthropic alias consults free(), which drops burned.
+
+    Claude Code sends ids like ``claude-3-5-haiku``; Lingling turns them into
+    the haiku size class's live-derived ranking and walks it against
+    ``catalog.free()``. ``free()`` is the recycler's burn-filter funnel, so a
+    burned first-preference gets skipped and the alias routes to the
+    next-down one, rather than leaking through to the executor and 503ing.
+    This is the alias-chain side of the recycler's "remove from everywhere"
+    guarantee.
+
+    The ranking is derived from curated capability descriptions (the same
+    signals ``providers.opencode.FREE_MODEL_CAPS`` attaches to the live
+    roster), never from a hardcoded id table -- so both claims pinned here
+    are *behavioural*: the fast model wins haiku while live, and a burned
+    leader steps aside for the next-ranked live one.
+    """
+    from claudecode import model_map
+    fast_choice = ("alpha-fast-free", {"desc": "fast and lightweight chat; text-only"})
+    deep_choice = ("beta-deep-free", {"desc": "deep multi-step reasoning for planning; text-only"})
+    cat = _cc_recycler_catalog(fast_choice, deep_choice, "gamma-free")
+
+    # Precondition -- without the burn, the haiku alias resolves to the
+    # fast model, and opus to the deep one.
+    assert model_map.resolve("claude-3-5-haiku", catalog=cat) == "alpha-fast-free", (
+        "precondition: haiku's top live pick must be the fast model"
+    )
+    assert model_map.resolve("claude-opus-4-1", catalog=cat) == "beta-deep-free", (
+        "precondition: opus's top live pick must be the deep-reasoning model"
+    )
+
+    while cat.record_model_failure("alpha-fast-free") is False:
+        pass
+    assert cat.is_burned("alpha-fast-free") is True
+    assert "alpha-fast-free" not in {m.id for m in cat.free()}
+
+    # Now the alias must skip the burned first pick -- free()'s burn-filter is
+    # doing the work for resolve here, by design. Haiku's ranked pool is empty
+    # (its only fast model burned), so the alias serves the next live model
+    # rather than failing; opus still has its deep pick live.
+    chosen = model_map.resolve("claude-3-5-haiku", catalog=cat)
+    assert chosen == "beta-deep-free", (
+        f"alias must skip the burned fast pick and route to the next live "
+        f"model; got {chosen!r}"
+    )
+    assert model_map.resolve("claude-opus-4-1", catalog=cat) == "beta-deep-free", (
+        "opus's deep pick must survive the haiku burn; got "
+        f"{model_map.resolve('claude-opus-4-1', catalog=cat)!r}"
+    )
+
+
+def test_unit_a_burned_claude_code_pick_reroutes_at_the_messages_endpoint():
+    """End-to-end: a burned /v1/messages explicit pick reroutes via recycler.
+
+    Claude Code's picker sends an explicit ``model`` field (or an alias,
+    which strip_alias turns into a real OpenCode id); if the recycler burned
+    it because upstream rotated it out, app.py's messages handler intercepts
+    the pick *before* dispatching the executor -- calling
+    ``dispatcher.fallback_model(exclude={target})`` for the nearest live
+    substitute. The substitute id is what surfaces in the Anthropic Messages
+    response's ``lingling.routed_model`` audit key, so Claude Code's session
+    trace records the model that actually answered instead of the dead id the
+    client picked.
+
+    Burns a live catalog model end-to-end to drive the cycle; the executor is
+    stubbed so no real upstream call happens, and the burn heals on
+    ``finally:`` so the burn state cannot leak into other tests.
+    """
+    # Ensure we see the real catalog, not a spy stub left by a previous hermetic test.
+    _restore_catalog()
+    # Heal any burn/blacklist left by previous live tests so precondition is met.
+    live_ids = {m.id for m in app_mod.catalog.free()}
+    if len(live_ids) < 2:
+        raise SkipTest("fewer than 2 free models in the live catalog; cannot exercise reroute")
+    brain = dispatcher.dispatcher_model(app_mod.catalog)
+    candidates = live_ids - ({brain} if brain else set())
+    if not candidates:
+        raise SkipTest("only the dispatcher brain free; cannot exercise non-brain reroute")
+    target = next(iter(candidates))
+    # If a previous test left this target burned/blacklisted, heal it first.
+    if app_mod.catalog.is_burned(target) or app_mod.catalog.is_blacklisted(target):
+        app_mod.catalog.record_model_success(target)
+        try:
+            app_mod.catalog.clear_blacklist(target)
+        except Exception:
+            pass
+    assert not app_mod.catalog.is_burned(target), \
+        "precondition: target must start live"
+
+    fake_ids = []
+    original_exec = app_mod.executor.execute_nonstream
+
+    def _fake_execute(messages, model_id, providers, **kwargs):
+        fake_ids.append(model_id)
+        canned = {
+            "choices": [{"message": {"role": "assistant", "content": "ok"},
+                          "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        return canned, providers[0] if providers else None, None, []
+
+    app_mod.executor.execute_nonstream = _fake_execute
+    body = {
+        "model": target,
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    try:
+        # Burn the target directly via the catalog's internal state for deterministic
+        # hermetic coverage (avoids recycler threshold / blacklist races with live
+        # upstream). This is the same state the messages handler checks before rerouting.
+        import time as _time
+        lm = app_mod.catalog._logical.get(target)
+        if lm is None:
+            raise SkipTest(f"target {target!r} not in catalog _logical (upstream rotated it out)")
+        lm.burned = True
+        lm.burned_at = _time.time()
+        lm.recover_after = lm.burned_at + 3600
+        assert app_mod.catalog.is_burned(target) or app_mod.catalog.is_blacklisted(target), \
+            f"target {target!r} should be burned/blacklisted after direct burn"
+
+        client = TestClient(app_mod.app)
+        r = client.post("/v1/messages", json=body)
+        assert r.status_code == 200, r.text
+        body_json = r.json()
+        lingling_meta = body_json.get("lingling") or {}
+        routed_model = lingling_meta.get("routed_model")
+        assert routed_model != target, (
+            f"messages handler did NOT reroute: routed_model={routed_model!r} "
+            f"but target={target!r} should be burned and bypassed"
+        )
+        assert routed_model in live_ids, (
+            f"substitute {routed_model!r} is not a free model in the live catalog"
+        )
+        assert fake_ids, "the executor must have been called"
+        assert fake_ids[0] != target, \
+            "must NOT have invoked the burned id -- the reroute should bypass it"
+        assert fake_ids[0] == routed_model, (
+            f"executor's id {fake_ids[0]!r} should match the surfaced "
+            f"routed_model {routed_model!r}"
+        )
+    finally:
+        app_mod.executor.execute_nonstream = original_exec
+        app_mod.catalog.record_model_success(target)  # un-burn for next test"
 
