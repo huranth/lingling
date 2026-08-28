@@ -1,10 +1,15 @@
 """Global model metadata from models.dev.
 
 models.dev is a freely-licensed catalog of model capabilities (modalities,
-pricing, context limits). We flatten it into one lookup keyed by *bare* model id
-(any ``provider/`` prefix stripped) so a model can be enriched regardless of how
-the gateway exposes it. Pricing is deliberately not consulted -- it mislabels
-some paid OpenCode models as free.
+pricing, context limits) covering many providers. We flatten it into one lookup
+keyed by *bare* model id (any ``provider/`` prefix stripped) so we can enrich a
+model regardless of how the gateway exposes it -- e.g. OpenCode's
+``mimo-v2.5-free`` resolves here.
+
+The enricher answers: is this model vision-capable / reasoning, and what are its
+context and output limits. Each provider decides free-vs-paid itself; models.dev
+pricing is deliberately not consulted because it mislabels some paid OpenCode
+models as free.
 """
 
 from __future__ import annotations
@@ -35,11 +40,7 @@ def _load(force: bool = False) -> Dict[str, Dict[str, Any]]:
         if not force and _cache and (time.time() - _cache_at) < _CACHE_TTL:
             return _cache
         try:
-            resp = httpx.get(
-                config.MODELS_DEV_API,
-                timeout=config.REQUEST_TIMEOUT,
-                headers={"User-Agent": config.UPSTREAM_USER_AGENT},
-            )
+            resp = httpx.get(config.MODELS_DEV_API, timeout=config.REQUEST_TIMEOUT)
             resp.raise_for_status()
             payload = resp.json()
         except Exception:
@@ -137,10 +138,17 @@ def input_modalities(meta: Dict[str, Any]) -> List[str]:
 def reasoning_effort_values(meta: Dict[str, Any]) -> List[str]:
     """Effort levels a model actually honours, from models.dev.
 
-    ``reasoning_options`` is not uniform across models (deepseek offers
-    low/high/max; mimo offers none) -- the same data OpenCode's CLI shows under
-    ``/variants``. Reading it matters because OpenCode answers 200 for a value a
-    model doesn't implement, so it can't be probed. Empty means "send nothing".
+    models.dev publishes ``reasoning_options`` per model, and the sets are not
+    uniform: ``deepseek-v4-flash-free`` offers ``high``/``max`` only, while
+    ``ling-3.0-flash-free`` offers ``low``/``medium``/``high`` and
+    ``mimo-v2.5-free`` offers none at all. This is the same data OpenCode's own
+    CLI shows under ``/variants``.
+
+    Reading it matters because OpenCode answers 200 for an effort value a model
+    does not implement -- the parameter is accepted and silently ignored. Probing
+    therefore cannot distinguish "honoured" from "swallowed", and an earlier
+    hand-built map in this repo was wrong for six of seven free models as a
+    result. An empty list means "send no effort parameter".
     """
     out: List[str] = []
     for opt in meta.get("reasoning_options") or []:
@@ -178,3 +186,7 @@ def enrich(model_id: str, prefer_provider: Optional[str] = None) -> Dict[str, An
         "reasoning_toggle": reasoning_toggle(meta),
         "_meta": meta,
     }
+
+
+def refresh() -> None:
+    _load(force=True)

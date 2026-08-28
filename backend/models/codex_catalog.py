@@ -61,32 +61,12 @@ _LEVEL_DESCRIPTIONS: Dict[str, str] = {
 # of them, the published set wins and this disappears on the next run.
 _DEFAULT_LEVEL = "default"
 
-# OpenCode's free relay rejects any request whose input exceeds ~262K tokens with
-# HTTP 400 ``[400] This endpoint's maximum context length is 262144 tokens``,
-# regardless of the underlying model's own context window -- laguna-s-2.1's
-# endpoint reported exactly that number, and the other endpoints behaved the
-# same on observed over-cap turns (muse-spark returned an empty ``chat.completion``
-# stub wrapped in 400 where laguna returned the explicit text, but both 400'd).
-#
-# This makes models.dev's per-model ``context_length`` -- which describes the
-# upstream model's *paper* context (muse-spark 1M, nemotron-3-ultra 1M,
-# x-preview-f 1M) -- a *lie* about what Codex can actually send through the free
-# relay. Codex 0.146 read the larger advertised window from `lingling_models.json`,
-# never triggered its own session-truncator, sent an ~870K-token session, and the
-# relay 400'd every free model attempted in turn.
-#
-# Clamping the advertised window here lets Codex compact sessions against the
-# budget the free relay actually has: ``effective_context_window_percent`` (95%)
-# below this cap leaves a workable input budget plus a headroom reserve for the
-# response, and sessions bigger than the relay can host are truncated by Codex
-# *before* they cross the wire. ``min(context_length, cap)`` leaves sub-cap
-# models (hy3-free's real 190K, mimo's 200K, etc.) advertised exactly as models.dev
-# publishes them.
-FREE_TIER_RELAY_CONTEXT_CAP = 262144
-
 # Fields Codex's parser demands. A caller passing a hand-made template gets a
 # clear failure here instead of an "expected value at line 1 column N" from the
-# Rust side after the file is written.
+# Rust side after the file is written. Fields the generator writes itself
+# (``supports_reasoning_summaries``, identity, levels) are not required: this
+# build's catalog dropped the summaries field from every model, and the entry
+# gets it from ``entry_for`` regardless of the template.
 REQUIRED_TEMPLATE_FIELDS = (
     "slug",
     "display_name",
@@ -96,12 +76,6 @@ REQUIRED_TEMPLATE_FIELDS = (
     "supported_in_api",
     "priority",
     "base_instructions",
-    # Codex 0.146 renamed the old boolean `supports_reasoning_summaries` to this
-    # string field (values like "none"/"auto"). It is inherited verbatim from the
-    # template; requiring it keeps the validation aligned with the installed
-    # binary's own dump instead of the schema this module was first written
-    # against.
-    "default_reasoning_summary",
     "support_verbosity",
     "truncation_policy",
     "supports_parallel_tool_calls",
@@ -162,17 +136,27 @@ def entry_for(
         "slug": model_id,
         "display_name": display_name,
         "supported_reasoning_levels": levels,
+        # Normalised to the classic Responses wire shape, whatever the template
+        # was. Codex's newest models set ``tool_mode = "code_mode_only"`` /
+        # ``use_responses_lite``, which makes Codex register a freeform
+        # JavaScript ``exec`` tool (Custom payload) instead of the standard
+        # ``exec_command`` shell tool (Function payload). A model that emits
+        # ordinary ``function_call`` items then dies in the registry with
+        # "tool exec invoked with incompatible payload" and never gets a tool
+        # result. Lingling's bridge reads ``instructions`` and ``tools``, so the
+        # lite shape loses the system prompt and every tool anyway. The keys are
+        # dropped, not nulled: classic models in Codex's own dump carry no
+        # ``tool_mode`` key at all, and ``multi_agent_version`` is the
+        # code-mode-only sibling that must go with it.
+        "use_responses_lite": False,
         # The picker's initial highlight, not the wire default: Codex sends the
         # effort from its own config (falling back to `minimal`) regardless of
         # what this says. Weakest declared level, so nothing here spends more
         # thinking than the user asked for.
         "default_reasoning_level": levels[0]["effort"],
-        # Summary display follows the template's `default_reasoning_summary`
-        # (inherited verbatim from the clone). Codex 0.146 replaced the old
-        # boolean `supports_reasoning_summaries` with this string field, and
-        # injecting the stale key back would risk the Rust parser rejecting the
-        # file -- same reason nothing else here writes a field the template does
-        # not carry.
+        # Gates the `reasoning` field as much as the levels do: with summaries
+        # unsupported, Codex omits reasoning entirely even for a declared model.
+        "supports_reasoning_summaries": True,
         "visibility": "list",
         "supported_in_api": True,
         "priority": priority,
@@ -186,17 +170,12 @@ def entry_for(
         "service_tiers": [],
         "availability_nux": None,
     })
+    entry.pop("tool_mode", None)
+    entry.pop("multi_agent_version", None)
 
     if description:
         entry["description"] = description
     if context_length:
-        # The free relay's per-request token cap (see ``FREE_TIER_RELAY_CONTEXT_CAP``)
-        # is smaller than what models.dev publishes for several free models, so
-        # advertising models.dev's number verbatim would tell Codex it can send
-        # far more than the relay will accept. Clamp the advertised window to
-        # the relay's actual ceiling; ``min`` keeps every sub-cap model advertised
-        # at its real published value.
-        context_length = min(int(context_length), FREE_TIER_RELAY_CONTEXT_CAP)
         entry["context_window"] = context_length
         entry["max_context_window"] = context_length
     return entry

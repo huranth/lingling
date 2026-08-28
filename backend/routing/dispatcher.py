@@ -1,31 +1,46 @@
-"""Two-layer multi-model dispatcher (multi-provider aware).
+"""The two-layer multi-model dispatcher (multi-provider aware).
 
 Selecting ``lingling-auto`` sends the conversation to a small, fast, free
-dispatcher model, which reads the conversation plus a capability table of every
-free model and returns a JSON routing decision ``{"model", "reason"}``. The
-executor then forwards the full conversation to the chosen model.
+*dispatcher* model (resolved live from the catalog via :func:`dispatcher_model`).
+The dispatcher reads the conversation plus a capability table of every free
+model -- now annotated with which providers serve each model -- and returns a
+JSON routing decision: ``{"model": "<id>", "reason": "<short>"}``. The executor
+then forwards the *entire* conversation to the chosen model across the
+providers that serve it (the context bridge + cross-provider failover).
 
-Hard rules: an image restricts candidates to vision-capable models before the
-dispatcher decides, and the dispatcher is nudged toward models served by
-multiple providers (those can fail over if one provider is rate-limited).
+Hard rules:
+* If the conversation contains an image, candidates are restricted to
+  vision-capable models before the dispatcher decides.
+* The dispatcher is nudged to prefer models served by multiple providers, since
+  those can fail over if one provider is rate-limited.
+
+The brain id itself is dynamic: it is picked from the live ``catalog.free()``.
+An operator can pin a specific model with ``LINGLING_DISPATCHER_MODEL``; a
+pinned id that goes stale (burned, blacklisted, or rotated out of the free
+roster) is stepped over to the next live model instead of failing the request.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core import config
 from models.vision_bridge import messages_have_images
 
+_log = logging.getLogger("uvicorn.error")
+
 # A callable that runs the dispatcher model: (messages, model) -> assistant text.
 CallModel = Callable[[List[Dict[str, Any]], str], str]
 
 
 def _capability_hint(model: Any) -> str:
-    # Prefer the curated description (FREE_MODEL_CAPS) -- empirically verified.
-    # Fall back to an inferred hint only when none exists.
+    # Prefer the curated human-readable description attached by the provider
+    # (providers.opencode.FREE_MODEL_CAPS) -- it is empirically verified and
+    # tells the dispatcher exactly what each model is good at. Fall back to an
+    # inferred hint only when no curated description exists.
     caps = getattr(model, "capabilities", None)
     if isinstance(caps, dict) and caps.get("desc"):
         return str(caps["desc"])
@@ -51,7 +66,7 @@ def build_capability_table(candidates: List[Any]) -> str:
     for m in candidates:
         # Round up, never down: `//` and bare round() both rendered a 500-token
         # window as "0K" (round(0.5) is 0 -- banker's rounding), telling the
-        # dispatcher a real model had no context.
+        # routing brain a real model had no context at all.
         ctx = f"{max(1, round(m.context_length / 1000))}K" if m.context_length else "?"
         vision = "yes" if m.vision else "no"
         reasoning = "yes" if m.reasoning else "no"
@@ -123,7 +138,7 @@ The reason names the kind of work and why that model fits it. Examples:
 {"model": "north-mini-code-free", "reason": "Writing a React component is code generation, and this model is specialized for it."}
 {"model": "nemotron-3-ultra-free", "reason": "Finding why the deploy fails needs multi-step diagnosis rather than code output."}
 {"model": "mimo-v2.5-free", "reason": "The user attached a screenshot, so only a vision-capable model can answer."}
-{"model": "deepseek-v4-flash-free", "reason": "A one-line factual question is best served by the fastest model."}
+{"model": "ling-3.0-flash-free", "reason": "A one-line factual question is best served by the fastest model."}
 """
 
 
@@ -383,29 +398,103 @@ def fallback_model(
 ) -> str:
     """Deterministic fallback when the dispatcher cannot decide.
 
-    ``messages`` lets the fallback route on the *kind of work* rather than
+    ``messages`` lets the fallback route on the *kind of work* instead of
     ignoring the request. Without it this returned ``DISPATCHER_MODEL`` whenever
-    it was in the pool, so every dispatcher outage or bad reply sent the turn to
-    the router's own model regardless of what was asked -- and the failover path
-    retried on the profile it had just failed with.
+    that model was in the pool, so every dispatcher outage, unparseable reply and
+    hallucinated id sent the turn to the router's own model no matter what was
+    asked -- a refactor got a general chat model, and the model-failover path
+    retried on the same profile it had just failed with.
 
     ``exclude`` removes models that already failed, so failover picks a genuinely
-    different one.
+    different one. Burned models (see ``catalog.UnifiedCatalog.record_model_failure``)
+    never reach the pool to begin with -- ``catalog.free()`` filters them out
+    pasture-wide, so this function's burn awareness is implicit. When the pool
+    drains entirely AND the dispatcher's own model is itself burned, we raise
+    :class:`DispatcherUnavailable` instead of returning a known-dead id.
     """
     exclude = exclude or set()
     pool = catalog.vision_free() if has_images else catalog.free()
     pool = [m for m in pool if m.id not in exclude]
+    if has_images and not pool:
+        # PB5-W3-XX sibling (silent-degraded-fallback, vision->text):
+        # no live vision model remained after ``exclude``-filtering -- the
+        # caller already replaced the image with a placeholder upstream
+        # (``vision_bridge.strip_images_for_text_model``), so answering
+        # from a text-only model beats a hard 503, BUT the swap was
+        # previously completely silent. The operator never saw the
+        # degradation in the dashboard nor the request ledger -- an image
+        # turn silently answered from a model that cannot see the image,
+        # and the only signal was the text-only model id in
+        # ``lingling.routed_model`` that a caller would only spot cross-
+        # referencing the request body. An INFO log here surfaces the
+        # swap out-of-band so an operator monitoring ``/api/health`` or
+        # following the request ledger can see what happened without re-
+        # deriving it.
+        degraded_pool = [m for m in catalog.free() if m.id not in exclude]
+        degraded_preview = ", ".join(sorted(m.id for m in degraded_pool)) or "(none)"
+        _log.info(
+            "dispatcher: degraded fallback -- vision request had images "
+            "but no live vision model after exclude={%s}; answering from "
+            "text-only pool [%s] with image->placeholder already applied",
+            ", ".join(sorted(exclude)) or "(empty exclude)",
+            degraded_preview,
+        )
+        pool = degraded_pool
     if not pool:
-        # No vision model left for an image request: answering from a text-only
-        # model beats refusing, and the caller has already replaced the image
-        # with a placeholder for models that cannot see it.
-        pool = [m for m in catalog.free() if m.id not in exclude]
-    if not pool:
-        return config.DISPATCHER_MODEL
+        # The candidate pool drained *after* removing ``exclude``-d and burned
+        # models (burned ones never make it through ``catalog.free()``). Today's
+        # bare return of ``DISPATCHER_MODEL`` would re-hand out a known-dead id
+        # if the brain itself happened to be burned -- raise instead, so the
+        # request flow's blanket handler emits a 503 rather than parroting a
+        # zombie model id back to the caller. With no pinned brain
+        # (``DISPATCHER_MODEL == ""``) there is nothing to re-hand anyway, so
+        # the raise is unconditional.
+        if config.DISPATCHER_MODEL:
+            if not catalog.is_burned(config.DISPATCHER_MODEL):
+                return config.DISPATCHER_MODEL
+        raise DispatcherUnavailable(
+            "no live model after exclude"
+            + (
+                f"; the dispatcher's own brain is burned ({config.DISPATCHER_MODEL})"
+                if config.DISPATCHER_MODEL
+                else ""
+            )
+        )
 
     kind = classify_work(messages or [], has_images)
     pool.sort(key=lambda m: _capability_score(m, kind), reverse=True)
     return pool[0].id
+
+
+class DispatcherUnavailable(RuntimeError):
+    """No live free model is available after burn-filtering the catalog.
+
+    Raised by :func:`dispatcher_model` (and indirectly by :func:`fallback_model`
+    once burned models are filtered out of ``catalog.free()``) when both the
+    live candidate pool AND the dispatcher's own routing brain are unavailable.
+    The blanket ``except Exception`` handlers in ``app.py``'s request flow
+    translate it into a 503 just like today's crash-on-dead-model, but without
+    silently re-handing out a known-dead id.
+    """
+
+
+def dispatcher_model(catalog: Any) -> Optional[str]:
+    """The model the dispatcher should call to route a turn.
+
+    With a pinned ``config.DISPATCHER_MODEL``, returns that id while it stays
+    live (not burned); once it burns, auto-promotes the next-best live model
+    from ``catalog.free()``. With an empty default (the shipped configuration),
+    the brain is resolved entirely from the live catalog -- whatever
+    ``catalog.free()`` currently leads with -- so a model upstream rotates out
+    or burns never walls routing behind a stale id. Returns ``None`` only when
+    no live model exists at all, letting the caller fail with a clean "no live
+    models" path instead of trying a known-dead id.
+    """
+    live = catalog.free()
+    if config.DISPATCHER_MODEL:
+        if not catalog.is_burned(config.DISPATCHER_MODEL):
+            return config.DISPATCHER_MODEL
+    return live[0].id if live else None
 
 
 def decide(
@@ -426,7 +515,17 @@ def decide(
 
     candidate_ids = [m.id for m in candidates]
     dispatcher_messages = build_dispatcher_messages(messages, candidates, has_images)
-    raw = call_model(dispatcher_messages, config.DISPATCHER_MODEL)
+    brain = dispatcher_model(catalog)
+    if brain is None:
+        # No live free model at all -- and the dispatcher's brain is itself
+        # burned -- so don't even attempt the routing call: it would crash on
+        # a burned id and the app-layer handler would synthesize a fallback that
+        # recurses here. Raise explicitly for a clean 503 upstream.
+        raise DispatcherUnavailable(
+            "no live model available, and the dispatcher's own routing brain is "
+            f"burned ({config.DISPATCHER_MODEL})"
+        )
+    raw = call_model(dispatcher_messages, brain)
     chosen, reason = parse_decision(raw)
 
     if chosen and chosen in candidate_ids:

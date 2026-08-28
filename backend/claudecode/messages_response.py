@@ -1,11 +1,25 @@
 """OpenAI chat-completion response -> Anthropic Messages response.
 
-Key mappings: ``finish_reason`` -> ``stop_reason`` (a client branches on it, so
-``length`` -> ``max_tokens``, ``tool_calls`` -> ``tool_use``); flat text -> a
-content block list; and usage field names. Reasoning is returned only when the
-client asked for thinking, in its own ``thinking`` block, never folded into the
-answer. A turn with no visible answer is reported as such -- see
-:func:`_assistant_text`.
+Three mappings carry the weight:
+
+* **``finish_reason`` -> ``stop_reason``.** Anthropic's vocabulary is different
+  and a client branches on it, so ``length`` must become ``max_tokens`` and
+  ``tool_calls`` must become ``tool_use`` -- a wrong value here makes an agent
+  mis-handle a perfectly good turn.
+* **Flat text -> a content block list.** Anthropic answers are always blocks,
+  and a ``tool_calls`` response becomes one ``tool_use`` block per call.
+* **Usage field names.** ``prompt_tokens``/``completion_tokens`` become
+  ``input_tokens``/``output_tokens``.
+
+Reasoning is returned only when the client asked for thinking, and then in its
+own ``thinking`` block -- never folded into the answer. Both of the other two
+arrangements were tried against a real session and both were worse: concatenated,
+the deliberation reads as the reply; emitted unrequested, it floods the terminal,
+because Anthropic redacts thinking by default and Lingling has nothing to redact
+with. See :func:`claudecode.thinking.wants_thinking`.
+
+A turn that produces no visible answer at all is reported as such rather than
+having its scratch work promoted -- see :func:`_assistant_text`.
 """
 
 from __future__ import annotations

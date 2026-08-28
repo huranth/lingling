@@ -1,21 +1,32 @@
 """Unified multi-provider catalog of free models.
 
-Each provider lists its own models; this catalog merges them by id into a
-:class:`LogicalModel` that records which providers serve it. That grouping is
-what enables cross-provider failover. Only free models become logical models;
-premium ones are counted as filtered.
+Each provider lists its own models; this catalog merges them into one view.
+Models are grouped by id into a :class:`LogicalModel` that records *which
+providers serve it*. That grouping is what enables cross-provider failover:
+``deepseek-v4-flash-free`` served by OpenCode becomes one
+logical model; the executor can then try different egress proxies in turn
+when one IP burns.
+
+Only free models become logical models; premium models are counted as filtered.
 """
 
 from __future__ import annotations
 
-import json
+import logging
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core import config
+from models.catalog_persistence import BurnStateStore
 from providers.base import Provider, ProviderModel
+
+# Same ``uvicorn.error`` root the daemon ``self._log``-gers and the health/tor
+# managers share, so the recycler's burn / heal / cooldown-emits surface at
+# INFO threshold alongside the rest of the daemon's state-change logs and the
+# operator can grep one namespace for every "is the gateway misbehaving?" line.
+_log = logging.getLogger("uvicorn.error")
 
 
 class LogicalModel:
@@ -25,6 +36,32 @@ class LogicalModel:
         self.id = primary.id
         self.primary = primary
         self.providers: Dict[str, ProviderModel] = {primary.provider_id: primary}
+        self.consecutive_failures: int = 0
+        self.last_failure_at: float = 0.0
+        self.burned: bool = False
+        self.burned_at: float = 0.0
+        self.recover_after: float = 0.0  # auto-retry timestamp; 0 = no trial scheduled
+        # Reach from disk via ``BurnStateStore``. ``blacklisted`` is the
+        # operator-quality "stop probing" flag; ``blacklist_hits`` counts
+        # back-to-back reconcile failures and trips ``blacklisted`` once it
+        # crosses ``config.BURN_BLACKLIST_HITS``. ``burned`` is unchanged:
+        # recycled by the live recycler (``record_model_failure`` /
+        # ``record_model_success``); the blacklist is the strict superset.
+        self.blacklisted: bool = False
+        self.blacklist_hits: int = 0
+
+    @property
+    def retired(self) -> bool:
+        """Whether this model id is on the operator's ``LINGLING_RETIRED_MODELS`` list.
+
+        Driven by the seed config rather than probe verdict: the model is hidden
+        on every refresh so the dispatcher can never pick it, even before the
+        recycler has had a chance to observe a failure. The flag is re-derived
+        from ``config`` on every ``refresh`` / ``apply_persisted_state`` call so
+        editing the env var is felt on the next refresh without touching
+        on-disk state.
+        """
+        return self.id in config.LINGLING_RETIRED_MODELS
 
     def add(self, pm: ProviderModel) -> None:
         self.providers[pm.provider_id] = pm
@@ -99,12 +136,50 @@ class LogicalModel:
         }
 
 
+def _apply_retired_seed(logical: Dict[str, LogicalModel]) -> int:
+    """Reconcile the operator's ``LINGLING_RETIRED_MODELS`` seed against the catalog.
+
+    Two-way reconciliation so editing the env var is felt on the next refresh
+    without touching the on-disk manifest:
+    * Each id in the seed is forced onto ``blacklisted=True`` so dispatch
+      cannot pick it, even before the recycler has had a chance to observe a
+      failure.
+    * Each id that is currently blacklisted with ``blacklist_hits == 0`` (so
+      the only reason it is blacklisted is the seed itself, not an operator or
+      the probe path) AND is NOT in the seed any more is cleared, so removing a
+      model from the env var promptly returns it to the rotation.
+
+    Reusing the blacklist flag (instead of a parallel filter) means the retire
+    seed rides the same persist/rehydrate pipeline as operator blacklists, so
+    the ``free()`` filter, the dashboard and the dispatcher all see it through
+    one funnel. Returns the number of *changes* made (set + cleared) so callers
+    can log the diff.
+    """
+    retired = set(config.LINGLING_RETIRED_MODELS or ())
+    changes = 0
+    for mid, lm in logical.items():
+        if mid in retired:
+            if not lm.blacklisted:
+                lm.blacklisted = True
+                changes += 1
+        elif lm.blacklisted and lm.blacklist_hits == 0:
+            lm.blacklisted = False
+            changes += 1
+    return changes
+
+
 class UnifiedCatalog:
     """Merges every provider's free models into one routable catalog."""
 
-    def __init__(self, providers: Dict[str, Provider]) -> None:
+    def __init__(self, providers: Dict[str, Provider], persist_path: Optional[Path] = None) -> None:
         self.providers = providers
-        self._lock = threading.Lock()
+        # Reentrant lock -- mutating helpers (``mark_blacklisted``, ``clear_blacklist``,
+        # ``record_model_failure`` etc.) can be called from inside a read that is
+        # already holding ``_lock`` (the reconciler's ``_classify`` does exactly
+        # this). A plain ``threading.Lock`` would deadlock in that path; ``RLock``
+        # matches the "any helper can be called whether lock is held or not"
+        # contract the ``_*_locked`` private functions already imply.
+        self._lock = threading.RLock()
         self._logical: Dict[str, LogicalModel] = {}
         self._all_models: List[ProviderModel] = []
         self._per_provider: Dict[str, Dict[str, Any]] = {}
@@ -120,85 +195,13 @@ class UnifiedCatalog:
         # below, so without this every request would re-run a failing upstream
         # fetch and concurrent callers would queue behind each other.
         self._attempted_at: float = 0.0
-        # Advertised-`-free` models that refused to serve (OpenCode answers
-        # "This model is unavailable for free"). Learned at runtime when a
-        # request hits that 400, so the catalog stops offering models the
-        # upstream has retired even though it still advertises them.
-        self._unavailable: Dict[str, float] = {}
-        # Operator-curated dead ids (config.retired_seed_ids). Honored verbatim
-        # and excluded from the runtime self-heal in refresh(): the seed exists
-        # precisely because /models keeps advertising a model the operator knows
-        # is dead, so a live re-appearance is NOT authoritative for a seeded id.
-        self._seed_ids: set = set(config.retired_seed_ids())
-        self._load_unavailable()
-
-    # -- retired models ----------------------------------------------------
-    def _load_unavailable(self) -> None:
-        """Restore the retired set; every loaded entry is re-stamped ``now``.
-
-        Seeded ids (``config.retired_seed_ids()``) are hidden from the very
-        first startup. Runtime-learned entries (parked by the recycler on a
-        'Model is unavailable' 400) are loaded back on every gateway start,
-        AND re-stamped ``now`` -- this is what lets a parked model STAY
-        parked across restarts and across refreshes: across a restart the
-        original parked_at of hours ago would already be past any probation
-        window, so the catalog's first refresh would otherwise resurrect the
-        model on a /models re-list (the chronic case gives /models the same
-        listing pre and post restart). The probation-pop loop is gone, the
-        re-stamp alone is what holds the parked state across the restart.
-        Persistence respects LINGLING_RETIRED_MODEL_TTL_DAYS on load only: an
-        entry whose persisted timestamp is older than the TTL is dropped
-        here, so OpenCode gets a chance to resume serving it during the next
-        week even without an operator clearing retired_models.json.
-        """
-        ttl = config.RETIRED_MODEL_TTL_DAYS * 86400
-        now = time.time()
-        self._unavailable = {}
-        for mid in config.retired_seed_ids():
-            self._unavailable[mid] = now
-        try:
-            raw = json.loads(Path(config.RETIRED_MODELS_FILE).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw = {}
-        if isinstance(raw, dict):
-            for mid, ts in raw.items():
-                if isinstance(ts, (int, float)) and (now - float(ts)) < ttl:
-                    self._unavailable[str(mid)] = now  # re-stamp: parked stays parked across restarts
-
-    def _save_unavailable(self) -> None:
-        try:
-            path = Path(config.RETIRED_MODELS_FILE)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self._unavailable), encoding="utf-8")
-            tmp.replace(path)
-        except OSError:
-            pass
-
-    def mark_unavailable(self, model_id: str) -> None:
-        """Hide a model from the catalog because the upstream retired its free tier.
-
-        Called when a request to an advertised-`-free` model comes back with the
-        "unavailable for free" 400. The model is dropped from every query (the
-        ``_unavailable`` membership is what ``by_id`` / ``_active`` / ``is_free``
-        consult, not the ``_logical`` cache) and the fact is persisted so the
-        Codex catalog generator (a separate process) agrees. The entry expires
-        after ``RETIRED_MODEL_TTL_DAYS``, so a restored free tier reappears
-        without a manual step.
-        """
-        with self._lock:
-            self._unavailable[model_id] = time.time()
-            self._save_unavailable()
-
-    def is_unavailable(self, model_id: str) -> bool:
-        return model_id in self._unavailable
-
-    def _active(self, items) -> List[LogicalModel]:
-        return [m for m in items if m.id not in self._unavailable]
-
-    def retired(self) -> List[str]:
-        """Retired model ids, for the dashboard to show rather than guess."""
-        return sorted(self._unavailable)
+        # Persistent burn-state store. Lives outside the in-memory dict so the
+        # recycler's verdict on a model still holds after a clean restart; the
+        # reconciler reads/applies the on-disk manifest at startup and the
+        # catalog rewrites it after every burn / heal / blacklist transition.
+        self._burn_store = BurnStateStore(
+            Path(persist_path) if persist_path is not None else config.BURN_STATE_FILE
+        )
 
     def refresh(self, force: bool = False) -> "UnifiedCatalog":
         with self._lock:
@@ -236,7 +239,17 @@ class UnifiedCatalog:
                     free_count += 1
                     lm = logical.get(pm.id)
                     if lm is None:
-                        logical[pm.id] = LogicalModel(pm)
+                        lm = LogicalModel(pm)
+                        prior = self._logical.get(pm.id)  # carry burn state across refresh
+                        if prior is not None:
+                            lm.consecutive_failures = prior.consecutive_failures
+                            lm.last_failure_at = prior.last_failure_at
+                            lm.burned = prior.burned
+                            lm.burned_at = prior.burned_at
+                            lm.recover_after = prior.recover_after
+                            lm.blacklisted = prior.blacklisted
+                            lm.blacklist_hits = prior.blacklist_hits
+                        logical[pm.id] = lm
                     else:
                         lm.add(pm)
                 per_provider[pid] = {
@@ -252,46 +265,252 @@ class UnifiedCatalog:
             self._all_models = all_models
             self._per_provider = per_provider
             self._generated_at = time.time()
-
-            # No auto-resurrection: a model parked by the recycler STAYS parked
-            # across refreshes and across restarts. The earlier "self-heal on a
-            # /models re-list" pop used to undo the retirement within one
-            # refresh for the chronic case (OpenCode keeps advertising the model
-            # but the backend refuses chat) -- across a gateway restart the
-            # parked entry's persisted timestamp was well past the probation
-            # window, so the FIRST post-startup refresh immediately resurrected
-            # the model "everywhere" again. Parked entries are now sticky until
-            # either the operator clears retired_models.json manually or the
-            # LINGLING_RETIRED_MODEL_TTL_DAYS age filter in _load_unavailable
-            # drops the entry on the next gateway start (gives OpenCode a week
-            # to resume serving it without an operator touch).
+            # Re-stamp the operator retire list on every refresh so it can't be
+            # aged out by TTL/cooldown and survives an empty manifest on disk.
+            seeded = _apply_retired_seed(self._logical)
+            if seeded:
+                _log.info(
+                    "catalog: applied %d retired-model seed entr%s from %s",
+                    seeded, "y" if seeded == 1 else "ies", "LINGLING_RETIRED_MODELS",
+                )
+            # NO persist call here -- on first boot, the manifest on disk
+            # carries burns from the previous process; if we wrote our
+            # still-empty in-memory state at this point, we'd clobber it
+            # before apply_persisted_state could read it. ``record_model_*``
+            # and ``apply_persisted_state`` own persists from here on.
             return self
 
     # -- queries -----------------------------------------------------------
-    def free(self) -> List[LogicalModel]:
-        self.refresh()
-        active = self._active(self._logical.values())
-        return sorted(active, key=lambda lm: (not lm.vision, lm.id))
+    def free(self) -> List["LogicalModel"]:
+        """Every free model not currently burned, sorted vision-first then by id.
 
-    def vision_free(self) -> List[LogicalModel]:
+        Burned models are dropped here -- this is the single funnel every
+        candidate pool, client listing and picker derives from, so this filter
+        stamps them out of dispatcher candidate sets, ``fallback_model``,
+        ``model_map.resolve``'s Claude Code chain, the codex dump,
+        ``/api/models`` and ``/v1/models`` end-to-end, without those callers
+        needing their own burn logic. Falls back to root-[``self._is_burned_locked``]
+        so the cooldown-auto-recover tick also fires here, on the read path.
+        Blacklisted models (reconcile proved Zen will not serve them) are
+        dropped too, by the same funnel, so phone-home reauth / manual
+        clear-list are the only paths back.
+        """
+        self.refresh()
+        with self._lock:
+            return [
+                lm for lm in sorted(self._logical.values(),
+                                    key=lambda m: (not m.vision, m.id))
+                if not self._is_burned_locked(lm) and not lm.blacklisted
+            ]
+
+    def vision_free(self) -> List["LogicalModel"]:
         return [lm for lm in self.free() if lm.vision]
 
-    def by_id(self, model_id: str) -> Optional[LogicalModel]:
-        """Resolve a model from the current catalog view.
+    # -- recycler: burn / heal / cooldown ----------------------------------
+    def record_model_failure(self, model_id: str) -> bool:
+        """Bump a model's consecutive-failure counter; burn it past the threshold.
 
-        Runs on every routed request, so it does not re-fetch when the model is
-        already known -- an explicit request must not pay an upstream round-trip
-        just because the TTL happened to expire. Only an unknown model falls
-        through to a refresh, so a just-published model still resolves by name.
+        Returns True iff this call newly transitioned the model to ``burned``
+        (i.e. the counter just crossed ``config.MAX_MODEL_FAILURES``). Returns
+        False otherwise (already burned, or model unknown to the catalog).
+
+        A burned model is dropped from ``free()`` / ``vision_free()`` and from
+        every client-facing listing; after ``config.MODEL_BURN_COOLDOWN_SECONDS``
+        it gets one trial request, at which point a fresh success un-burns it.
         """
-        if model_id in self._unavailable:
-            return None
-        lm = self._logical.get(model_id)
-        if lm is not None:
-            return lm
+        with self._lock:
+            lm = self._logical.get(model_id)
+            if lm is None:
+                return False
+            lm.consecutive_failures += 1
+            lm.last_failure_at = time.time()
+            if not lm.burned and lm.consecutive_failures >= config.MAX_MODEL_FAILURES:
+                lm.burned = True
+                lm.burned_at = lm.last_failure_at
+                lm.recover_after = lm.burned_at + config.MODEL_BURN_COOLDOWN_SECONDS
+                _log.info(
+                    "recycler: model %s just tanked for the %dth time up the chain -- "
+                    "dropping it from the rotation; back in the kitchen in %ds if it behaves",
+                    lm.id, lm.consecutive_failures, int(config.MODEL_BURN_COOLDOWN_SECONDS),
+                )
+                self._persist_state()
+                return True
+            return False
+
+    def record_model_success(self, model_id: str) -> None:
+        """Reset a model's failure streak; heal a burned model that just succeeded."""
+        transitioned = False
+        with self._lock:
+            lm = self._logical.get(model_id)
+            if lm is None:
+                return
+            lm.consecutive_failures = 0
+            lm.last_failure_at = 0.0
+            if lm.burned:
+                lm.burned = False
+                lm.burned_at = 0.0
+                lm.recover_after = 0.0
+                transitioned = True
+                _log.info(
+                    "recycler: model %s cooked clean on the trial -- back in the kitchen",
+                    lm.id,
+                )
+            # A clean return-trip also resets reconcile-trail hits; the
+            # ``blacklisted`` flag is operator-controlled and survives.
+            if lm.blacklist_hits:
+                lm.blacklist_hits = 0
+                transitioned = True
+        if transitioned:
+            self._persist_state()
+
+    def is_burned(self, model_id: str) -> bool:
+        """Whether ``model_id`` is currently burned; consumes any cooldown elapsed."""
+        with self._lock:
+            lm = self._logical.get(model_id)
+            if lm is None:
+                return False
+            return self._is_burned_locked(lm)
+
+    def _maybe_auto_recover(self, lm: "LogicalModel") -> None:
+        # Caller must hold ``self._lock``.
+        # A blacklisted model must NOT auto-recover on cooldown -- the blacklist
+        # is the operator/reconciler saying "Zen will not serve this; stop
+        # wasting a free-tier slot on it". Only an explicit un-blacklist call
+        # brings it back.
+        if lm.blacklisted:
+            return
+        if lm.burned and lm.recover_after and time.time() >= lm.recover_after:
+            lm.burned = False
+            lm.recover_after = 0.0
+            _log.info(
+                "recycler: model %s's cooldown lapsed -- letting it back into the kitchen for one shift",
+                lm.id,
+            )
+
+    def _is_burned_locked(self, lm: "LogicalModel") -> bool:
+        # Caller must hold ``self._lock``. Burns-pop-on-cooldown lives here so
+        # ``free()`` -- the single funnel every candidate path & listing derives
+        # from -- drives the auto-recover tick instead of needing its own.
+        self._maybe_auto_recover(lm)
+        return lm.burned
+
+    # -- blacklist / reconcile surface area -------------------------------
+    def is_blacklisted(self, model_id: str) -> bool:
+        """Whether ``model_id`` is on the operator/reconcile blacklist."""
+        with self._lock:
+            lm = self._logical.get(model_id)
+            return bool(lm and lm.blacklisted)
+
+    def mark_blacklisted(
+        self, model_id: str, hits: int, probe_status: Optional[int],
+    ) -> bool:
+        """Reconcile-trail update: bump blacklist_hits; trip blacklisted on threshold.
+
+        Called by the reconciler after a probe confirms the model is still
+        broken. ``hits`` is the new consecutive-probe-broken count; the
+        threshold lives on the reconciler, the catalog only persists what it
+        is told. ``probe_status`` is captured for the operator log. Returns
+        True iff this call newly flipped the model to blacklisted.
+        """
+        with self._lock:
+            lm = self._logical.get(model_id)
+            if lm is None:
+                return False
+            lm.blacklist_hits = max(0, int(hits))
+            newly_blacklisted = False
+            if config.BURN_BLACKLIST_HITS > 0 and not lm.blacklisted and \
+                    lm.blacklist_hits >= config.BURN_BLACKLIST_HITS:
+                lm.blacklisted = True
+                newly_blacklisted = True
+                _log.warning(
+                    "recycler: model %s probed broken %d times in a row "
+                    "(status=%s) -- hard-blacklisted until an operator clears it",
+                    lm.id, lm.blacklist_hits, probe_status,
+                )
+        self._persist_state()
+        return newly_blacklisted
+
+    def clear_blacklist(self, model_id: str) -> bool:
+        """Operator un-blacklist. Returns True iff the model was blacklisted."""
+        with self._lock:
+            lm = self._logical.get(model_id)
+            if lm is None:
+                return False
+            if not lm.blacklisted and not lm.blacklist_hits:
+                return False
+            was_blacklisted = lm.blacklisted
+            lm.blacklisted = False
+            lm.blacklist_hits = 0
+        self._persist_state()
+        return was_blacklisted
+
+    def apply_persisted_state(self) -> int:
+        """Read the on-disk burn manifest and re-hydrate the catalog.
+
+        Called once at startup, after the first ``refresh()`` has rebuilt
+        ``_logical``. Any persisted entry whose model id no longer exists on
+        any provider is left untouched on disk -- a future refresh on a
+        healthier upstream will rediscover the model and pick the manifest
+        back up. Returns the number of entries applied (for logging).
+        """
+        manifest = self._burn_store.load()
+        if not manifest:
+            return 0
+        applied = 0
+        with self._lock:
+            for mid, entry in manifest.items():
+                lm = self._logical.get(mid)
+                if lm is None:
+                    continue
+                lm.burned = bool(entry.get("burned"))
+                lm.burned_at = float(entry.get("burned_at", 0.0))
+                lm.recover_after = float(entry.get("recover_after", 0.0))
+                lm.consecutive_failures = int(entry.get("consecutive_failures", 0))
+                lm.blacklisted = bool(entry.get("blacklisted"))
+                lm.blacklist_hits = int(entry.get("blacklist_hits", 0))
+                applied += 1
+            # Re-stamp the operator retire list AFTER the disk rehydration so a
+            # currently-empty list that the operator added mid-process is felt
+            # on the next reload, and any model the disk says is fine but the
+            # env var wants hidden is forced onto the blacklist here.
+            _apply_retired_seed(self._logical)
+        if applied:
+            _log.info(
+                "burn-state: rehydrated %d manifest entr%s from %s",
+                applied, "y" if applied == 1 else "ies", self._burn_store.path,
+            )
+            # Persist the merged (in-memory + on-disk) state so the file
+            # carries the canonical bled-through view, not whatever shape
+            # it had on the previous boot.
+            self._persist_state()
+        return applied
+
+    def _persist_state(self) -> None:
+        """Snapshot every LogicalModel's burn trail to disk.
+
+        Takes ``self._lock`` itself (the lock is an ``RLock``, so callers that
+        already hold it -- ``record_model_failure``, ``mark_blacklisted``,
+        ``apply_persisted_state`` -- nest safely) so the snapshot cannot catch
+        a half-applied transition (e.g. ``burned=True`` with a stale
+        ``burned_at``) from the reconciler thread, which calls this without the
+        lock. ``BurnStateStore`` then takes its own internal lock for the
+        actual filesystem write.
+        """
+        with self._lock:
+            snapshot: Dict[str, Dict[str, Any]] = {}
+            for mid, lm in self._logical.items():
+                snapshot[mid] = {
+                    "burned": lm.burned,
+                    "blacklisted": lm.blacklisted,
+                    "blacklist_hits": lm.blacklist_hits,
+                    "consecutive_failures": lm.consecutive_failures,
+                    "burned_at": lm.burned_at,
+                    "recover_after": lm.recover_after,
+                }
+        self._burn_store.save(snapshot)
+
+    def by_id(self, model_id: str) -> Optional[LogicalModel]:
         self.refresh()
-        if model_id in self._unavailable:
-            return None
         return self._logical.get(model_id)
 
     # alias for callers that prefer .get
@@ -309,8 +528,6 @@ class UnifiedCatalog:
     def is_free(self, model_id: str) -> Optional[bool]:
         """True if free, False if known-but-premium, None if unknown."""
         self.refresh()
-        if model_id in self._unavailable:
-            return None
         if model_id in self._logical:
             return True
         for pm in self._all_models:
@@ -321,20 +538,20 @@ class UnifiedCatalog:
     def meta(self) -> Dict[str, Any]:
         self.refresh()
         logical = self._logical
-        active = self._active(list(logical.values()))
         return {
             "generated_at": self._generated_at,
-            "free": len(active),
-            "vision_free": len([lm for lm in active if lm.vision]),
+            "free": len(logical),
+            "vision_free": len([lm for lm in logical.values() if lm.vision]),
             "total_models": len(self._all_models),
             "premium_filtered": len([m for m in self._all_models if not m.free]),
-            "multi_provider_models": len([lm for lm in active if len(lm.providers) > 1]),
-            # Advertised-`-free` models the upstream refused to serve, learned at
-            # runtime. Surfaced so the dashboard can show them rather than have
-            # them silently vanish (or worse, keep being offered).
-            "retired": len(self._unavailable),
-            "retired_models": self.retired(),
+            "multi_provider_models": len([lm for lm in logical.values() if len(lm.providers) > 1]),
+            "burned": len([lm for lm in logical.values() if lm.burned]),
+            "blacklisted": len([lm for lm in logical.values() if lm.blacklisted]),
             "free_only": True,
             "providers": self._per_provider,
+            "burn_state_file": str(self._burn_store.path),
+            # True when *every* provider's list is a stale cached fallback, i.e.
+            # the last refresh could not reach any upstream. The dashboard can
+            # warn instead of implying the (cached) list is freshly confirmed.
             "stale": bool(self._stale) and all(self._stale.values()),
         }

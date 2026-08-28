@@ -1,16 +1,33 @@
 """OpenAI chat SSE -> Anthropic Messages SSE.
 
-OpenAI repeats one chunk shape; Anthropic sends an explicit lifecycle a client
-relies on (message_start, per-block start/delta/stop, message_delta carrying
-stop_reason and usage, message_stop). So this is a state machine, and three
-rules exist because breaking them fails silently:
+The two formats disagree about more than field names. OpenAI repeats one chunk
+shape and lets the client infer structure; Anthropic sends an explicit lifecycle
+a client is entitled to rely on:
 
-* blocks are opened before being written to and closed before the next opens;
-* indices are handed out in order of first appearance, never reserved per type;
-* ``message_delta`` is emitted even when the upstream reported no finish_reason.
+    message_start
+      content_block_start   index=0
+      content_block_delta   index=0   (many)
+      content_block_stop    index=0
+      content_block_start   index=1
+      ...
+    message_delta       <- stop_reason and usage land here, not in a final chunk
+    message_stop
 
-Tool arguments pass through as ``input_json_delta`` fragments, but the enclosing
-block needs its name and id up front (OpenAI only sends them on the first).
+So this is a state machine, and three of its rules exist because getting them
+wrong fails silently rather than loudly:
+
+* **Blocks are opened before they are written to and closed before the next one
+  opens.** A delta for an unopened index is undefined behaviour in a client.
+* **Indices are handed out in order of first appearance**, never reserved per
+  block type. Reserving leaves gaps, and a client keyed on index either collides
+  or waits forever for a block that never opens.
+* **``message_delta`` is emitted even when the upstream never reported a
+  finish_reason.** A client that never sees it treats the turn as unfinished.
+
+Tool arguments are the awkward case: OpenAI streams them as JSON string
+fragments and Anthropic does too, via ``input_json_delta`` -- so fragments pass
+straight through, but the enclosing block needs its name and id up front, which
+OpenAI only sends on the first fragment.
 """
 
 from __future__ import annotations

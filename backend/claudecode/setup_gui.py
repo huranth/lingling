@@ -16,12 +16,12 @@ Writing ``ANTHROPIC_MODEL`` therefore breaks ``/model``: the picker shows your
 choice and the request carries the pinned one. So this writes ``model`` as a
 *starting* default and never touches the environment variable.
 
-The two things it does write to ``env`` are the endpoint and the credential.
-Neither is switchable from inside a session, and both need to beat whatever a
-previous gateway left behind -- Anthropic documents a settings-file ``env`` entry
-as taking precedence over a shell export of the same name, which is the only way
-to neutralise a persisted ``ANTHROPIC_BASE_URL`` without editing the user's
-environment.
+What it writes to ``env`` is the endpoint (plus a local sentinel
+``ANTHROPIC_AUTH_TOKEN``). The endpoint is not
+switchable from inside a session and needs to beat a leftover export -- Anthropic
+documents a settings-file ``env`` entry as taking precedence over a shell export
+of the same name, which is the only way to neutralise a persisted
+``ANTHROPIC_BASE_URL`` without editing the user's environment.
 
 It also removes any ``provider`` block. That key is absent from Anthropic's
 settings reference -- some third-party launchers invent it -- and it outranks
@@ -46,10 +46,21 @@ SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 # Written so editors and Claude Code itself can validate the file.
 SCHEMA = "https://json.schemastore.org/claude-code-settings.json"
 
-# Endpoint and credential only. `ANTHROPIC_MODEL` is deliberately absent: it would
+# Endpoint only. `ANTHROPIC_MODEL` is deliberately absent: it would
 # override the `model` setting and break `/model`. `CLAUDE_CODE_EFFORT_LEVEL` is
-# absent for the same reason with respect to `/effort`.
+# absent for the same reason with respect to `/effort`. `ANTHROPIC_AUTH_TOKEN`
+# is written as a local sentinel: the gateway is keyless and never validates
+# it, but Claude Code refuses to send a request when the token is present and
+# empty ("Not logged in · Please run /login" -- verified on 2.1.223), and a
+# non-empty value also neutralises a leftover export from another gateway.
 MANAGED_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN")
+
+# A fixed local placeholder for the credential slot. It is not a secret: the
+# keyless gateway ignores it, and it only has to look non-empty to Claude
+# Code's pre-flight auth check. A fixed value keeps the settings file
+# byte-stable across re-runs (idempotent apply) and never touches the user's
+# real Anthropic credentials.
+LOCAL_AUTH_TOKEN = "lingling-local-keyless"
 
 # Variables that pin something the terminal is supposed to own. Reported loudly,
 # because a leftover one makes `/model` or `/effort` look broken.
@@ -132,54 +143,8 @@ def stale_conflicts(settings: Dict[str, Any]) -> List[str]:
     return found
 
 
-def fetch_model_overrides(
-    base_url: str, timeout: float = 6.0,
-) -> Dict[str, Any]:
-    """contextWindowOverrides + maxTokensOverrides for every free model.
-
-    Claude Code warns and assumes a 200k window for any model id it doesn't
-    recognise -- wrong for the 1M-context models -- so each model's real window
-    is declared under ``contextWindowOverrides`` (and its output cap under
-    ``maxTokensOverrides``). Read live from the gateway, so a newly published
-    model is covered the next time setup runs. Both maps are empty when the
-    gateway is unreachable; callers then leave existing overrides alone.
-    """
-    url = base_url.rstrip("/") + "/v1/models"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError):
-        return {}
-
-    ctx_map: Dict[str, int] = {}
-    out_map: Dict[str, int] = {}
-    no_window: List[str] = []
-    for m in payload.get("data", []):
-        if not isinstance(m, dict) or not m.get("id"):
-            continue
-        mid = m["id"]
-        ctx = m.get("context_length")
-        if not ctx:
-            # The router (lingling-auto) has no fixed window; it routes to any
-            # free model, so its declared window is the smallest one -- the only
-            # value that can never overestimate what it lands on.
-            no_window.append(mid)
-            continue
-        ctx_map[mid] = int(ctx)
-        out_max = m.get("max_output")
-        if out_max:
-            out_map[mid] = int(out_max)
-
-    smallest = min(ctx_map.values(), default=None)
-    for mid in no_window:
-        if smallest:
-            ctx_map[mid] = smallest
-    return {"contextWindowOverrides": ctx_map, "maxTokensOverrides": out_map}
-
-
 def build_settings(
-    existing: Dict[str, Any], base_url: str, token: str, model: str,
-    overrides: Optional[Dict[str, Any]] = None,
+    existing: Dict[str, Any], base_url: str, model: str,
 ) -> Dict[str, Any]:
     """Merge Lingling's configuration into whatever is already there.
 
@@ -197,10 +162,12 @@ def build_settings(
 
     env = dict(out.get("env") or {}) if isinstance(out.get("env"), dict) else {}
     env["ANTHROPIC_BASE_URL"] = base_url.rstrip("/")
-    # An empty string is documented as "treated as unset for provider selection",
-    # which is what a keyless local gateway wants -- and it still neutralises a
-    # leftover export from another gateway.
-    env["ANTHROPIC_AUTH_TOKEN"] = token
+    # A non-empty local sentinel: the keyless gateway never validates it, but
+    # Claude Code treats a present-but-empty token as "not logged in" and
+    # refuses to send (verified on 2.1.223). It still neutralises a leftover
+    # export from another gateway, because a settings-file `env` entry beats
+    # a shell export of the same name.
+    env["ANTHROPIC_AUTH_TOKEN"] = LOCAL_AUTH_TOKEN
     # Never written: it would outrank the `model` key and make /model a no-op.
     env.pop("ANTHROPIC_MODEL", None)
     env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
@@ -211,15 +178,6 @@ def build_settings(
     # this key itself when the user picks a level, and leaving a stale value here
     # would silently set the floor for every new session.
     out.pop("effortLevel", None)
-    # Declare each free model's real context window / output cap so Claude Code
-    # stops assuming 200k for ids it doesn't recognise (fetch_model_overrides).
-    if overrides:
-        for key in ("contextWindowOverrides", "maxTokensOverrides"):
-            vals = overrides.get(key) or {}
-            if vals:
-                merged = dict(out.get(key) or {})
-                merged.update(vals)
-                out[key] = merged
     return out
 
 
@@ -239,6 +197,15 @@ def write_settings(data: Dict[str, Any]) -> Optional[Path]:
     tmp = SETTINGS_FILE.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     tmp.replace(SETTINGS_FILE)
+    # ``os.replace`` carries the new file's inode mode through, so a user-set
+    # 0o600 would silently downgrade to 0o644 here. settings.json can hold
+    # permissions and hooks, so re-assert owner-only after every Apply.
+    try:
+        os.chmod(SETTINGS_FILE, 0o600)
+        if backup is not None:
+            os.chmod(backup, 0o600)
+    except OSError:
+        pass
     return backup
 
 
@@ -266,119 +233,7 @@ def fetch_models(base_url: str, timeout: float = 4.0) -> Tuple[List[str], Option
     return ids, None
 
 
-def fetch_or_mint_key(
-    base_url: str, timeout: float = 4.0, label: str = "Claude Code",
-) -> Tuple[str, Optional[str]]:
-    """Get a usable API key without the user copying one by hand.
-
-    Read from Lingling's own key store on disk rather than over HTTP. ``/api/keys``
-    is authenticated -- correctly, since it can mint and revoke credentials -- so
-    asking it for a key requires the key we are trying to obtain. The file is the
-    way out of that circle: anything that can write ``~/.claude/settings.json``
-    already has the filesystem access the store would need, so reading it grants
-    no privilege the caller did not have.
-
-    Order:
-
-    * auth is switched off -- no key is needed, return ``""``;
-    * a key already exists -- reuse it, so repeated runs do not litter the keyring;
-    * none exists -- mint one.
-
-    Returns ``(token, error)``. An error means the user must paste one, which the
-    window then asks for -- the case for a gateway on another machine.
-    """
-    # A gateway with auth disabled answers /api/health with required=false, and a
-    # key would be pointless noise. This also proves it is actually running.
-    try:
-        with urllib.request.urlopen(base_url.rstrip("/") + "/api/health", timeout=timeout) as resp:
-            health = json.loads(resp.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError) as exc:
-        return "", f"Could not reach {base_url.rstrip('/')}/api/health ({exc})."
-
-    auth = health.get("auth") if isinstance(health, dict) else None
-    if isinstance(auth, dict) and auth.get("required") is False:
-        return "", None
-
-    try:
-        from core import api_keys
-        from core import config
-    except ImportError:
-        return "", "Paste a key from the dashboard (Keys view)."
-
-    # list_keys() masks the token by design -- it feeds the dashboard, which must
-    # never redisplay a secret. The store itself holds the real one, and that is
-    # what Claude Code needs, so read it directly.
-    try:
-        raw = json.loads(Path(config.API_KEYS_FILE).read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raw = []
-    except (OSError, json.JSONDecodeError) as exc:
-        return "", f"Could not read the key store ({exc}). Paste a key instead."
-
-    if isinstance(raw, list):
-        for entry in raw:
-            if isinstance(entry, dict) and isinstance(entry.get("token"), str) and entry["token"]:
-                return entry["token"], None
-
-    try:
-        created = api_keys.create_key(label)
-    except OSError as exc:
-        return "", f"Could not mint a key ({exc}). Paste one from the dashboard."
-    token = created.get("token")
-    if isinstance(token, str) and token:
-        return token, None
-    return "", "Paste a key from the dashboard (Keys view)."
-
-
-def auth_required(base_url: str, timeout: float = 4.0) -> Optional[bool]:
-    """Whether the gateway demands a key. ``None`` when it cannot be reached.
-
-    Three-valued on purpose. "No key" means two opposite things -- a gateway
-    running with ``LINGLING_REQUIRE_KEY=0`` needs none, while a gateway with auth
-    on and an empty keyring needs one that does not exist yet -- and telling the
-    user the wrong one sends them to a session where every request 401s.
-    """
-    try:
-        with urllib.request.urlopen(base_url.rstrip("/") + "/api/health", timeout=timeout) as resp:
-            health = json.loads(resp.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError):
-        return None
-    auth = health.get("auth") if isinstance(health, dict) else None
-    if isinstance(auth, dict) and auth.get("required") is False:
-        return False
-    return True
-
-
-def existing_key(base_url: str, timeout: float = 4.0) -> str:
-    """The first key already on the dashboard, or ``""`` when there is none.
-
-    Read-only on purpose. :func:`fetch_or_mint_key` *creates* a key when the
-    keyring is empty, which no unattended path should do: it filled the setup
-    window on a gateway whose Keys view read "No keys issued", and the token then
-    outlived its keyring by surviving in ``settings.json``. Offering what already
-    exists keeps issuing credentials a deliberate act in the dashboard.
-    """
-    if auth_required(base_url, timeout) is not True:
-        return ""
-
-    try:
-        from core import config
-    except ImportError:
-        return ""
-
-    try:
-        raw = json.loads(Path(config.API_KEYS_FILE).read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return ""
-
-    if isinstance(raw, list):
-        for entry in raw:
-            if isinstance(entry, dict) and isinstance(entry.get("token"), str) and entry["token"]:
-                return entry["token"]
-    return ""
-
-
-def apply(base_url: str, token: str, model: str) -> Dict[str, Any]:
+def apply(base_url: str, model: str) -> Dict[str, Any]:
     """Do the whole job. Returns a result dict for the UI to render.
 
     Separated from the widgets so the command-line path and the tests exercise
@@ -386,8 +241,7 @@ def apply(base_url: str, token: str, model: str) -> Dict[str, Any]:
     """
     existing, warning = load_settings()
     conflicts = stale_conflicts(existing)
-    overrides = fetch_model_overrides(base_url)
-    data = build_settings(existing, base_url, token, model, overrides=overrides)
+    data = build_settings(existing, base_url, model)
     backup = write_settings(data)
     return {
         "settings_path": str(SETTINGS_FILE),
@@ -396,7 +250,6 @@ def apply(base_url: str, token: str, model: str) -> Dict[str, Any]:
         "warning": warning,
         "model": model,
         "base_url": base_url.rstrip("/"),
-        "keyless": not token,
     }
 
 
@@ -414,7 +267,7 @@ def run_gui() -> int:
         from tkinter import messagebox, ttk
     except ImportError:
         print("This build of Python has no tkinter. Use the command line instead:")
-        print("  python setup_claude_code.py --model deepseek-v4-flash-free")
+        print("  python setup_claude_code.py --model <model-id>")
         return 2
 
     root = tk.Tk()
@@ -453,18 +306,6 @@ def run_gui() -> int:
         foreground="#777777", font=("Segoe UI", 8),
     ).grid(row=4, column=1, sticky="w")
 
-    # -- key -------------------------------------------------------------
-    # The user pastes a key from the dashboard if needed. No key is auto-fetched
-    # or shown -- an auto-filled token in a screenshot looks like a leak.
-    ttk.Label(frame, text="API key").grid(row=5, column=0, sticky="w", pady=4)
-    token_var = tk.StringVar()
-    token_entry = ttk.Entry(frame, textvariable=token_var, width=32, show="*")
-    token_entry.grid(row=5, column=1, sticky="we", pady=4)
-    ttk.Label(
-        frame, text="paste a key from the Keys tab",
-        foreground="#777777", font=("Segoe UI", 8),
-    ).grid(row=6, column=1, sticky="w")
-
     status = tk.Text(frame, height=9, width=62, wrap="word", relief="flat",
                      background="#f4f2ee", foreground="#333333")
     status.grid(row=8, column=0, columnspan=3, sticky="we", pady=(12, 8))
@@ -477,7 +318,7 @@ def run_gui() -> int:
         status.configure(state="disabled")
 
     def refresh() -> None:
-        """Repopulate the model list and fetch a key, from whatever gateway is named."""
+        """Repopulate the model list from whatever gateway is named."""
         ids, error = fetch_models(url_var.get())
         if error:
             model_box["values"] = []
@@ -492,12 +333,6 @@ def run_gui() -> int:
         current = existing.get("model")
         model_var.set(current if current in ids else ids[0])
 
-        # Only a key that is live on the dashboard is offered. The settings file is
-        # deliberately not consulted: it holds whatever a previous run wrote, so a
-        # key revoked in the Keys view kept reappearing here and the field looked
-        # populated on a gateway with none issued. No keys -> empty field.
-        token_var.set(existing_key(url_var.get()))
-
         say(f"Found {len(ids)} model(s). Pick a starting model and click Apply.")
 
     def on_apply() -> None:
@@ -506,7 +341,7 @@ def run_gui() -> int:
             messagebox.showwarning("Pick a model", "Choose a model first, or click Refresh.")
             return
         try:
-            result = apply(url_var.get().strip(), token_var.get().strip(), model)
+            result = apply(url_var.get().strip(), model)
         except OSError as exc:
             messagebox.showerror("Could not write settings", str(exc))
             return
@@ -518,16 +353,6 @@ def run_gui() -> int:
         ]
         if result["backup"]:
             lines.append(f"Backed up your old file to {Path(result['backup']).name}")
-        if result["keyless"]:
-            # Two very different situations, and calling both "keyless" sent the
-            # user to a session where every request 401s.
-            if auth_required(url_var.get()) is False:
-                lines.append("No key needed -- this gateway accepts unauthenticated calls.")
-            else:
-                lines.append(
-                    "No key written, but this gateway requires one. Create a key in "
-                    "the dashboard's Keys view, paste it above, and Apply again."
-                )
         if result["warning"]:
             lines += ["", f"Note: {result['warning']}"]
         if result["conflicts"]:
@@ -561,10 +386,6 @@ def run_cli(argv: List[str]) -> int:
     )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--model", help="the starting model; omit to list what is available")
-    parser.add_argument(
-        "--key", default=None,
-        help="API key; omitted means ask the gateway for one",
-    )
     args = parser.parse_args(argv)
 
     ids, error = fetch_models(args.base_url)
@@ -581,18 +402,7 @@ def run_cli(argv: List[str]) -> int:
         print(f"{args.model!r} is not offered by {args.base_url}. Available: {', '.join(ids)}")
         return 1
 
-    token = args.key
-    if token is None:
-        # The CLI keeps minting: it is an explicit, scripted invocation, and a
-        # headless install has no window to paste a key into. The GUI does not,
-        # because a field that fills itself with a brand-new credential on a
-        # gateway showing no keys issued is indistinguishable from a leak.
-        token, key_error = fetch_or_mint_key(args.base_url)
-        if key_error:
-            print(key_error)
-            return 1
-
-    result = apply(args.base_url, token, args.model)
+    result = apply(args.base_url, args.model)
     print(f"Wrote {result['settings_path']}")
     if result["backup"]:
         print(f"Backed up to {result['backup']}")

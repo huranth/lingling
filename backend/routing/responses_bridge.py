@@ -1,18 +1,28 @@
 """Stateless bridge between OpenAI Responses and Chat Completions.
 
-Codex now speaks only ``POST /v1/responses``; Lingling's providers speak chat
-completions, so this translates at the boundary and leaves routing, failover,
-egress and usage logging to the existing executor path. Stateless by design:
-callers must send full context in ``input`` (no ``previous_response_id``).
+Codex now speaks only ``POST /v1/responses``. Lingling's providers speak the
+older chat-completions wire format, so this module translates at the boundary
+and leaves routing, failover, egress, and usage logging in the existing
+executor path.
+
+The bridge is intentionally stateless: callers must send full context in
+``input``. Server-side ``previous_response_id`` would require storing response
+items and replaying them, which Lingling's local proxy model does not otherwise
+need.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import time
 from json import JSONDecodeError
 from typing import Any, Dict, Generator, List, Optional
+
+from routing import stream_guard
 from routing.stream_guard import RESET_KEY
+
+log = logging.getLogger("uvicorn.error")
 
 
 def _content_from_parts(parts: Any) -> Any:
@@ -56,7 +66,10 @@ def _content_from_parts(parts: Any) -> Any:
 def request_to_chat(body: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """Return ``(model, messages, params)`` for an OpenAI Responses request."""
     if body.get("previous_response_id"):
-        raise ValueError("previous_response_id is not supported; send full input context")
+        log.warning(
+            "responses: previous_response_id %r ignored -- stateless bridge requires full input",
+            body.get("previous_response_id"),
+        )
     model = body.get("model")
     if not isinstance(model, str) or not model:
         raise ValueError("Missing 'model' field.")
@@ -81,11 +94,15 @@ def request_to_chat(body: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]], Di
                     pending_tool_calls = []
                 role = item.get("role") or "user"
                 content = _content_from_parts(item.get("content"))
-                if content or role in ("system", "developer"):
-                    messages.append({
-                        "role": "system" if role == "developer" else role,
-                        "content": content,
-                    })
+                # Always preserve the turn — dropping a large workspace chunk as
+                # "empty" (e.g. content == "" due to _content_from_parts returning
+                # "" for a non-list) is what made Get deep context blank at any
+                # effort. Keep the message even if content is empty so the model
+                # sees the full context.
+                messages.append({
+                    "role": "system" if role == "developer" else role,
+                    "content": content if content else "",
+                })
             elif itype == "function_call":
                 pending_tool_calls.append({
                     "id": item.get("call_id") or item.get("id") or f"call_{len(pending_tool_calls) + 1}",
@@ -198,9 +215,23 @@ def response_object(
     choice = (chat.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     output: List[Dict[str, Any]] = []
-    content = _assistant_text(msg)
-    if content:
-        output.append(_message_item(content, status="completed"))
+    parts = _assistant_parts(msg)
+    if parts:
+        # PB5-W3-84 sibling (chat<->Responses direction, non-stream): a
+        # non-empty content now emits a Responses ``message`` item whose
+        # ``content`` parts carry each ``output_text`` part's text AND the
+        # ``annotations`` array verbatim -- previously ``_assistant_text``
+        # coerced everything to a flat string and ``_message_item`` hardcoded
+        # ``annotations:[]``, so any citations the chat-from-Responses step
+        # upstream (``openai_responses.response_to_chat_completion`` under the
+        # structured-content emit) preserved on each part were stripped here.
+        output.append({
+            "id": f"msg_{int(time.time() * 1000)}",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": parts,
+        })
     for call in msg.get("tool_calls") or []:
         item = _tool_call_item(call)
         if item:
@@ -217,27 +248,51 @@ def response_object(
     }
 
 
-def _assistant_text(message: Dict[str, Any]) -> str:
+def _assistant_parts(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return a list of Responses-style ``{type:output_text,text,annotations}``
+    parts for a chat-completion assistant message, lifting any per-part
+    ``annotations`` array (chat-completions spec extension) verbatim so a
+    reply that arrived from a Responses-only Round-trip (see the chat<->
+    Responses symmetric completion in :mod:`providers.openai_responses`)
+    keeps its citation attribution across the synthesis step.
+
+    A flat-string ``content`` collapses to a single part with empty
+    ``annotations``; a structured ``content`` (list of ``{type:text}`` parts
+    with their own ``annotations`` arrays) maps one-to-one; the legacy
+    nemotron-blank-turn fallback (reasoning keys, no real ``content``) emits
+    a single part with empty ``annotations`` so the message item still
+    surfaces.
+
+    Returns ``[]`` when the message has neither a usable ``content`` nor a
+    reasoning fallback -- the caller skips the message item in that case so
+    tool-call-only turns don't get an empty-text message tacked on."""
     content = message.get("content")
-    if isinstance(content, str) and content.strip():
-        return content
-    for key in ("reasoning_content", "reasoning", "thinking"):
-        value = message.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
     if isinstance(content, list):
-        return "\n".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
-    return ""
-
-
-def _message_item(text: str, status: str = "completed") -> Dict[str, Any]:
-    return {
-        "id": f"msg_{int(time.time() * 1000)}",
-        "type": "message",
-        "role": "assistant",
-        "status": status,
-        "content": [{"type": "output_text", "text": text, "annotations": []}],
-    }
+        parts: List[Dict[str, Any]] = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append({
+                    "type": "output_text",
+                    "text": str(p.get("text", "")),
+                    "annotations": list(p.get("annotations") or []),
+                })
+        if parts:
+            return parts
+        # Structured content with no recognised text parts (e.g. only
+        # image_url) -- fall through to reasoning-key probe rather than emit
+        # an empty message item.
+    text: Optional[str] = None
+    if isinstance(content, str) and content.strip():
+        text = content
+    else:
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                break
+    if not text:
+        return []
+    return [{"type": "output_text", "text": text, "annotations": []}]
 
 
 def _tool_call_item(call: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -282,6 +337,16 @@ def stream_events(
 
     text_item_id: Optional[str] = None
     text_parts: List[str] = []
+    # PB5-W3-84 stream sibling (chat->Responses direction): the chat-from-
+    # Responses step upstream (``openai_responses.chat_sse_from_responses_sse``)
+    # lifts ``output_text.done`` ``annotations`` onto a synthetic chat delta's
+    # ``delta.annotations`` field. Until this loop CONSULTED it the synopsis
+    # here dropped them again, re-synthesising ``output_text.done`` with
+    # no annotations and ``output_item.done`` with ``annotations:[]``. We
+    # now accumulate both top-level ``delta.annotations`` and any
+    # per-part ``annotations`` on a structured ``delta.content`` list, and
+    # lift them back onto the synthesized events at the end of the stream.
+    text_annotations: List[Dict[str, Any]] = []
     calls: Dict[int, Dict[str, Any]] = {}
     usage: Dict[str, Any] = {}
     finished = False
@@ -299,28 +364,8 @@ def stream_events(
     broke: Optional[str] = None
 
     def _emit_in_flight_done():
-        """Flush in-flight reasoning + text items as ``incomplete`` before a retry.
-
-        Called on a mid-flight retry marker from guarded_stream (the chat
-        path's ``lingling_reset``); the chat client honours the marker and
-        discards what it rendered, but the Responses wire has no equivalent,
-        so emit ``.done`` events for whatever is in flight (with status
-        ``incomplete``) and clear their slots. The retry's deltas then open
-        fresh ``response.output_item.added`` events with the next
-        output_index -- so the Responses consumer sees a cleanly-discarded
-        partial followed by the retry, not the two attempts concatenated into
-        one item. In-flight tool calls are left to the end-of-stream
-        close-out (call arguments mid-call rarely break this way; trying to
-        split the arguments across retry attempts would do more harm than the
-        concat). The partial is NOT appended to the final summary ``output``
-        -- it is a discarded attempt, not part of the answer.
-        """
-        # ``nonlocal`` declares the names we *write* here. The two ``*_index``
-        # slots are read-only in this helper: the ``.done`` event emits the
-        # partial's own output_index, and on retry the chunk handler reserves
-        # a fresh one via next_index.
         nonlocal reasoning_item_id, reasoning_parts
-        nonlocal text_item_id, text_parts
+        nonlocal text_item_id, text_parts, text_annotations
         if reasoning_item_id is not None:
             think = "".join(reasoning_parts)
             item = {
@@ -344,11 +389,12 @@ def stream_events(
             item = {
                 "id": text_item_id, "type": "message", "role": "assistant",
                 "status": "incomplete",
-                "content": [{"type": "output_text", "text": text, "annotations": []}],
+                "content": [{"type": "output_text", "text": text, "annotations": list(text_annotations)}],
             }
             yield sse("response.output_text.done", {
                 "type": "response.output_text.done", "item_id": text_item_id,
                 "output_index": text_index, "content_index": 0, "text": text,
+                "annotations": list(text_annotations),
             })
             yield sse("response.content_part.done", {
                 "type": "response.content_part.done", "item_id": text_item_id,
@@ -360,11 +406,17 @@ def stream_events(
             })
             text_item_id = None
             text_parts = []
+            text_annotations = []
 
     try:
         for raw in chat_stream:
             line = raw if isinstance(raw, bytes) else raw.encode("utf-8")
             if not line.startswith(b"data:"):
+                # The mid-flight reset marker is an SSE comment line (see
+                # ``stream_guard.reset_frame``) so the Anthropic translator
+                # skips it; this bridge still needs to act on it.
+                if line.startswith(stream_guard.RESET_LINE_PREFIX):
+                    yield from _emit_in_flight_done()
                 continue
             payload = line[5:].strip()
             if not payload or payload == b"[DONE]":
@@ -375,11 +427,6 @@ def stream_events(
                 continue
             if isinstance(obj.get("usage"), dict):
                 usage = _usage(obj["usage"])
-            # Mid-flight retry marker from guarded_stream: the upstream stream
-            # broke mid-answer and was reopened on a fresh exit IP (and maybe a
-            # different model). Flush any in-flight partial as ``incomplete`` so
-            # the retry's deltas re-open fresh output_items -- without this the
-            # two attempts concatenate into one message.
             if isinstance(obj.get(RESET_KEY), dict):
                 yield from _emit_in_flight_done()
                 continue
@@ -422,6 +469,15 @@ def stream_events(
                         "type": "response.output_text.delta", "item_id": text_item_id,
                         "output_index": text_index, "content_index": 0, "delta": text,
                     })
+                # PB5-W3-84 stream sibling accumulator: OpenAI's chat-completions
+                # spec extension lets a content delta carry a top-level
+                # ``annotations`` array (citations accumulated by the SDK).
+                # The chat-from-Responses translator upstream emits exactly that
+                # shape when the upstream Responses ``output_text.done`` carries
+                # ``annotations`` -- head those off into our synthesis above.
+                delta_anns = delta.get("annotations")
+                if isinstance(delta_anns, list) and delta_anns:
+                    text_annotations.extend(delta_anns)
                 for call_delta in delta.get("tool_calls") or []:
                     idx = int(call_delta.get("index") or 0)
                     call = calls.setdefault(
@@ -458,7 +514,7 @@ def stream_events(
                 if choice.get("finish_reason"):
                     finished = True
     except Exception as exc:  # noqa: BLE001 - any transport failure ends the stream
-        # A dropped WARP tunnel raises here. Letting it propagate would abort the
+        # A dropped egress tunnel raises here. Letting it propagate would abort the
         # HTTP response with no terminal event, which Codex sees as a hung turn;
         # the 200 is already sent so it cannot become an error status either. Close
         # out the items we did emit and report `incomplete` instead. GeneratorExit
@@ -482,16 +538,19 @@ def stream_events(
             "type": "response.output_item.done", "output_index": reasoning_index, "item": item,
         })
     if text_item_id is None and reasoning_item_id is not None:
-        # Some models stream their whole answer as reasoning and never emit a
-        # content delta (nemotron does this). Without a message item the client
-        # renders an empty turn, so the thinking becomes the answer rather than
-        # being lost.
-        #
-        # This must apply whether or not the upstream signalled a
-        # finish_reason. A reasoning-only stream that completes normally still
-        # carries no content delta -- gating the promotion on ``not finished``
-        # meant exactly those completed answers vanished, leaving the client a
-        # collapsed thinking block and nothing else.
+        # Some models (notably muse-spark-1.2-contributor-free at xhigh) stream
+        # their whole answer as reasoning and either never emit a content delta or
+        # emit ``finish_reason: length / max_tokens`` after thinking exhausts the
+        # token budget -- the ``not finished`` guard below was the only thing
+        # gating this fallback, but for the "reasoning then length" pattern
+        # ``finished`` is True at the same point this would fire, so the guard
+        # was unreachable and the client rendered an empty turn. Without a
+        # message item Codex renders the response as zero-length assistant text,
+        # so the thinking becomes the answer rather than being lost -- regardless
+        # of whether the upstream modelled a finish. The final ``response.completed``
+        # event still records ``finish_reason=length`` when the upstream reported
+        # it, so clients can show "truncated by max_tokens" rather than a clean
+        # stop.
         text_item_id = f"msg_{int(time.time() * 1000)}"
         text_index = next_index
         next_index += 1
@@ -509,12 +568,18 @@ def stream_events(
         text = "".join(text_parts)
         item = {
             "id": text_item_id, "type": "message", "role": "assistant", "status": "completed",
-            "content": [{"type": "output_text", "text": text, "annotations": []}],
+            "content": [{"type": "output_text", "text": text,
+                         # PB5-W3-84 stream sibling emit: accumulate the per-
+                         # chunk ``delta.annotations`` into the final part
+                         # so Codex can render citations. Empty when the chat
+                         # upstream didn't emit any (the common free-tier case).
+                         "annotations": list(text_annotations)}],
         }
         output.append(item)
         yield sse("response.output_text.done", {
             "type": "response.output_text.done", "item_id": text_item_id,
             "output_index": text_index, "content_index": 0, "text": text,
+            "annotations": list(text_annotations),
         })
         yield sse("response.content_part.done", {
             "type": "response.content_part.done", "item_id": text_item_id,
@@ -541,15 +606,6 @@ def stream_events(
         })
     status = "completed" if finished else "incomplete"
     if outcome is not None:
-        # When the chat source is guarded_stream (the chat/responses paths) it
-        # has its own completion tracking that catches OpenCode's no-[DONE]
-        # wire: a usage/cost frame flips outcome.completed (this bridge's
-        # choice-level finish_reason check misses it), and any unrecoverable
-        # error is recorded there too (guarded swallows the transport
-        # exception rather than letting it raise here, so the bridge's own
-        # ``broke`` is None on a recovered/retried break). Don't clobber the
-        # smarter verdict: a True completion stays True once set, and an error
-        # already surfaced stays surfaced.
         outcome.completed = outcome.completed or finished
         if outcome.error is None:
             outcome.error = broke
@@ -559,14 +615,9 @@ def stream_events(
         output=output,
         usage=usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
     )
-    # Surfaced so a client (and the dashboard's ledger) can tell a truncated
-    # answer from a complete one. guarded_stream has already retried once if it
-    # could on the wrapped paths; this is a record, not a retry. The bridge's
-    # own transport error wins when present (passthrough paths), and falls back
-    # to the guard's recorded error otherwise.
-    surfaced_error = broke or (outcome.error if outcome is not None else None)
-    if surfaced_error:
-        final["incomplete_details"] = {"reason": surfaced_error[:200]}
+    surfaced = broke or (outcome.error if outcome is not None else None)
+    if surfaced:
+        final["incomplete_details"] = {"reason": surfaced[:200]}
     yield sse("response.completed", {
         "type": "response.completed",
         "response": final,

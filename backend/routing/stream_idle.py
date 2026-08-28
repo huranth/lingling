@@ -1,26 +1,60 @@
-"""Notice a stream that has gone silent without dying.
+"""Noticing a stream that has gone silent without dying.
 
-``execute_stream`` guards the first chunk and ``stream_guard`` retries a stream
-that raises; neither covers a stream that stops producing while the connection
-stays open (one real session sat 885s with zero tokens). httpx's read timeout
-misses it too: the provider reads with ``iter_lines()`` and drops empty lines,
-so SSE keepalives reset the read timeout while delivering nothing usable.
+The gap this closes
+-------------------
+``execute_stream`` guards the *first* chunk, and ``stream_guard`` retries a stream
+that raises. Neither covers a stream that simply stops speaking while the
+connection stays open, and a real session hit exactly that:
 
-A worker thread drains the upstream onto a bounded queue; the caller reads with
-a deadline and raises :class:`StreamStalled` if no frame arrives in budget. The
-reader is then left to finish on its own -- it cannot be closed from here
-(closing a generator another thread is blocked in raises ValueError), and its
-own ``REQUEST_TIMEOUT`` ends the connection (which is why the idle budget is
-smaller than it).
+    id 10  stream_broken  in=0  out=0  think=0  885.0s
+
+Fifteen minutes, no tokens, then filed as broken. Nothing killed it; nothing was
+watching it. To the user that is indistinguishable from a hang.
+
+Why httpx's own read timeout does not catch it
+----------------------------------------------
+``providers.base.stream_chat`` reads with ``resp.iter_lines()`` and drops empty
+lines (``if line:``). SSE keepalives *are* empty lines, so they reset httpx's read
+timeout while delivering nothing usable upstream. The clock therefore has to be
+kept where the usable frames are counted, not at the socket.
+
+How
+---
+The upstream generator is drained by a worker thread onto a queue, and the caller
+reads that queue with a deadline. No frame within the budget raises
+:class:`StreamStalled`, which the chat path feeds into its existing retry and the
+messages path turns into an honest end-of-turn.
+
+What happens to the abandoned upstream
+--------------------------------------
+It cannot be closed from here, and the first version of this module wrongly
+claimed otherwise. A generator that another thread is currently blocked inside
+raises ``ValueError: generator already executing`` on ``close()`` -- measured --
+so the ``finally`` in ``stream_chat`` never runs and the httpx connection is not
+released at that moment.
+
+Instead the reader thread is left to finish on its own. It does: the provider
+builds its client with an httpx timeout (``httpx.Timeout(REQUEST_TIMEOUT)`` for
+non-stream, ``STREAM_READ_TIMEOUT`` for streams), so a socket that has
+genuinely gone quiet raises there, the generator's ``finally`` closes the client,
+and the daemon thread exits. The consumer has long since returned, so the user
+never waits for it. What this module guarantees is that *the request* is not held
+hostage; the connection is reclaimed on the provider's own timeout.
+
+That makes the provider's timeout (``REQUEST_TIMEOUT`` / ``STREAM_READ_TIMEOUT``)
+the upper bound on a leaked connection, which is why the idle budget is much
+smaller than it.
+
+The budget is deliberately generous. When a free model thinks it streams
+``reasoning_content`` continuously -- measured at 1203 frames for one turn -- so a
+long think keeps the frames flowing and only a true stall goes quiet.
 """
 
 from __future__ import annotations
 
 import queue
 import threading
-from typing import Any, Generator, Iterable, Tuple
-
-from core import config
+from typing import Any, Generator, Iterable
 
 
 class StreamStalled(Exception):
@@ -36,29 +70,6 @@ class StreamStalled(Exception):
 
 # A sentinel distinguishable from any real frame.
 _DONE = object()
-
-
-def pacing_for(reasoning: bool) -> Tuple[float, float]:
-    """Idle-watchdog budget and httpx read timeout for one outbound stream.
-
-    A reasoning model that hides its thinking tokens stays silent on the wire
-    while it reasons; the default watchdog and httpx read budgets would both
-    fire on that silence and ``stream_guard`` would retry the model to death --
-    while it was merely thinking. Reasoning models therefore get a longer
-    "thinking patience": the watchdog budget is :data:`config.STREAM_THINKING_TIMEOUT`
-    and the httpx read timeout sits a first-token budget above it, so the
-    watchdog's :class:`StreamStalled` (informative, one retry via stream_guard)
-    governs a silent pause rather than a bare httpx ``ReadTimeout``. Non-reasoning
-    models keep the tight defaults -- they never legitimately go quiet, so the
-    watchdog still catches a real stall and first-token failover stays fast.
-
-    ``STREAM_THINKING_TIMEOUT <= 0`` disables the extension (reasoning models
-    fall back to the default budgets); it is not the watchdog-disable sentinel,
-    which is ``STREAM_IDLE_TIMEOUT <= 0``.
-    """
-    if reasoning and config.STREAM_THINKING_TIMEOUT > 0:
-        return config.STREAM_THINKING_TIMEOUT, config.STREAM_THINKING_TIMEOUT + config.STREAM_FIRST_TOKEN_TIMEOUT
-    return config.STREAM_IDLE_TIMEOUT, config.STREAM_FIRST_TOKEN_TIMEOUT
 
 
 def with_idle_timeout(

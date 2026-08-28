@@ -1,14 +1,33 @@
-"""Wait out an exhausted egress pool instead of failing the request.
+"""Waiting out an exhausted egress pool instead of failing the request.
 
-When every WARP exit answers 429 at once, ending as HTTP 503 makes a coding
-agent (Cline, Codex) abandon the whole task -- while the pool quietly recovers a
-minute later. So the request waits for the soonest exit and retries, since a
-70-second turn beats a dead session.
+When every Tor lane answers 429 at once, the request used to end as HTTP 503.
+For a coding agent that is not one lost turn: Cline and Codex abandon the whole
+task, and the human restarts from scratch -- while the pool quietly recovers a
+minute later and sits idle.
 
-Two deliberate choices: the wait happens on the event loop (``asyncio.sleep``),
-never in a worker thread that the executor needs; and the pool's own cooldown
-state is the trigger (``mark_failure`` only cools an exit where a different IP
-would help), so if nothing is cooling there is nothing to wait for.
+But the exits are only *cooling*, not dead, and the pool already knows exactly
+when the next one comes back (:meth:`ProxyPool.time_until_available`). So the
+request waits for it and tries again. A turn that takes 70 seconds is an
+annoyance; a turn that fails is a dead session, and nobody would trade those
+the other way around.
+
+Two deliberate choices:
+
+* **The wait happens on the event loop** (``asyncio.sleep``), never inside a
+  worker thread. A parked request must not hold a threadpool slot that the
+  executor needs for the requests that can still go out.
+* **The pool's own state is the trigger.** There is no "was this a rate limit?"
+  inspection of the error, because ``mark_failure`` only cools an exit for the
+  statuses where a different IP would actually help. If nothing is in cooldown
+  there is nothing to wait for, and waiting cannot fix a 400.
+
+"Saturated" lanes (carrying ``PROXY_MAX_PARALLEL_STREAMS`` in-flight streams)
+are also treated as unavailable: a request that lands on a saturated lane will
+get the same per-IP free-tier brownout the saturated lane's other streams are
+already burning. ``seconds_to_wait`` consults the lane's cooldown alone --
+the saturation check is the picker's job -- so parking here picks the right
+moment to retry (a cooled lane coming back *and* an in-flight stream finishing
+usually coincide) without holding on the saturated one.
 """
 
 from __future__ import annotations
@@ -40,6 +59,14 @@ def seconds_to_wait(proxy_pool: Any, budget_s: float, log: Any) -> float:
       strand the client for longer than the answer is worth.
 
     Callers treat ``0.0`` as "nothing changed, fail exactly as before".
+
+    Saturation check: if every non-cooled lane is at
+    ``PROXY_MAX_PARALLEL_STREAMS`` already, the soonest cooled lane's
+    cooldown is *also* the soonest pick (a stream finishing will free up
+    capacity only after the cooled exit cools). Wired through
+    ``active_streams`` (per-lane live-stream count) so the executor's
+    pick-time cap and parking's wait window make the same decision about
+    what "soonest available" means.
     """
     if budget_s <= 0 or proxy_pool is None:
         return 0.0
@@ -49,7 +76,7 @@ def seconds_to_wait(proxy_pool: Any, budget_s: float, log: Any) -> float:
         return 0.0
     if remaining > budget_s:
         log.warning(
-            "egress: every exit is cooling and the soonest needs %.1fs, over the %.0fs budget — bailing",
+            "egress: every exit is cooling and the soonest needs %.1fs, over the %.0fs budget",
             remaining, budget_s,
         )
         return 0.0
@@ -72,7 +99,7 @@ async def wait_for_egress(
     if not remaining:
         return 0.0
 
-    log.warning("egress: every exit is cooling — parking the request %.1fs for the next one", remaining)
+    log.warning("egress: every exit is cooling; holding the request %.1fs for the next one", remaining)
     await sleep(remaining)
     # The slept duration, not a measured one: a caller that injects its own
     # sleep (the tests do) still gets a truthful "this is what it waited for".
@@ -105,7 +132,7 @@ def hold_stream_for_egress(
         return
 
     log.warning(
-        "egress: every exit is cooling — parking the broken stream %.1fs for the next one",
+        "egress: every exit is cooling; holding the broken stream %.1fs for the next one",
         remaining,
     )
     while remaining > 0:

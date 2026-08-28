@@ -1,4 +1,20 @@
-"""Anthropic Messages request -> OpenAI chat-completions request."""
+"""Anthropic Messages request -> OpenAI chat-completions request.
+
+Four differences from the Codex/Responses bridge do the real work here:
+
+* **``system`` is a top-level field, not a message.** Anthropic has no ``system``
+  role for the main prompt, so it has to be hoisted into ``messages[0]``. A
+  ``system`` turn *inside* ``messages`` is a different thing -- Anthropic's
+  mid-conversation system messages -- and is kept in place.
+* **``max_tokens`` is required.** Claude Code always sends it; forwarding it is
+  not optional the way ``max_output_tokens`` was.
+* **Tool traffic lives inside content blocks.** ``tool_use`` sits in an assistant
+  turn's content array and ``tool_result`` in a *user* turn's, where chat
+  completions want ``assistant.tool_calls`` and a separate ``tool`` role.
+* **Thinking blocks are replayed, not dropped.** DeepSeek rejects a tool-calling
+  assistant turn that arrives without ``reasoning_content`` -- see
+  :func:`_assistant_message` for the measurement and what it broke.
+"""
 
 from __future__ import annotations
 

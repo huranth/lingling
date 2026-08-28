@@ -1,10 +1,24 @@
-"""Read thinking depth out of an Anthropic Messages request.
+"""Reading thinking depth out of an Anthropic Messages request.
 
-Claude Code expresses depth three ways: ``output_config.effort`` (modern words,
-already ranked in :mod:`routing.effort`); ``thinking.budget_tokens`` (older, a
-token budget bucketed onto the same ladder); and ``thinking: {"type":
-"disabled"}`` (an explicit no). This only *extracts* a label -- clamping to the
-model's legal values happens after routing, in ``app._resolve_effort``.
+Codex nests its depth under ``reasoning.effort`` and Lingling hands that label to
+:mod:`routing.effort`, which ranks it and clamps it to whatever the routed
+OpenCode model publishes. Claude Code needs the same treatment, but it can
+express depth three different ways depending on its version and the model it
+thinks it is talking to:
+
+1. ``output_config.effort`` -- the modern control, values ``low medium high
+   xhigh max``. Every one of those words is already ranked in
+   :mod:`routing.effort`, so translation is exact rather than approximate.
+2. ``thinking: {"type": "enabled", "budget_tokens": N}`` -- the older control,
+   still sent by Claude Code when ``MAX_THINKING_TOKENS`` is set or when it
+   believes the model predates adaptive thinking. A token budget is not a word,
+   so it is bucketed onto the same ladder.
+3. ``thinking: {"type": "disabled"}`` -- an explicit request for no thinking,
+   which is meaningfully different from saying nothing at all.
+
+This module only *extracts* a label. Clamping happens after routing, in
+``app._resolve_effort``, because which values are legal depends on the model that
+routing picked.
 """
 
 from __future__ import annotations
