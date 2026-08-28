@@ -4,7 +4,7 @@
    Warm sand paper, terracotta accent. Every colour, font, space, radius,
    z-index and duration the page uses lives here; the page references tokens by
    name only. Every pair the UI actually renders is verified against WCAG 2.1
-   (4.5:1 text, 3:1 non-text).
+   (4.5:1 text, 3:1 non-text) — see the audit note at the foot of this file.
    ========================================================================== */
 :root{
   /* ---- paper (light band, L > 85%) — warm sand page, near-white cards ---- */

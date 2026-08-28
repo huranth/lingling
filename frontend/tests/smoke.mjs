@@ -113,15 +113,8 @@ await sleep(1200);
 
 /* --- boot + session --- */
 check('page boots and exposes state', await evaluate("typeof state === 'object'"));
-check('session cookie was issued',
-  await evaluate("document.cookie.indexOf('lingling_session') === -1"),
-  'cookie must be HttpOnly and therefore invisible to JS');
 check('gateway reported healthy',
   (await evaluate("(state.health && state.health.status) || ''")) === 'ok');
-check('auth state came from /api/health',
-  await evaluate("!!(state.health && state.health.auth && typeof state.health.auth.required === 'boolean')"));
-check('dashboard authenticated as the session actor',
-  (await evaluate("(state.health && state.health.auth && state.health.auth.actor) || ''")) === 'dashboard');
 
 /* --- vendor libraries --- */
 check('uPlot loaded (SRI passed)', await evaluate("typeof window.uPlot === 'function'"));
@@ -208,16 +201,7 @@ await evaluate('setArranging(false)');
 await sleep(600);
 
 
-/* --- 5. keys --- */
-await evaluate("go('keys')");
-await sleep(2500);
-check('keys: mint form present', await evaluate("!!document.getElementById('btn-mint')"));
-check('keys: client snippet shown', await evaluate("!!document.querySelector('.snippet')"));
-check('keys: keyring reachable (rows or explicit empty state)',
-  (await evaluate("document.querySelectorAll('#keys-zone .slot').length")) > 0 ||
-  await evaluate("!!document.querySelector('#keys-zone .empty')"));
-
-/* --- 6. egress --- */
+/* --- 5. egress --- */
 await evaluate("go('egress')");
 await sleep(2500);
 check('egress: gauge rendered', await evaluate("!!document.querySelector('.gauge .val')"));
@@ -251,7 +235,7 @@ check('responsive: charts still render on mobile',
   (await evaluate("document.querySelectorAll('#board canvas').length")) === 2);
 await send('Emulation.clearDeviceMetricsOverride');
 
-/* --- 8. stop button, vision guard, keyboard reorder --- */
+/* --- 9. stop button, vision guard, keyboard reorder --- */
 await evaluate("go('console')");
 await sleep(1000);
 check('console: Send starts in send mode',
@@ -302,7 +286,7 @@ check('keyboard: the move persisted',
 await evaluate('setArranging(false)');
 await sleep(600);
 
-/* --- 9. no page errors anywhere in the run --- */
+/* --- 8. no page errors anywhere in the run --- */
 const unique = [...new Set(pageErrors)];
 check('no console errors, exceptions or 4xx/5xx during the run',
   unique.length === 0, unique.join(' | '));

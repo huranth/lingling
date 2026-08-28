@@ -9,7 +9,7 @@ flowchart LR
         E["Your editor<br/>Cline · Codex · Claude Code"]
         L["Lingling<br/>127.0.0.1:8000"]
     end
-    P["Egress pool<br/>WARP exits + Tor lanes"]
+    P["Egress pool<br/>Tor lanes"]
     O["OpenCode<br/>free models"]
     E -->|"OpenAI · Responses · Anthropic"| L
     L --> P
@@ -42,8 +42,7 @@ flowchart TD
     WIN -->|"any OS, by hand"| PIP["pip install -r requirements.txt<br/>python app.py"]
     BAT --> DASH
     PIP --> DASH["Dashboard live at<br/>127.0.0.1:8000"]
-    DASH --> KEY["Keys view →<br/>create an ll_ token"]
-    KEY --> DONE(["Paste it into your editor"])
+    DASH --> DONE(["Point your editor at the base URL"])
 ```
 
 ```
@@ -53,12 +52,11 @@ python app.py
 ```
 
 `start.bat` does the same thing *and* sets up the egress pool for you. Its
-first run downloads the WARP tools plus a ~25 MB Tor bundle, so give it a few
-minutes; every run after that starts fast.
+first run downloads the ~25 MB Tor bundle, so give it a few minutes; every run
+after that starts fast.
 
-Lingling asks for an API key by default. If it's just you on your own machine and
-that feels like ceremony, start it with `LINGLING_REQUIRE_KEY=0` and skip the key
-step entirely.
+No API key. The gateway is open on your own machine — the base URL is the whole
+credential.
 
 ## Pointing your editor at it
 
@@ -76,8 +74,8 @@ flowchart LR
 | Client | Base URL | One-click setup |
 |---|---|---|
 | Cline / any OpenAI client | `http://127.0.0.1:8000/v1` | — |
-| Codex | `http://127.0.0.1:8000/v1` | `setup_codex.bat` |
-| Claude Code | `http://127.0.0.1:8000` &nbsp;**← no `/v1`** | `setup_claude_code.py` |
+| Codex | `http://127.0.0.1:8000/v1` | `scripts/setup_codex.py` |
+| Claude Code | `http://127.0.0.1:8000` &nbsp;**← no `/v1`** | `scripts/setup_claude_code.py` |
 
 ### Cline, or anything else that speaks OpenAI
 
@@ -87,7 +85,7 @@ Four fields and you're connected:
 |---------|-------|
 | Provider | OpenAI Compatible |
 | Base URL | `http://127.0.0.1:8000/v1` |
-| API key | your `ll_...` token |
+| API key | anything — the gateway is open (blank is fine) |
 | Model | any free model, or `lingling-auto` to let Lingling choose |
 
 ### Codex
@@ -95,9 +93,8 @@ Four fields and you're connected:
 Codex only speaks the newer Responses API these days, so its provider block
 points at the gateway and Lingling does the translating.
 
-The easy route is `setup_codex.bat` in the repo root. Double-click it and it
-refreshes the model catalog, writes `~/.codex/config.toml`, and sorts out the API
-key — reusing one you've already issued, or minting a fresh one. There's nothing
+The easy route is `scripts/setup_codex.py`. Double-click it and it
+refreshes the model catalog and writes `~/.codex/config.toml`. There's nothing
 after that.
 
 If you'd rather do it by hand, `~/.codex/config.toml` wants to look like this:
@@ -110,15 +107,9 @@ model = "lingling-auto"
 name = "Lingling"
 base_url = "http://127.0.0.1:8000/v1"   # codex appends /responses; keep /v1
 wire_api = "responses"
-env_key = "LINGLING_API_KEY"
 ```
 
-Then set the key in your terminal before running `codex` (you can drop `env_key`
-altogether if you're running with `LINGLING_REQUIRE_KEY=0`):
-
-```
-set LINGLING_API_KEY=ll_your_token
-```
+No key line — the gateway is open.
 
 One extra wrinkle: for the reasoning dial to actually reach the model, Codex
 needs the model declared in its own catalog. `python tools\codex_catalog.py`
@@ -131,8 +122,8 @@ free models turn up.
 Claude Code speaks Anthropic's API rather than OpenAI's, so it gets its own
 endpoint.
 
-The gentlest way in is the setup window — double-click `setup_claude_code.py`.
-It reads the model list from your running gateway, reuses or mints a key, writes
+The gentlest way in is the setup window — double-click `scripts/setup_claude_code.py`.
+It reads the model list from your running gateway, writes
 `~/.claude/settings.json`, and cleans out any stale `provider` block left behind
 by an older gateway. Then run `claude`. No environment variables to remember.
 
@@ -141,7 +132,6 @@ Claude Code adds it itself:
 
 ```
 set ANTHROPIC_BASE_URL=http://127.0.0.1:8000
-set ANTHROPIC_AUTH_TOKEN=ll_your_token
 ```
 
 Model and thinking depth live in the terminal: `/model` and `/effort` change them
@@ -267,7 +257,6 @@ flowchart LR
     D(["Dashboard<br/>127.0.0.1:8000"]) --> CAT["📚 Catalog<br/><i>what's free right now</i>"]
     D --> CON["💬 Console<br/><i>try a prompt in-browser</i>"]
     D --> LED["📊 Ledger<br/><i>every request, charted</i>"]
-    D --> KEY["🔑 Keys<br/><i>mint / revoke ll_ tokens</i>"]
     D --> EGR["🌍 Egress<br/><i>exit IP health</i>"]
 ```
 
@@ -299,9 +288,8 @@ gateway. Skip this section unless something specific needs changing.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `LINGLING_HOST` / `LINGLING_PORT` | `127.0.0.1` / `8000` | Where `python app.py` binds |
-| `LINGLING_REQUIRE_KEY` | `1` | Gate API clients behind a `ll_` key |
 | `LINGLING_ALLOWED_ORIGINS` | *(empty)* | Extra CORS origins, comma-separated |
-| `LINGLING_DATA_DIR` | `backend/data` | Where the keyring, usage DB and WARP identities live |
+| `LINGLING_DATA_DIR` | `backend/data` | Where the usage DB and Tor lane state live |
 
 **Timeouts and refresh**
 
@@ -316,13 +304,9 @@ gateway. Skip this section unless something specific needs changing.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `LINGLING_WARP_COUNT` | `10` | How many WARP identities to register (slots; lanes = distinct exits the PoP offers) |
-| `LINGLING_PROBE_ON_STARTUP` | `1` | Send a real model request through each WARP proxy at startup to detect rate-limited/dead IPs |
+| `LINGLING_TOR_COUNT` | `5` | How many Tor lanes to run (each is one distinct exit IP; restart rotates it) |
 | `LINGLING_PROBE_INTERVAL_S` | `300` | The daemon re-runs the real-model probe + healers on this cadence |
-| `LINGLING_WARP_FORM_ON_STARTUP` | `1` | Assemble distinct exit lanes after the startup probe |
-| `LINGLING_TOR_ENABLED` | `1` | Run Tor egress lanes beside WARP (zero-account exit IPs; first run downloads Tor itself) |
 | `LINGLING_TOR_COUNT` | `3` | How many Tor lanes to run (each is one random exit IP; a restart rotates it) |
-| `LINGLING_WARP_ENDPOINTS` | curated list | Cloudflare edges used for tunnel re-rolls (comma-separated) |
 | `LINGLING_PROBE_MODEL` | *(a free model)* | Model used for the startup probe |
 | `LINGLING_PROBE_TIMEOUT` | `15` | Timeout (s) for each startup probe request |
 | `LINGLING_PROBE_CONCURRENCY` | `6` | Lanes probed at once (each lane first passes a raw SOCKS5 liveness check with a hard timeout, so a silent tunnel can't stall the pass) |
@@ -427,49 +411,46 @@ after `LINGLING_STREAM_IDLE_TIMEOUT` rather than hanging your session forever.
 ### The egress pool: lanes, not lies
 
 Nothing here needs your attention; it's listed so you know what the Egress
-view is showing you. But one fact first, because it's easy to get wrong:
-**a WARP identity is not an exit IP.** Your local Cloudflare PoP owns a small
-set of public exits — on the network this was built on, somewhere between two
-and five depending on the hour — and every tunnel lands on one when it comes
-up. Ten identities can share one address. So Lingling counts what actually
-carries traffic, **lanes**, and assembles them from two free sources that
-need no account:
+view is showing you. One fact, because it's easy to get wrong: **a Tor lane
+is one exit IP.** Each lane is a separate `tor.exe` pinned to a *different*
+exit country via `StrictNodes 1` + disjoint `ExitNodes {cc}`, so exit IPs are
+guaranteed distinct by construction. No shared anycast colo can collapse them
+the way one tunnelling vendor's identities did. Lingling counts what actually
+carries traffic, **lanes**:
 
 | Source | Default | Distinct exits | Rotation |
 |---|---|---|---|
-| **WARP** | 10 slots | 2–5 — whatever your Cloudflare PoP offers right now | tunnel re-roll (~4s, no re-registration) |
-| **Tor** | 3 lanes | one per lane, always distinct | restart the lane (~seconds, fresh route) |
+| **Tor** | 5 lanes | one per lane, always distinct | restart the lane / NEWNYM (~seconds, fresh route) |
 | **Any SOCKS proxy** | — | one per proxy you add | yours |
 
 ```mermaid
 flowchart TD
-    BOOT(["Startup probe:<br/>a real request through every lane"]) --> J{"how did<br/>each one do?"}
+    BOOT(["Health daemon:<br/>SOCKS port + OpenCode probe + IsTor probe per lane"]) --> J{"how did<br/>each one do?"}
     J -->|"healthy"| POOL["in the pool"]
-    J -->|"tunnel dead"| H1["identity healer<br/><i>regenerate (the only<br/>time this happens)</i>"]
-    J -->|"HTTP 429"| H2["exit healer<br/><i>re-roll the tunnel off<br/>the burned IP</i>"]
+    J -->|"tunnel dead"| H1["lane healer<br/><i>restart, then regenerate<br/>(DataDirectory wipe + new circuit)</i>"]
+    J -->|"HTTP 429"| H2["cooldown<br/><i>mileage the exit IP off<br/>the burned lane</i>"]
     J -->|"Tor lane burned"| H3["rotate<br/><i>restart = fresh route</i>"]
     H1 --> POOL
     H2 --> POOL
     H3 --> POOL
-    POOL -->|"tunnel checks every 60s<br/>real probe every 5min"| J
-    POOL --> FORM["lane formation:<br/>duplicates re-rolled onto<br/>exits nobody is using"]
-    FORM --> POOL
+    POOL -->|"lane checks every 60s"| J
 ```
 
-Three mechanics keep the lanes real:
+The mechanics that keep the lanes real:
 
-* **A learned edge→exit map.** Which exit a WARP tunnel gets depends on which
-  Cloudflare edge it enters through. Every roll is recorded, so healing and
-  formation aim at known edges instead of re-rolling blind.
-* **Re-roll, don't re-register.** A burned exit heals by re-establishing the
-  tunnel — free and seconds. Cloudflare registrations are only spent when a
-  tunnel is genuinely dead, and OpenCode quota is never spent placing lanes
-  (verification runs through Cloudflare's own endpoint).
-* **Truth on the dashboard.** The Egress view shows each lane's exit IP and a
-  live **exit lanes** count — "5 slots on 1 address" can never masquerade as
-  "5 exits" again. When every lane is burned at once, the healer waits on the
-  upstream's reset window instead of churning, and held requests get SSE
-  keepalives so your client doesn't give up.
+* **Distinct by construction.** A lane is a real Tor exit pinned to its own
+  country, so `N` lanes mean `N` distinct exit IPs — never `N` slots on one
+  address. The health daemon proves each one with an OpenCode reachability
+  probe plus an IsTor probe that fingerprints the actual exit IP.
+* **Regenerate escalates.** A dead lane first restarts (cheap), and only
+  after repeated failures a wholesale `regenerate_lane` — DataDirectory wipe +
+  consensus re-fetch + fresh circuit build — the heavy path that re-rolls the
+  exit from scratch.
+* **Truth on the dashboard.** The Egress view shows each lane's exit country
+  and IP and a live distinct-exits count, so a burned lane reads `down`/`rate-
+  limited` honestly instead of `up` off a bound port. When every lane is
+  burned at once, held requests wait out the cooldown instead of 503ing, and
+  the dashboard polls faster so healing transitions are visible.
 
 Want more lanes? Raise `LINGLING_TOR_COUNT` (each Tor lane is one always-
 distinct exit at ~63 MB RAM), or add any SOCKS5 proxy from the dashboard —
@@ -492,12 +473,12 @@ python -m pytest tests/ -q
 
 The launcher creates local runtime state under `backend/data/`. That directory is
 ignored by Git and must not be copied into a release: it can contain issued API
-keys, usage history, WARP identity keys, Tor state, and downloaded binaries. A
+keys, usage history, Tor lane state, and downloaded binaries. A
 fresh download creates an empty state directory on first start.
 
-One security note worth stating plainly: the WARP bootstrap, the Tor download
-and both one-click setups fetch their tools over verified TLS only, and a
-failed download never quietly disables certificate checking process-wide.
+One security note worth stating plainly: the Tor download and the one-click
+setups fetch their tools over verified TLS only, and a failed download never
+quietly disables certificate checking process-wide.
 
 ---
 
@@ -520,7 +501,7 @@ flowchart TB
     end
     subgraph out["Transport"]
         PR["providers/<br/><i>keys, proxies, httpx pools</i>"]
-        WA["warp/<br/><i>exits, lanes, healers</i>"]
+        WA["tor/<br/><i>lanes, health, probes</i>"]
     end
     CB --> DI
     AB --> DI
@@ -540,48 +521,41 @@ flowchart TB
 | Effort | `backend/routing/effort.py` | Rank-based effort translation |
 | Codex bridge | `backend/routing/responses_bridge.py` | Responses ↔ chat completions |
 | Claude bridge | `backend/claudecode/` | Anthropic Messages ↔ chat completions |
-| WARP | `backend/warp/manager.py` | WARP identity lifecycle + tunnel re-rolls |
-| Tor lanes | `backend/warp/tor_egress.py` | Zero-account Tor exit lanes |
-| Probe + healers | `backend/warp/probe.py` | Real-model probe, exit healer, lane spreading |
-| Egress map | `backend/warp/egress_map.py` | Learned Cloudflare edge → exit map |
-| Lane formation | `backend/warp/formation.py` | Assembles distinct exits on purpose |
-| Health daemon | `backend/warp/health.py` | Periodic checks, healing, probe cadence |
+| Tor lanes | `backend/tor/manager.py` | Lane lifecycle: tor.exe config, launch, circuit control (NEWNYM / rebuild) |
+| Health daemon | `backend/tor/health.py` | Periodic probes (OpenCode reachability + IsTor), healing, pool sync |
+| Egress helpers | `backend/core/egress_helpers.py` | Shared loopback/port/probe helpers |
 | Usage | `backend/usage/store.py` | SQLite request ledger |
 | Dashboard | `frontend/` | Single-page app |
 
 ### Endpoints
 
-🔓 open · 🔒 needs a key
+All open — the gateway is keyless by design.
 
-| Method | Path | | Purpose |
-|--------|------|---|---------|
-| GET | `/` | 🔓 | Dashboard + session cookie |
-| GET | `/api/health` | 🔓 | Liveness + provider/catalog/pool summary |
-| GET | `/v1/models` | 🔓 | OpenAI-compatible model list |
-| POST | `/v1/chat/completions` | 🔒 | Main router |
-| POST | `/v1/responses` | 🔒 | Codex (Responses wire format) |
-| POST | `/v1/messages` | 🔒 | Claude Code (Anthropic wire format) |
-| GET | `/api/models` | 🔒 | Catalog + router entry |
-| GET | `/api/usage` · `/api/usage/since/{id}` | 🔒 | Ledger feed |
-| GET/POST/DELETE | `/api/keys` | 🔒 | Issue / list / revoke `ll_` keys |
-| GET/POST | `/api/proxies` | 🔒 | Egress pool status / add |
-| GET | `/api/warp` | 🔒 | WARP status |
-| POST | `/api/warp/setup\|start\|stop\|refresh` | 🔒 | WARP lifecycle |
-| GET/POST | `/api/warp/probe` | 🔒 | Latest real-model probe / run it now |
-| POST | `/api/warp/formation` | 🔒 | Assemble distinct exit lanes now |
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/` | Dashboard |
+| GET | `/api/health` | Liveness + provider/catalog/pool summary |
+| GET | `/v1/models` | OpenAI-compatible model list |
+| POST | `/v1/chat/completions` | Main router |
+| POST | `/v1/responses` | Codex (Responses wire format) |
+| POST | `/v1/messages` | Claude Code (Anthropic wire format) |
+| GET | `/api/models` | Catalog + router entry |
+| GET | `/api/usage` · `/api/usage/since/{id}` | Ledger feed |
+| GET/POST | `/api/proxies` | Egress pool status / add |
+| GET | `/api/tor` | Tor lane status |
+| POST | `/api/tor/setup\|start\|stop` | Tor lifecycle |
+| POST | `/api/tor/renew` / `/api/tor/refresh` | NEWNYM sweep / rebuild circuits |
+| GET | `/api/tor/health` | Per-lane health + exit IPs |
 
 ### Auth
 
-```mermaid
-flowchart LR
-    B["Browser"] -->|"loads /"| S["signed HttpOnly<br/>session cookie"] --> GW(["Lingling"])
-    C["API client"] -->|"Authorization: Bearer ll_…<br/>or x-api-key"| GW
-    GW --- CORS["CORS: explicit loopback<br/>allow-list, never *"]
-```
+There is none — no keys, no sessions, no cookies. The gateway is open on your
+own machine; the base URL is the whole credential.
 
-Sessions don't survive a restart, because the signing secret is generated per
-process. That's deliberate and harmless — the page re-fetches `/` and picks up a
-new one.
+The only protective layer left is CORS: an explicit allow-list of loopback
+dashboard ports (plus `LINGLING_ALLOWED_ORIGINS`), never `*`, so a random
+website in your browser cannot drive the dashboard or fire destructive routes
+like `DELETE /api/usage` or `POST /api/tor/refresh`.
 
 ### What Lingling does and doesn't touch
 
