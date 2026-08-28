@@ -1,23 +1,36 @@
-"""Lingling gateway -- a dumb routing proxy for free AI models.
+"""Lingling gateway — a dumb routing proxy for free AI models.
 
-Takes whatever an OpenAI-compatible client (Cline, Claude Code, Codex) sends and
-routes it to free models on OpenCode, defeating the per-IP free-tier limit via a
-rotating pool of egress proxies (Cloudflare WARP by default). The client owns
-all prompting; Lingling only routes. See the README for the endpoint list.
+Lingling takes whatever an OpenAI-compatible client (Cline, Claude Code, any
+harness) sends and routes it to free models on OpenCode, defeating OpenCode's
+per-IP free-tier limit via a rotating pool of egress proxies (Tor lanes)
+identities by default). The client owns all prompting; Lingling only routes.
+
+Endpoints
+---------
+GET    /api/health                     liveness + provider/catalog summary
+GET    /api/models?refresh=0           multi-model entry + pooled free models
+POST   /api/models/refresh             force a catalog re-fetch
+GET    /api/providers                  per-provider status
+GET    /api/providers/{pid}/keys       a provider's key pool (secret-free)
+POST   /api/providers/{pid}/keys       add a key/token to a provider
+DELETE /api/providers/{pid}/keys/{kid} remove a key from a provider
+GET    /api/accounts                   OpenCode key pool (shortcut)
+POST   /api/accounts                   add an OpenCode key (shortcut)
+GET    /api/usage?limit=N              usage summary + recent requests
+GET    /v1/models                       OpenAI-compatible model list
+POST   /v1/chat/completions            OpenAI-compatible router
 """
 
 from __future__ import annotations
 
 import contextlib
-import copy
 import json
 import logging
 import threading
-import shutil
 import time
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,12 +44,9 @@ from core import auth
 from routing import dispatcher
 from routing import effort
 from routing import executor
-from core import api_keys
 from routing import parking
 from routing import stream_guard
 from routing import stream_idle
-from routing import pacing_memory
-from routing import sampler
 from routing import responses_bridge
 from claudecode import messages_bridge
 from claudecode import messages_response
@@ -45,14 +55,13 @@ from claudecode import model_map
 from claudecode import thinking as cc_thinking
 from models import vision_bridge
 from models.catalog import UnifiedCatalog
+from models.reconciler import OpenCodeReconciler
 from providers import registry
-from providers import active_streams
-from providers.base import extract_assistant_text, extract_usage
+from providers.base import extract_assistant_text, extract_usage, promote_reasoning_to_content
+from core.egress_helpers import _port_is_open
 from usage.store import UsageStore
-from warp.manager import WarpManager, _port_is_open
-from warp import health as warp_health
-from warp import formation as warp_formation
-from warp import probe as warp_probe
+from tor.manager import TorManager
+from tor import health as tor_health
 
 VERSION = "0.2.0"
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -62,359 +71,162 @@ app = FastAPI(
     version=VERSION,
     description="Dumb routing proxy for free AI models (OpenCode + IP rotation)",
 )
-# CORS is deliberately narrow: with allow_origins=["*"] any internet page could
-# read /api/keys or fire POST /api/warp/refresh from a visitor's browser.
+# CORS is deliberately narrow. With allow_origins=["*"] any page on the
+# internet could fire POST /api/tor/setup from a visitor's browser;
+# credentialed requests need an explicit origin list.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=auth.allowed_origins(),
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "x-api-key"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 log = logging.getLogger("uvicorn.error")
+logging.getLogger("uvicorn.access").disabled = True
+# Terminal cleanliness: one line per routed request, one per lifecycle event.
+# Health-daemon and catalog chatter move to DEBUG unless LINGLING_VERBOSE=1.
+if not config.VERBOSE:
+    for _n in ("tor-health", "reconcile", "uvicorn.error"):
+        _lg = logging.getLogger(_n)
+        # Keep WARNING and above; INFO chatter (heal pokes, cycle verdicts)
+        # is debug-only in quiet mode.
+        if _lg.level == 0:
+            _lg.setLevel(logging.WARNING)
 
-# Routes reachable with no credential. Everything else under /api/ and /v1/ is
-# gated below. Compared after stripping a trailing slash, because this
-# middleware runs before FastAPI's redirect_slashes -- so `/api/health/` from a
-# monitoring probe is recognised as open rather than answered 401.
-_OPEN_PATHS = frozenset({
-    "/", "/api/health", "/v1", "/v1/models", "/docs", "/openapi.json", "/redoc",
-    # Claude Code HEADs this on startup; gating it logged a scary auth-reject
-    # line for a harmless liveness check.
-    "/api/hello",
-})
+def _startup_sync_tor(*, start_daemon: bool = True) -> None:
+    """Sync already-running Tor lanes into the pool, then start the daemon.
 
+    tor.exe lanes persist across Lingling
+    restarts as standalone subprocesses, so running ``start_all()`` again
+    would skip-or-duplicate them; instead we sync their URLs into the proxy
+    pool directly so the cross-family rotation works immediately without the
+    user clicking Start. The Tor health daemon then takes over verification
+    + healing.
 
-@app.middleware("http")
-async def _gate(request: Request, call_next):
-    """Require a session cookie or API key for every /api/ and /v1/ route.
-
-    Previously only /v1/chat/completions was gated, leaving DELETE /api/usage,
-    DELETE /api/keys/{id} and POST /api/warp/refresh open to any local process
-    or LAN host -- too large a blast radius (wipe the ledger, revoke keys,
-    destroy WARP identities) to leave ungated.
-    """
-    path = request.url.path
-    guarded = path.startswith("/api/") or path.startswith("/v1/")
-    normalized = path.rstrip("/") or "/"
-    if request.method == "OPTIONS" or not guarded or normalized in _OPEN_PATHS:
-        return await call_next(request)
-    ok, actor = auth.identify(request)
-    if not ok and config.REQUIRE_API_KEY:
-        log.warning(
-            "auth reject method=%s path=%s client=%s",
-            request.method, path, request.client.host if request.client else "?",
-        )
-        return JSONResponse(
-            {
-                "detail": (
-                    "Unauthorised. Browser clients: load the dashboard at / to obtain "
-                    "a session. API clients: send 'Authorization: Bearer ll_...'."
-                )
-            },
-            status_code=401,
-        )
-    # Downstream handlers can read the resolved actor for logging.
-    request.state.actor = actor if ok else "open"
-    return await call_next(request)
-
-def _startup_sync_warp(*, start_daemon: bool = True) -> None:
-    """Sync already-running WARP proxies into the pool, then start the daemon.
-
-    The wireproxy processes persist across Lingling restarts, so rather than
-    re-running start_all() we sync their URLs straight into the pool and let the
-    health daemon take over. Daemon start is deferred to _bootstrap_warp when
-    ``LINGLING_BOOTSTRAP_WARP=1`` so its first cycle doesn't race registration.
+    When ``LINGLING_BOOTSTRAP_TOR=1`` the daemon start is deferred to
+    :func:`_bootstrap_tor` so its first cycle doesn't race with the background
+    lane-launch thread.
     """
     try:
-        added = _sync_warp_to_pool()
+        added = _sync_tor_to_pool()
         if added:
-            log.info("startup: %d WARP proxies were already up — synced them into the pool", added)
-        elif warp_manager.status()["proxies_running"] > 0:
-            log.info("startup: %d WARP proxies already lounging in the pool", warp_manager.status()["proxies_running"])
+            log.info("startup: hoisted %d running Tor lanes back into the pool -- they were cooking the whole time", added)
+        elif tor_manager.status()["lanes_running"] > 0:
+            log.info("startup: Tor lanes already in the pool (%d cooking) -- nothing to do",
+                     tor_manager.status()["lanes_running"])
         else:
-            log.info("startup: no running WARP proxies to sync — we'll bootstrap some")
+            log.info("startup: no running Tor lanes left to re-sync")
     except Exception as exc:  # noqa: BLE001
-        log.warning("startup: WARP sync skipped (%s)", exc)
+        log.warning("startup: Tor sync went sideways (%s) -- skipping", exc)
 
-    # Start the background health daemon after initial sync (unless the caller
-    # deferred it to _bootstrap_warp to avoid racing with identity registration).
     if start_daemon:
         try:
-            warp_health_daemon.start()
+            tor_health_daemon.start()
         except Exception as exc:  # noqa: BLE001
-            log.warning("startup: WARP health daemon failed to start (%s)", exc)
+            log.warning("startup: Tor health daemon failed to start (%s)", exc)
+
 
     # Trim the request log. Without this it grows for the life of the install.
     try:
         removed = usage_store.prune(config.USAGE_RETENTION_DAYS)
         if removed:
             log.info(
-                "startup: pruned %d usage rows older than %d days",
+                "startup: pruned %d stale usage rows (older than %d days)",
                 removed, config.USAGE_RETENTION_DAYS,
             )
     except Exception as exc:  # noqa: BLE001
-        log.warning("startup: usage prune skipped (%s)", exc)
-
+        log.warning("startup: usage prune went sideways (%s) -- skipping", exc)
 
 def _bootstrap_tor() -> None:
-    """Download Tor once and start the zero-account egress lanes.
+    """Download tor.exe + launch the N Tor lanes in-process (LINGLING_BOOTSTRAP_TOR=1).
 
-    Off the event loop on purpose: the first download is ~25 MB and the first
-    instance's directory fetch can take a minute; everything after that is
-    seconds. Lanes join the proxy pool like any other SOCKS proxy, so the
-    executor, probe and cooldown machinery need no changes to use them.
+    Doing this here rather than over HTTP is deliberate:
+    ``/api/tor/setup`` + ``/api/tor/start`` are authenticated, so ``start.bat``
+    would otherwise need a credential to bootstrap the server it just launched.
+    A missing stem/tor.exe or a failed download is reported and swallowed --
+    the gateway keeps serving directly.
     """
     try:
-        if not tor_manager.ensure_tools(log=log.info):
-            return
-        result = tor_manager.start_all(log=log.info)
-        added = tor_manager.sync_to_pool(proxy_pool, log=log.info)
+        st = tor_manager.status()
+        if st["lanes_running"] < tor_manager.count:
+            log.info("bootstrap: cooking fresh Tor lanes (one-time, slow -- tor.exe download + circuit build)")
+            tor_manager.setup_lanes(log=log.info)
+        res = _start_tor_at_startup()
         log.info(
-            "bootstrap: Tor lanes up — %d started, %d failed, %d in pool",
-            result.get("started", 0), result.get("failed", 0), added,
+            "bootstrap: Tor's ready (started=%d, failed=%d, skipped=%d)",
+            res.get("started", 0), res.get("failed", 0), res.get("skipped", 0),
         )
-        # Tor lanes joined the pool *after* the WARP startup probe snapshotted
-        # it, so that cached ProbeSummary says "10 lanes" while the live pool
-        # now holds 13 -- and the dashboard showed both at once ("across 10
-        # slots" beside a 13/13 gauge). Re-probe the now-full pool here so the
-        # cached snapshot catches up, and rotate any Tor lane the probe finds
-        # burned (its healer is a restart, which re-picks a fresh exit route)
-        # rather than waiting PROBE_INTERVAL_S for the daemon's first tick.
-        if added > 0 and config.PROBE_ON_STARTUP and len(proxy_pool) > 0:
-            try:
-                # probe_all resolves+converges on a model the catalog still
-                # serves, so the refreshed snapshot reflects the full pool with a
-                # model that actually answers instead of 400-ing every Tor lane.
-                tor_summary = warp_probe.probe_all(
-                    proxy_pool, catalog=catalog, log=log.info,
-                )
-                tor_rotated = warp_probe.rotate_burned_tor_lanes(
-                    proxy_pool, tor_manager, tor_summary, log=log.info,
-                )
-                if tor_rotated:
-                    log.info(
-                        "probe: Tor join refreshed snapshot to %d lanes, "
-                        "rotated %d burned Tor lanes",
-                        tor_summary.total, tor_rotated,
-                    )
-                # Re-run the sampler over the now-full pool so Tor lanes feed
-                # ok_exits() right away. Without this, ok_exits() for every
-                # sampled model still reflects the WARP-only pool the
-                # WARP-startup sampler snapshotted before Tor bootstrapped, so a
-                # model burned on WARP but served by a fresh Tor lane reads
-                # "cooked" (empty ok_set -> fail-fast on WARP) for up to the
-                # SAMPLER_INTERVAL_S it takes the daemon's first sampler cycle to
-                # catch up. The sampler shares ``tor_summary`` (the full-pool
-                # canary) so the canary is not re-probed.
-                if config.SAMPLER_ENABLED:
-                    try:
-                        sampler.sample_models(
-                            proxy_pool, catalog, tor_summary, log=log.info,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("sampler: post-Tor pass failed (%s)", exc)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("probe: Tor-join snapshot refresh failed (%s)", exc)
     except Exception as exc:  # noqa: BLE001
-        # A failed Tor bootstrap must not affect the gateway or the WARP pool.
-        log.warning("bootstrap: Tor setup failed (%s) - continuing without it", exc)
-
-
-def _bootstrap_warp() -> None:
-    """Register and start WARP identities in-process (LINGLING_BOOTSTRAP_WARP=1).
-
-    Done here rather than over HTTP because /api/warp/setup and /start are
-    authenticated -- start.bat would otherwise need a credential to bootstrap
-    the server it just launched.
-    """
-    try:
-        status = warp_manager.status()
-        if status["identities_registered"] < warp_manager.count:
-            log.info("bootstrap: minting WARP identities (one-time, slow)")
-            warp_manager.setup_identities(log=log.info)
-        _start_warp_at_startup()
-        log.info(
-            "bootstrap: WARP up — %d exits wrangled. opencode's free tier did not pre-game for this.",
-            proxy_pool.status().get("total", 0),
-        )
-        # --- startup probe: test every proxy with a real model request ---
-        if config.PROBE_ON_STARTUP and len(proxy_pool) > 0:
-            try:
-                # probe_all resolves the target from the live catalog (not the
-                # hardcoded pin, which 400-s when OpenCode gates it behind a key)
-                # and converges: a model rejected on every lane is retried with
-                # another free model, so a stale-but-advertised id no longer
-                # makes the whole pool read probe_error. (It is NOT retired --
-                # "unavailable" while still listed is transient overload, not
-                # removal.)
-                summary = warp_probe.probe_all(
-                    proxy_pool, catalog=catalog, log=log.info,
-                )
-                # Heal dead (expired) and rate-limited proxies.
-                expired_healed = warp_probe.heal_expired(
-                    proxy_pool, summary, warp_manager, log=log.info,
-                )
-                rl_healed = warp_probe.heal_rate_limited(
-                    proxy_pool, summary, warp_manager, log=log.info,
-                )
-                # Tor lanes have no identity to re-roll -- their healer is a
-                # restart, which re-picks guard/middle/exit for a fresh exit
-                # IP. Called here, not from heal_rate_limited (which skips
-                # non-WARP lanes by design), so a burned Tor lane does not
-                # sit unhealed until the daemon's first periodic probe runs
-                # PROBE_INTERVAL_S seconds later.
-                tor_rotated = warp_probe.rotate_burned_tor_lanes(
-                    proxy_pool, tor_manager, summary, log=log.info,
-                )
-                spread_moved = warp_probe.spread_distinct_exits(
-                    proxy_pool, summary, warp_manager, log=log.info,
-                )
-                if expired_healed or rl_healed or tor_rotated or spread_moved:
-                    log.info(
-                        "probe: fixed up — healed %d expired identities, "
-                        "%d burned exits, rotated %d Tor lanes, spread %d slots onto unused exits",
-                        expired_healed, rl_healed, tor_rotated, spread_moved,
-                    )
-                # --- exit-lane formation: assemble distinct exits on purpose ---
-                if config.WARP_FORM_ON_STARTUP and len(proxy_pool) > 0:
-                    try:
-                        formed = warp_formation.form_distinct_exits(
-                            proxy_pool, warp_manager, log=log.info,
-                        )
-                        if formed.get("distinct"):
-                            usage_store.log(
-                                "lane-formation", "lane-formation", "probe",
-                                reason=(
-                                    f"{formed['distinct']} distinct exits across "
-                                    f"{formed['slots']} slots "
-                                    f"({formed['rolls']} rolls, {formed['elapsed_s']:.0f}s)"
-                                ),
-                                status="ok",
-                                provider="warp",
-                            )
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("formation: startup formation failed (%s)", exc)
-                # --- post-heal multi-model sampler ---
-                # The heal's canary summary is the "which exits are alive"
-                # baseline; hand it to the sampler so per-(model, exit) health
-                # (and the request path's per-model routing / fail-fast) is
-                # populated immediately after the pool is fixed up, without
-                # re-probing the canary. Enabled/configured via LINGLING_SAMPLER_*.
-                if config.SAMPLER_ENABLED:
-                    try:
-                        sampler.sample_models(
-                            proxy_pool, catalog, summary, log=log.info,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("sampler: startup pass failed (%s)", exc)
-                # Log a single summary row so the dashboard shows one entry.
-                try:
-                    usage_store.log(
-                        "startup-probe", "startup-probe", "probe",
-                        reason=(
-                            f"{summary.healthy}/{summary.total} healthy, "
-                            f"{summary.rate_limited} rate-limited, "
-                            f"{summary.dead} dead"
-                            + (f", {summary.probe_error} probe-error" if summary.probe_error else "")
-                        ),
-                        # probe_error lanes reached OpenCode but were answered
-                        # with a model-rejecting 4xx: the egress layer is up,
-                        # so they are not "exhausted" -- the probe model just
-                        # could not verify them.
-                        status="ok" if (
-                            summary.healthy > 0
-                            or (summary.probe_error > 0 and summary.dead == 0)
-                        ) else "exhausted",
-                        provider="warp",
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-            except Exception as exc:  # noqa: BLE001
-                log.warning("probe: startup probe failed (%s)", exc)
-    except Exception as exc:  # noqa: BLE001
-        # A failed bootstrap must not stop the gateway: it still routes fine
-        # directly, just without IP rotation.
-        log.warning("bootstrap: WARP setup failed (%s) - continuing without it", exc)
+        log.warning("bootstrap: Tor setup went sideways (%s) -- continuing without it", exc)
     finally:
         # Start the health daemon *after* bootstrap so its first cycle doesn't
-        # race with identity registration and pool sync.
+        # race with lane launch and pool sync.
         try:
-            warp_health_daemon.start()
+            tor_health_daemon.start()
         except Exception as exc:  # noqa: BLE001
-            log.warning("bootstrap: health daemon start failed (%s)", exc)
+            log.warning("bootstrap: Tor health daemon start went sideways (%s)", exc)
 
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Startup/shutdown for the gateway (replaces the @app.on_event hooks)."""
-    # Raise the sync-worker thread ceiling. Every streamed request holds one
-    # thread for the life of the stream, so anyio's ~40 default is the real
-    # concurrency limit; the work is I/O-bound, so the extra threads are cheap.
-    try:
-        import anyio
-        limiter = anyio.to_thread.current_default_thread_limiter()
-        limiter.total_tokens = config.THREADPOOL_MAX
-        log.info("threadpool: lifted the sync executor ceiling to %d", config.THREADPOOL_MAX)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("threadpool: could not raise limiter (%s)", exc)
+    """Startup/shutdown for the gateway.
 
-    # Prune idle pooled httpx connections in the background so a long-idle
-    # gateway does not keep dozens of sockets open forever.
-    from providers.connection_pool import get_connection_pool
-    conn_pool = get_connection_pool()
-    _pool_prune_stop = threading.Event()
+    Replaces the deprecated @app.on_event hooks and adds the shutdown half the
+    health daemon never had. The single egress family comes up here:
 
-    def _prune_pool_loop() -> None:
-        while not _pool_prune_stop.wait(config.CONNECTION_POOL_IDLE_S / 2):
-            try:
-                conn_pool.prune_idle(config.CONNECTION_POOL_IDLE_S)
-            except Exception:  # noqa: BLE001
-                pass
+    * Tor lanes (tor-bootstrap thread) -- slow on first run (downloads tor.exe
+      + builds circuits) so it runs off the event loop.
 
-    _prune_thread = threading.Thread(
-        target=_prune_pool_loop, name="conn-pool-prune", daemon=True,
-    )
-    _prune_thread.start()
-
-    _startup_sync_warp(start_daemon=not config.BOOTSTRAP_WARP)
-    if config.BOOTSTRAP_WARP:
-        # Registration can take a minute; run it off the event loop so the
-        # server starts answering /api/health immediately.
-        threading.Thread(target=_bootstrap_warp, name="warp-bootstrap", daemon=True).start()
-    if config.TOR_ENABLED and tor_manager.count > 0:
-        # Tor lanes bootstrap independently of WARP: first run downloads the
-        # bundle (~25 MB) and fetches the directory; later boots are seconds.
+    A missing stem/tor.exe or a failed download leaves the gateway serving
+    directly rather than blocking startup.
+    """
+    # Sync any already-running Tor lanes into the pool (cross-restart reuse),
+    # and let _bootstrap_tor download+launch when the env flag is set. The
+    # bootstrap thread is daemon, so it never blocks exit.
+    _startup_sync_tor(start_daemon=not config.BOOTSTRAP_TOR)
+    if config.BOOTSTRAP_TOR:
         threading.Thread(target=_bootstrap_tor, name="tor-bootstrap", daemon=True).start()
-    log.info("LINGLING UP — opencode's free tier is about to have a day.")
+
+    # Burn-state reconcile against OpenCode Zen. The catalog's in-memory state
+    # is empty at boot, so first refresh + apply_persisted_state together are
+    # what the operator's first request sees. The synchronous run_once below is
+    # the *only* tick that has to block startup -- every later tick is daemon.
+    try:
+        catalog.refresh(force=True)
+        catalog.apply_persisted_state()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("startup: burn-state rehydrate refused to come up (%s)", exc)
+    try:
+        reconciler.run_once()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("startup: first reconcile tick blew up (%s) -- continuing anyway", exc)
+    try:
+        reconciler.start()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("startup: reconciler daemon refused to come up (%s)", exc)
+
     try:
         yield
     finally:
-        _pool_prune_stop.set()
         try:
-            conn_pool.shutdown()
+            reconciler.stop()
         except Exception as exc:  # noqa: BLE001
-            log.warning("shutdown: connection pool close failed (%s)", exc)
+            log.warning("shutdown: reconciler stop went sideways (%s)", exc)
         try:
-            warp_health_daemon.stop()
+            tor_health_daemon.stop()
         except Exception as exc:  # noqa: BLE001
-            log.warning("shutdown: health daemon stop failed (%s)", exc)
+            log.warning("shutdown: tor health daemon stop went sideways (%s)", exc)
         try:
-            # Stop the WARP proxies on the way out. On Windows the kill-on-close
-            # job already takes them with this process no matter how it dies;
-            # this is the polite path (and the only one on POSIX), so a closed
-            # gateway never leaves a port busy.
-            warp_manager.stop_all()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("shutdown: warp stop failed (%s)", exc)
-        try:
+            # Stop the Tor lanes on the way out (loopback ports + control
+            # sockets). The kill job already arms against orphans; this is the
+            # polite path and the POSIX-only path.
             tor_manager.stop_all()
         except Exception as exc:  # noqa: BLE001
-            log.warning("shutdown: tor stop failed (%s)", exc)
+            log.warning("shutdown: tor stop went sideways (%s)", exc)
         try:
             usage_store.close()
         except Exception as exc:  # noqa: BLE001
-            log.warning("shutdown: usage store close failed (%s)", exc)
+            log.warning("shutdown: usage store close went sideways (%s)", exc)
 
 
 app.router.lifespan_context = lifespan
@@ -434,26 +246,28 @@ _PASSTHROUGH_EXCLUDE = frozenset({
     "model", "messages", "stream", "lingling", "session_id", "lingling_recover",
     # executor.execute_nonstream / execute_stream signature
     "model_id", "providers", "proxy_pool", "timeout",
-    # execute_stream-only: per-attempt lifecycle callback (see _log_stream_attempt)
-    "on_attempt",
-    # provider stream_chat / chat_completions signature (bound explicitly by the
-    # executor, so a client-supplied value would collide and raise TypeError)
-    "proxy_url", "proxy_id", "secret", "self",
+    # recycler: catalog handle threaded into the executor for success-heal /
+    # burn-mark; never a client-controlled value. Without this allowlist entry a
+    # body carrying {"catalog": ...} could collide with the kwarg.
+    "catalog",
     # starlette.concurrency.run_in_threadpool signature
     "func",
 })
 def _passthrough_params(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Forward every OpenAI-compatible request parameter except managed fields."""
+    """Forward every OpenAI-compatible request parameter except fields Lingling manages."""
     return {k: v for k, v in body.items() if k not in _PASSTHROUGH_EXCLUDE}
 
 
 def _header_safe(value: str) -> str:
-    """Make a string safe as an HTTP header value.
+    """Make a string safe to put in an HTTP header value.
 
-    Starlette encodes headers as latin-1, so any character above U+00FF raises.
-    The dispatcher's ``reason`` is model-generated and routinely has em-dashes or
-    smart quotes, so this is a normal path. Only the X-Lingling-* mirror is
-    sanitised; the full reason still reaches the client in the body.
+    Starlette encodes header values as latin-1, so any character above U+00FF
+    raises UnicodeEncodeError when the response is constructed. The dispatcher's
+    ``reason`` is model-generated free text and routinely contains an em-dash or
+    smart quotes, so this is a normal path, not an adversarial one.
+
+    Only the X-Lingling-* mirror is sanitised; the full reason still reaches the
+    client intact in the JSON/SSE body.
     """
     if not value:
         return ""
@@ -462,41 +276,38 @@ def _header_safe(value: str) -> str:
         ("\u201c", '"'), ("\u201d", '"'), ("\u2026", "..."), ("\u2022", "*"),
     ):
         value = value.replace(uni, ascii_)
-    # Control chars must go before the latin-1 pass: CR/LF/NUL are valid latin-1
-    # and survive it, and Starlette then rejects the header with RuntimeError,
-    # aborting the whole response.
+    # Control characters must go before the latin-1 pass: CR, LF and NUL are all
+    # valid latin-1, so they survive it, and Starlette then refuses the header
+    # with RuntimeError("Invalid HTTP header value") -- aborting the response and
+    # leaving the client with nothing. The reason is model-generated text, so a
+    # stray line break in it is a normal occurrence, not an attack.
     value = "".join(" " if ch in "\r\n\t" else ch for ch in value if ch >= " ")
     return value.encode("latin-1", "replace").decode("latin-1")
 
 
-def _failure_provenance_headers(
-    target: str, routed_by: str, reason: str,
-) -> Dict[str, str]:
-    """The X-Lingling-Routed-* provenance a success carries, for an exhausted 503.
+def _harvest_stream_usage(raw: bytes, into: Dict[str, Any]) -> None:
+    """Read token counts out of an SSE line without altering the byte stream.
 
-    An operator already sees ``X-Lingling-Routed-Model``/``By``/``Reason`` on a
-    successful response; a failure used to drop them, so debugging the "429
-    prison" meant crossing into the log to reconstruct which model was attempted
-    and who chose it. The three keys that don't depend on a winning provider are
-    surfaced here too -- target (which model was tried) and its routing story.
-    Provider/Account are omitted: every provider was tried and refused (or none
-    projected for the model), so a single value would mislead. ``HTTPException``
-    accepts a ``headers=`` dict and Starlette merges it into the 503 response.
-    """
-    return {
-        "X-Lingling-Routed-Model": _header_safe(target),
-        "X-Lingling-Routed-By": _header_safe(routed_by),
-        "X-Lingling-Reason": _header_safe(reason),
-    }
+    OpenCode's final content chunk carries an OpenAI-shaped ``usage`` object,
+    and it also emits a proprietary ``x-opencode-type: inference-cost`` frame
+    with a ``normalizedUsage`` block. Both are accepted; later frames win so
+    the most complete numbers survive. Anything unparseable is ignored --
+    telemetry must never be able to break a response.
 
+    Three keys with an underscore prefix are kept alongside the token counts
+    so the chat-stream blank-turn recovery (sibling #3 of the
+    nemotron-blank-turn family -- mirror of ``providers.base.promote_reasoning_to_content``
+    which handles the non-stream chat and the Responses-bridge siblings) can
+    decide whether a stream ended blank with reasoning text to surface:
 
-def _harvest_stream_usage(raw: bytes, into: Dict[str, int]) -> None:
-    """Read token counts off an SSE line without altering the byte stream.
-
-    OpenCode's final content chunk carries an OpenAI ``usage`` object, and it
-    also emits a proprietary ``normalizedUsage`` frame. Both are read; later
-    frames win. Anything unparseable is ignored -- telemetry must never break a
-    response.
+    * ``_visible_content_chars`` -- running total of visible text in every
+      ``content`` delta (string or structured parts). Zero at end-of-stream
+      means no content frame reached the client.
+    * ``_reasoning_text`` -- concatenated reasoning text gathered from
+      ``reasoning_content`` / ``reasoning`` / ``thinking`` delta keys. Used as
+      the fallback promotion payload when ``_visible_content_chars`` is zero.
+    * ``_finish_reason`` -- the last ``finish_reason`` seen; ``length``
+      paired with zero visible content is the canonical blank-turn signature.
     """
     if not raw.startswith(b"data:"):
         return
@@ -529,103 +340,287 @@ def _harvest_stream_usage(raw: bytes, into: Dict[str, int]) -> None:
             if isinstance(value, int):
                 into[dst_key] = value
 
+    # Sibling-#3 tracking: only accumulate when choices carry something we
+    # can later use to surface a blank turn. Skip otherwise to keep the path
+    # hot for the common case (the to-message-then-usage frames nemotron /
+    # muse emit, and the usage-only final chunk that OpenAI stream_options
+    # adds, which has an empty choices list on purpose).
+    choices = obj.get("choices")
+    if not isinstance(choices, list):
+        return
+    for ch in choices:
+        if not isinstance(ch, dict):
+            continue
+        delta = ch.get("delta")
+        if not isinstance(delta, dict):
+            delta = ch.get("message")
+        if isinstance(delta, dict):
+            content = delta.get("content")
+            if isinstance(content, str) and content.strip():
+                into["_visible_content_chars"] = (
+                    into.get("_visible_content_chars", 0) + len(content)
+                )
+            elif isinstance(content, list):
+                for part in content:
+                    if (isinstance(part, dict)
+                            and isinstance(part.get("text"), str)
+                            and part["text"]):
+                        into["_visible_content_chars"] = (
+                            into.get("_visible_content_chars", 0) + len(part["text"])
+                        )
+            # Mirror the first-key-wins order sibling #5 uses for non-stream:
+            # ``reasoning_content`` (deepseek/ling), then ``reasoning``
+            # (nemotron), then ``thinking`` (Anthropic). Break after the first
+            # present key so a model that ships both reasoning and a derived
+            # sibling at the same delta isn't counted twice.
+            for reason_key in ("reasoning_content", "reasoning", "thinking"):
+                rv = delta.get(reason_key)
+                if isinstance(rv, str) and rv:
+                    into["_reasoning_text"] = into.get("_reasoning_text", "") + rv
+                    break
+        fr = ch.get("finish_reason")
+        if fr:
+            into["_finish_reason"] = fr
+        # A tool-call turn is never blank: Codex renders the call even when no
+        # text delta ever arrived, so the blank-turn retry must not discard it.
+        if isinstance(delta, dict) and delta.get("tool_calls"):
+            into["_tool_calls"] = into.get("_tool_calls", 0) + 1
+
+
+def _chat_blank_recovery_frame(outcome, seen, target) -> Optional[bytes]:
+    """Build the SSE recovery frame for a chat stream that landed blank.
+
+    Streaming sibling #3 of the nemotron-blank-turn family, mirroring
+    ``providers.base.promote_reasoning_to_content`` for non-stream chat. A
+    reasoning-only turn that emits no visible ``content`` delta would reach an
+    OpenAI chat client as an empty reply; the non-stream chat path already
+    promotes the reasoning text inline, and the Responses bridge does its
+    equivalent via `response.output_text.delta` -- this injects the same
+    promotion into the streaming chat bytes right before ``[DONE]``.
+
+    Two recoveries, both one synthetic ``content`` delta framed as a normal
+    chunk so a chat client concatenates them like any other:
+
+    * If reasoning text was visible during the stream, mirror it verbatim
+      (same outcome as the non-stream sibling #5: the reasoning WAS the
+      answer).
+    * If reasoning_tokens were spent but no reasoning text was surfaced (a
+      reasoning model whose upstream hides thinking), say so plainly -- a
+      blank turn with thinking-token billing but zero text anywhere is the
+      most disorienting one for a client. We never claim the missing bytes
+      were real model output.
+
+    Returns ``None`` when nothing should be injected: the visible content
+    count is non-zero (the client got a real reply), the stream errored or
+    was mid-flight-recovered onto a fresher stream (either duplicates the
+    delta or contradicts the recovery marker), or we lack any evidence of a
+    blank-but-reasoning turn at all. A rescue attempt that is in flight or
+    completed always wins (the rescue pushes a reset frame first; injecting
+    a synthetic after it contradicts the discard instruction). The error
+    path -- a stream that broke mid-flight without ever reaching recovery --
+    still surfaces reasoning text so a Muse-style "thought then died" turn
+    becomes visible verbatim.
+    """
+    # Successful rescue wins: the rescue pushed a reset frame, the new stream's
+    # content IS the answer, and a synthetic after it contradicts the discard.
+    # A rescue-attempted-and-also-failed turn falls through -- its reasoning
+    # is the only answer we have left to surface (muse-spark's no-finish case).
+    # A bare-broken stream (no rescue enabled) is left alone: there's no signal
+    # to distinguish "the model said nothing" from "we lost the wire", so we
+    # never silently author an answer there.
+    if outcome.recovered and not outcome.error:
+        return None
+    if not outcome.recovered and outcome.error:
+        return None
+    # Already produced visible content: don't double up.
+    if seen.get("_visible_content_chars", 0) > 0:
+        return None
+    # No signal at all -- no reasoning text, no reasoning tokens billed.
+    # A true blank is left alone rather than rewritten as a phantom message.
+    # Per latest user request the empty must never reach the CLI — the stream
+    # will be retried silently at the app layer instead of surfacing a notice.
+    if not seen.get("_reasoning_text", "").strip() and not seen.get("reasoning_tokens", 0):
+        return None
+    reasoning_text = seen.get("_reasoning_text", "") or ""
+    reasoning_tokens = seen.get("reasoning_tokens", 0) or 0
+    finish_reason = seen.get("_finish_reason")
+    if reasoning_text.strip():
+        content = reasoning_text
+    elif reasoning_tokens > 0:
+        # Sibling #6: zero visible with billed reasoning but no text.
+        content = (
+            "[lingling: stream produced no visible content; upstream "
+            f"billed {reasoning_tokens} reasoning_tokens "
+            + (f"then finish_reason={finish_reason}. " if finish_reason else "")
+            + "Increase max_tokens or retry.]"
+        )
+    else:
+        return None
+    payload = {"choices": [{
+        "index": 0,
+        "delta": {"content": content},
+        "finish_reason": None,
+    }]}
+    return b"data: " + json.dumps(payload).encode("utf-8") + b"\n\n"
+
+
+def stream_with_blank_chat_recovery(
+    gen: Generator[bytes, None, None],
+    outcome,
+    seen: Dict[str, Any],
+    requested: str,
+    target: str,
+    log,
+) -> Generator[bytes, None, None]:
+    """Forward chat SSE bytes verbatim, injecting a recovery delta before [DONE].
+
+    Wraps :func:`routing.stream_guard.guarded_stream` for the chat path: a
+    stream that finishes blank (zero visible content) and never produced a
+    reasoning-text sibling field is otherwise indistinguishable from
+    "the model said nothing" -- the chat sibling of the nemotron-blank-turn
+    family that the non-stream path already handles via
+    ``promote_reasoning_to_content``. Here we don't have a single assembled
+    ``message`` dict to mutate, so the recovery is one synthetic ``content``
+    delta just upstream of the ``[DONE]`` sentinel, which keeps the order of
+    frames a chat client parses unchanged.
+
+    The wrapper never re-finishes the turn: ``finish_reason`` was already
+    announced by the real upstream and is left untouched. The recovery is
+    opt-in (no caller wires it for the Responses or Messages bridge, which
+    have their own dedicated siblings).
+    """
+    injected = False
+    for raw in gen:
+        if (not injected and b"data: [DONE]" in raw):
+            synth = _chat_blank_recovery_frame(outcome, seen, target)
+            if synth is not None:
+                log.info(
+                    "chat stream blank-turn recovery requested=%s target=%s: "
+                    "no visible content; injecting synthetic final delta",
+                    requested, target,
+                )
+                yield synth
+            injected = True
+        yield raw
+    # Some upstreams close the connection without an explicit ``[DONE]``
+    # marker -- guard the same recovery against that case so we don't drop
+    # it silently when Zen skips [DONE] under load.
+    if not injected:
+        synth = _chat_blank_recovery_frame(outcome, seen, target)
+        if synth is not None:
+            log.info(
+                "chat stream blank-turn recovery requested=%s target=%s: "
+                "no visible content, no [DONE] marker; appending final delta",
+                requested, target,
+            )
+            yield synth
+
 
 
 # Core singletons (module-level so tests can introspect/patch them).
 providers = registry.build_providers()
 proxy_pool = registry.build_proxy_pool()
 catalog = UnifiedCatalog(providers)
-# Point the OpenCode provider at the live catalog so its "bypass the egress
-# pool" set stays computed from whatever free models exist right now.
-from providers import opencode as _opencode_module  # noqa: E402
-_opencode_module.set_catalog_ref(catalog)
+# Start-up + periodic recycler-vs-upstream reconcile. The first run happens
+# synchronously inside lifespan() so the user's first request sees a verified
+# catalog; the daemon thread on the same instance handles subsequent ticks.
+reconciler = OpenCodeReconciler(catalog, providers["opencode"], proxy_pool=proxy_pool)
 usage_store = UsageStore()
-# Cloudflare WARP identity pool -- N free WARP accounts turned into local
-# SOCKS5 proxies, auto-registered into proxy_pool when started.
-warp_manager = WarpManager(
-    root_dir=Path(config.DATA_DIR) / "warp",
-    count=getattr(config, "WARP_IDENTITY_COUNT", 10),
-)
 
-# Tor egress lanes -- zero-account exit IPs beside the WARP pool. Each tor.exe
-# is one SOCKS5 lane with a random exit; a restart rotates the exit. Disabled
-# entirely with LINGLING_TOR_ENABLED=0.
-from warp.tor_egress import TorEgressManager  # noqa: E402
-tor_manager = TorEgressManager(
+# Core egress singletons: the Tor lane pool + its auto-healing health daemon.
+# The manager owns N separate tor.exe pinned to distinct exit countries,
+# registered into the shared proxy_pool as first-class members so least-loaded-
+# first rotates across the distinct lanes. Lazy stem import inside the manager
+# means a missing stem/tor.exe never blocks a direct run; the lane status
+# surfaces "Tor unavailable" instead of crashing the gateway.
+tor_manager = TorManager(
     root_dir=Path(config.DATA_DIR) / "tor",
-    count=getattr(config, "TOR_LANE_COUNT", 3) if config.TOR_ENABLED else 0,
+    count=getattr(config, "TOR_LANE_COUNT", 5),
+    exit_countries=getattr(config, "TOR_EXIT_COUNTRIES", None),
+    socks_base=getattr(config, "TOR_SOCKS_BASE_PORT", 52001),
+    control_base=getattr(config, "TOR_CONTROL_BASE_PORT", 52301),
+    tor_exe=getattr(config, "TOR_EXE", ""),
+    boot_timeout=getattr(config, "TOR_BOOT_TIMEOUT", 120),
+    log=log.info,
 )
-
-# Auto-healing WARP health daemon — runs in background, periodically checks
-# every WARP proxy and regenerates dead/burned ones automatically. Tor lanes
-# come along for the probe + rotation ride when enabled.
-warp_health_daemon = warp_health.WarpHealthDaemon(
-    warp_manager, proxy_pool,
-    tor_manager=tor_manager if config.TOR_ENABLED and tor_manager.count > 0 else None,
-    catalog=catalog,
+# Auto-healing Tor health daemon: periodically verifies every lane (SOCKS port
+# liveness + an OpenCode reachability probe + an IsTor probe that captures the
+# real distinct exit IP per lane for the dashboard) and regenerates dead or
+# burned lanes automatically so outages self-heal.
+tor_health_daemon = tor_health.TorHealthDaemon(
+    tor_manager, proxy_pool,
+    check_interval=getattr(config, "TOR_HEALTH_INTERVAL", 60),
+    min_healthy=getattr(config, "TOR_MIN_HEALTHY", 3),
     log=log.info,
 )
 
+def _sync_tor_to_pool() -> int:
+    """Register every running Tor lane SOCKS5 proxy into the ProxyPool.
 
-def _sync_warp_to_pool() -> int:
-    """Register every running WARP SOCKS5 proxy into the ProxyPool.
-
-    This does a simple port check only — the background health daemon
-    (warp_health_daemon) performs deeper HTTP probes and removes unhealthy
-    proxies within its next cycle. This ensures the pool is populated
-    immediately at startup rather than being empty because a few proxies
-    were slow to establish their WARP tunnel.
+    A simple port check only -- the Tor
+    health daemon (``tor_health_daemon``) does the deeper IsTor + OpenCode
+    probes and removes unhealthy lanes within its next cycle. This populates
+    the pool immediately at startup (tor.exe lanes persist across Lingling
+    restarts as standalone subprocesses) so traffic rotates across the lanes
+    without a manual click.
     """
     existing = {p.id: p for p in proxy_pool.get_all_proxies()}
     added = 0
-
-    for inst in warp_manager.instances:
-        if not inst.private_key:
+    for lane in tor_manager.lanes:
+        if not lane._is_running():
             continue
-        if not inst._is_running():
-            continue
-
-        pid = f"warp-{inst.index}"
+        pid = f"tor-{lane.index}"
         if pid in existing:
-            # Through the pool, so the write happens under its lock: `url` is the
-            # field the executor reads when building an httpx client.
-            proxy_pool.set_url(pid, inst.proxy_url)
+            # Port can change under a regenerate; write through the pool so
+            # the executor reads the new url under the pool's lock.
+            proxy_pool.set_url(pid, lane.proxy_url)
         else:
             proxy_pool.add(
-                inst.proxy_url,
+                lane.proxy_url,
                 proxy_id=pid,
-                label=f"WARP identity #{inst.index}",
+                label=f"Tor lane #{lane.index} {{{lane.exit_country}}}",
             )
             added += 1
     return added
 
 
 
-def _start_warp_at_startup() -> Dict[str, Any]:
-    """Auto-start existing WARP identities and sync them to the proxy pool.
 
-    Returns a status dict: ``started`` (bool); ``reason`` set on early-out when
-    tools are missing, no identities are registered, or ``start_all`` raises;
-    ``pool`` (proxy-pool snapshot); and on success ``synced_to_pool`` -- the
-    count of new ``warp-N`` entries added. Existing entries get their URL
-    refreshed in place so port migrations are reflected immediately.
+def _start_tor_at_startup() -> Dict[str, Any]:
+    """Auto-start existing Tor lanes and sync them to the proxy pool.
+
+    Launches any lanes not already running and feeds them into ``proxy_pool``. A missing stem or tor.exe is reported as a soft "could not
+    start" (never raises) so the tor-bootstrap thread never tears down the
+    gateway continues to serve directly.
     """
-    if not warp_manager.tools_ready():
-        return {"started": False, "reason": "tools not ready", "pool": proxy_pool.status()}
-    status = warp_manager.status()
-    if status["identities_registered"] == 0:
-        return {"started": False, "reason": "no identities registered", "pool": proxy_pool.status()}
-
+    if not tor_manager.stem_available():
+        return {"started": False, "reason": "stem not installed",
+                "stem_available": False, "tools_ready": tor_manager.tools_ready(),
+                "pool": proxy_pool.status()}
+    if not tor_manager.tools_ready():
+        # First run: tools haven't been downloaded yet. start_all refuses
+        # without a tor binary, so surface that rather than let it raise.
+        return {"started": False, "reason": "tor not set up (POST /api/tor/setup)",
+                "stem_available": True, "tools_ready": False,
+                "pool": proxy_pool.status()}
     try:
-        res = warp_manager.start_all(log=log.info)
+        res = tor_manager.start_all(log=log.info)
     except Exception as exc:  # noqa: BLE001
-        log.warning("warp auto-start failed: %s", exc)
-        return {"started": False, "reason": f"start_all failed: {exc}", "pool": proxy_pool.status()}
-
-    added = _sync_warp_to_pool()
+        log.warning("tor auto-start failed: %s", exc)
+        return {"started": False, "reason": f"start_all failed: {exc}",
+                "pool": proxy_pool.status()}
+    added = _sync_tor_to_pool()
     res["pool"] = proxy_pool.status()
     res["synced_to_pool"] = added
-    res["started"] = True
+    # Boolean-vs-count fix:: the boolean "did
+    # anything start?" flag lives in ``any_started`` so the integer ``started``
+    # count (e.g. 5 lanes launched) survives intact. The original line --
+    # ``res["started"] = res.get("started", 0) > 0`` -- overwrote the integer
+    # with a boolean (``5 > 0`` -> ``True``), and ``_bootstrap_tor``'s log
+    # line ``"started=%d" % res.get("started", 0)`` formatted ``True`` as
+    # ``1``: a 5-lane bootstrap surfaced "started=1" in the gateway logs,
+    # which is exactly the miscount surfaced in the gateway logs.
+    res["any_started"] = res.get("started", 0) > 0
     return res
 
 # ---------------------------------------------------------------------------
@@ -633,29 +628,23 @@ def _start_warp_at_startup() -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 @app.api_route("/api/hello", methods=["GET", "HEAD"])
 def hello() -> Dict[str, Any]:
-    """Liveness probe Claude Code HEADs on startup. Answering it avoids a scary
-    401 auth-reject line on every session start."""
+    """Liveness probe Claude Code sends on startup.
+
+    Not a documented Anthropic route, but Claude Code HEADs it to decide whether
+    the endpoint is reachable. Answering it keeps the backend log honest: the
+    alternative was a 401 `auth reject` line on every session start, which reads
+    like a problem and is not one.
+    """
     return {"ok": True, "name": "Lingling"}
 
 
 @app.get("/api/health")
-def health(request: Request) -> Dict[str, Any]:
-    """Liveness plus a secret-free summary of providers, catalog and pool.
-
-    ``auth`` reports whether the gate is on and how *this* caller was
-    identified, so the dashboard can display the real state instead of
-    assuming it.
-    """
-    _, actor = auth.identify(request)
+def health() -> Dict[str, Any]:
+    """Liveness plus a secret-free summary of providers, catalog and pool."""
     return {
         "status": "ok",
         "name": "Lingling",
         "version": VERSION,
-        "auth": {
-            "required": config.REQUIRE_API_KEY,
-            "actor": actor,
-            "keys_issued": len(api_keys.list_keys()),
-        },
         "usage_retention_days": config.USAGE_RETENTION_DAYS,
         "providers": {pid: prov.status() for pid, prov in providers.items()},
         "catalog": catalog.meta(),
@@ -664,23 +653,12 @@ def health(request: Request) -> Dict[str, Any]:
 
 
 def _multimodel_entry() -> Dict[str, Any]:
-    """The hard-coded ``lingling-auto`` entry: the multi-model router itself.
-
-    Not a model the gateway forwards -- the alias a client picks to ask Lingling
-    to *choose*. The dispatcher reads the turn and routes onto a real free model,
-    so ``lingling-auto`` has no upstream of its own: ``context_length`` and
-    ``max_output`` are ``None`` (no ceiling to advertise, not "unbounded
-    upstream"). It is baked into the catalog responses -- ``/v1/models`` lists it
-    first, making it the default pick in OpenAI/Codex model pickers -- rather than
-    fetched from OpenCode, which is exactly why the recycler can never touch it:
-    ``catalog.mark_unavailable`` retires ids the upstream once listed, and the
-    router never was one. Vision and reasoning are claimed True so a capability
-    probe ("is there a model here that can see this image?") does not filter the
-    catch-all out before the dispatcher picks a real vision/reasoning model; the
-    providers list names every upstream so the dashboard's "served by" reads
-    sensibly, while failover runs over the chosen model's *real* providers, not
-    this alias.
-    """
+    """The single hard-coded model: the multi-model router itself."""
+    # The dispatcher field mirrors what routing actually uses as its brain:
+    # the pinned DISPATCHER_MODEL when one is configured, otherwise the model
+    # auto-promoted from the live catalog (which changes as models burn and
+    # un-burn). Reporting the raw config would show "" on a default install.
+    brain = dispatcher.dispatcher_model(catalog)
     return {
         "id": config.MULTIMODEL_ID,
         "name": config.MULTIMODEL_NAME,
@@ -689,7 +667,7 @@ def _multimodel_entry() -> Dict[str, Any]:
         "vision": True,
         "reasoning": True,
         "multi_model": True,
-        "dispatcher": config.DISPATCHER_MODEL,
+        "dispatcher": brain,
         "providers": [p.display_name for p in providers.values()],
         "context_length": None,
         "max_output": None,
@@ -705,10 +683,7 @@ def _openai_model_entry(model: Dict[str, Any]) -> Dict[str, Any]:
         "id": mid,
         "object": "model",
         "created": 0,
-        "owned_by": (
-            model.get("provider")
-            or (model.get("providers") or ["lingling"])[0]
-        ),
+        "owned_by": model.get("provider") or "lingling",
         "root": mid,
         "parent": None,
         "permission": [],
@@ -738,11 +713,9 @@ def get_models(refresh: int = 0) -> Dict[str, Any]:
 def v1_info() -> Dict[str, Any]:
     """Small compatibility landing page for clients pointed at `/v1`.
 
-    OpenAI-compatible clients normally call `/v1/models` and either
-    `/v1/chat/completions` (Codex < 0.144, Cline, etc.) or `/v1/responses`
-    (Codex >= 0.144); Anthropic-shaped clients like Claude Code use
-    `/v1/messages`. Surfacing all three keeps a browser/manual probe of the
-    base URL honest about what's actually served.
+    Codex/Cline and other OpenAI-compatible clients normally call `/v1/models` and
+    `/v1/chat/completions`; this makes a browser/manual probe of the base URL
+    less confusing.
     """
     return {
         "object": "api.info",
@@ -751,8 +724,6 @@ def v1_info() -> Dict[str, Any]:
         "endpoints": {
             "models": "/v1/models",
             "chat_completions": "/v1/chat/completions",
-            "responses": "/v1/responses",
-            "messages": "/v1/messages",
         },
     }
 
@@ -764,15 +735,8 @@ def v1_models(refresh: int = 0) -> Dict[str, Any]:
     Response shape intentionally matches OpenAI:
 
         {"object":"list", "data":[{"id":"...", "object":"model", ...}]}
-
-    The endpoint is keyless because it exposes no secrets and many local clients
-    load the model picker before/without sending auth. `/v1/chat/completions`
-    remains key-gated when LINGLING_REQUIRE_KEY=1.
     """
     catalog.refresh(force=bool(refresh))
-    # lingling-auto goes first so it is the default model an OpenAI/Codex picker
-    # lands on; everything after is the live free list (retired-by-recycler ids
-    # are already excluded by catalog.free()).
     models = [_openai_model_entry(_multimodel_entry())]
     models.extend(_openai_model_entry(m.to_dict()) for m in catalog.free())
     return {"object": "list", "data": models}
@@ -805,6 +769,35 @@ def get_keys(pid: str) -> Dict[str, Any]:
     return _get_provider(pid).keys.status()
 
 
+class KeyIn(BaseModel):
+    """A credential to add to a provider's key pool.
+
+    Mirrors the dict shape ``providers.key_pool.KeyPool.from_list`` accepts
+    (``secret``/``api_key``/``key``/``token``, optional ``label`` and ``id``)
+    so a caller can post any of those names; :meth:`resolved_secret` picks the
+    first one that is present and non-empty.
+    """
+    secret: Optional[str] = None
+    api_key: Optional[str] = None
+    key: Optional[str] = None
+    token: Optional[str] = None
+    label: str = ""
+    id: str = ""
+
+    def resolved_secret(self) -> str:
+        return self.secret or self.api_key or self.key or self.token or ""
+
+
+@app.post("/api/providers/{pid}/keys")
+def add_key(pid: str, body: KeyIn) -> Dict[str, Any]:
+    prov = _get_provider(pid)
+    secret = body.resolved_secret().strip()
+    if not secret:
+        raise HTTPException(400, "a credential (secret/api_key/key/token) is required")
+    key = prov.keys.add(secret, body.label, body.id)
+    return {"added": key.status(), "pool": prov.keys.status()}
+
+
 @app.delete("/api/providers/{pid}/keys/{kid}")
 def remove_key(pid: str, kid: str) -> Dict[str, Any]:
     prov = _get_provider(pid)
@@ -814,10 +807,15 @@ def remove_key(pid: str, kid: str) -> Dict[str, Any]:
     return {"removed": kid, "pool": prov.keys.status()}
 
 
-# OpenCode shortcut (the OpenCode key router), kept for convenience.
+# OpenCode shortcuts (the OpenCode key router), kept for convenience.
 @app.get("/api/accounts")
 def get_accounts() -> Dict[str, Any]:
     return _get_provider("opencode").keys.status()
+
+
+@app.post("/api/accounts")
+def add_account(body: KeyIn) -> Dict[str, Any]:
+    return add_key("opencode", body)
 
 
 # ---------------------------------------------------------------------------
@@ -866,290 +864,190 @@ def remove_proxy(pid: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Cloudflare WARP rotation (free, unlimited -- defeats OpenCode's IP limit)
+# Tor lanes (genuine exit-IP diversity -- the single egress family)
 # ---------------------------------------------------------------------------
-class WarpCountIn(BaseModel):
+class TorCountIn(BaseModel):
+    """Optional body for the Tor control endpoints. ``lane`` (1-based) targets a
+    single lane in renew/refresh; omit to apply to every running lane. ``count``
+    is accepted for symmetry with the other control endpoints but, like the
+    -- lane
+    count is fixed at construction time -- pass a different value and you get a
+    400 telling you to restart with LINGLING_TOR_COUNT instead."""
+
     count: Optional[int] = None
+    lane: Optional[int] = None
 
 
-@app.get("/api/warp")
-def warp_status() -> Dict[str, Any]:
-    """WARP manager status: how many identities registered, how many running."""
-    return warp_manager.status()
+# Tor lanes (the single egress family -- genuine exit-IP diversity)
+# ---------------------------------------------------------------------------
+@app.get("/api/tor")
+def tor_status() -> Dict[str, Any]:
+    """Tor manager status: lane count, how many running, configured exit
+    countries, distinct exit IPs, and per-lane control-port aliveness."""
+    return tor_manager.status()
 
 
-@app.post("/api/warp/setup")
-def warp_setup(body: WarpCountIn = WarpCountIn()) -> Dict[str, Any]:
-    """One-time: download wgcf+wireproxy and register N free WARP identities.
+@app.post("/api/tor/setup")
+def tor_setup(body: TorCountIn = TorCountIn()) -> Dict[str, Any]:
+    """One-time: download the Tor Expert Bundle + write per-lane torrc.
 
-    Idempotent -- existing identities are kept. Pass ``count`` to register more
-    (only honored if it exceeds the current count; restart required otherwise).
+    Idempotent -- existing lane configs are kept. Does NOT launch tor; ``POST
+    /api/tor/start`` does. The lane count is fixed at
+    construction time, so ``count`` differing from the manager's count is a 400
+    pointing the user at ``LINGLING_TOR_COUNT`` on restart.
     """
-    if body.count and body.count > warp_manager.count:
+    if body.count is not None and body.count != tor_manager.count:
         raise HTTPException(
             400,
-            f"this manager was built for {warp_manager.count} identities. "
-            f"Restart Lingling with WARP_IDENTITY_COUNT={body.count} to grow it.",
+            f"this manager was built for {tor_manager.count} Tor lanes. "
+            f"Restart Lingling with LINGLING_TOR_COUNT={body.count} to change it.",
         )
     try:
-        return warp_manager.setup_identities()
+        return tor_manager.setup_lanes(log=log.info)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"WARP setup failed: {exc}")
+        raise HTTPException(500, f"Tor setup failed: {exc}")
 
 
-@app.post("/api/warp/start")
-def warp_start() -> Dict[str, Any]:
-    """Launch all WARP wireproxy instances and feed them into the proxy pool."""
-    if not warp_manager.tools_ready() or warp_manager.status()["identities_registered"] == 0:
-        raise HTTPException(409, "WARP not set up yet. POST /api/warp/setup first.")
-    return _start_warp_at_startup()
+@app.post("/api/tor/start")
+def tor_start() -> Dict[str, Any]:
+    """Launch all configured Tor lanes and feed them into the proxy pool."""
+    if not tor_manager.stem_available():
+        raise HTTPException(409, "stem not installed (run `pip install stem==1.8.2`)")
+    if not tor_manager.tools_ready() and not config.TOR_EXE:
+        raise HTTPException(409, "Tor not set up yet. POST /api/tor/setup first.")
+    return _start_tor_at_startup()
 
 
-@app.post("/api/warp/stop")
-def warp_stop() -> Dict[str, Any]:
-    """Stop all WARP wireproxy instances (proxies stay in the pool, just offline)."""
-    return warp_manager.stop_all()
+@app.post("/api/tor/stop")
+def tor_stop() -> Dict[str, Any]:
+    """Stop every Tor lane (proxies leave the pool, just offline)."""
+    stop_result = tor_manager.stop_all()
+    removed: List[str] = []
+    for px in proxy_pool.get_all_proxies():
+        if px.id.startswith("tor-"):
+            proxy_pool.remove(px.id)
+            removed.append(px.id)
+    return {"stopped": stop_result.get("stopped", 0),
+            "removed_from_pool": removed, "pool": proxy_pool.status()}
 
 
-@app.get("/api/warp/health")
-def warp_health_status(probe: bool = False) -> Dict[str, Any]:
-    """Health check: TCP-connect each WARP SOCKS5 port (optional HTTP probe).
+@app.get("/api/tor/health")
+def tor_health(probe: bool = False) -> Dict[str, Any]:
+    """Tor health: TCP-check + (optional) full SOCKS5+IsTor probe per lane.
 
-    The HTTP probe uses opencode.ai as target to verify the tunnel is actually
-    working (not just the port open).
+    ``probe=true`` runs a fresh ``check_and_heal`` cycle now (which probes
+    OpenCode reachability + check.torproject.org/api/ip through each live lane
+    and fills in each lane's measured ``exit_ip``). Without ``probe``, this is
+    a cheap snapshot derived from each lane's recorded state -- no network
+    round-trip -- for dashboard polling.
     """
-    results = []
-    alive = 0
-    dead = 0
+    if probe:
+        try:
+            return tor_health_daemon.check_and_heal()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(500, f"Tor health probe failed: {exc}")
 
-    for inst in warp_manager.instances:
-        port_listening = _port_is_open("127.0.0.1", inst.port, timeout=0.5)
-        process_tracked = inst.process is not None and inst.process.poll() is None
-        identity_ok = bool(inst.private_key)
-        http_probe_ok: Optional[bool] = None
-
-        if probe and port_listening:
-            try:
-                http_probe_ok = warp_health._socks5_http_probe(
-                    inst.proxy_url, timeout=5.0
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.debug("warp health HTTP probe failed for #%d: %s", inst.index, exc)
-                http_probe_ok = False
-
-        is_alive = port_listening and identity_ok
-
+    results: List[Dict[str, Any]] = []
+    alive = dead = 0
+    for lane in tor_manager.lanes:
+        pid = f"tor-{lane.index}"
+        px = proxy_pool.get_by_id(pid)
+        port_open = _port_is_open("127.0.0.1", lane.socks_port, timeout=0.5)
+        control_alive = _port_is_open("127.0.0.1", lane.control_port, timeout=0.2)
+        is_alive = port_open and control_alive
         if is_alive:
             alive += 1
         else:
             dead += 1
-
         results.append({
-            "index": inst.index,
-            "port": inst.port,
-            "alive": is_alive,
-            "port_listening": port_listening,
-            "process_tracked": process_tracked,
-            "has_identity": identity_ok,
-            "http_probe_ok": http_probe_ok,
+            "index": lane.index,
+            "socks_port": lane.socks_port,
+            "control_port": lane.control_port,
+            "exit_country": lane.exit_country,
+            "exit_ip": lane.exit_ip,
+            "running": lane._is_running(),
+            "control_alive": control_alive,
+            "port_open": port_open,
+            "opencode_reachable": None,
+            "is_tor": None,
+            "consecutive_failures": px.consecutive_failures if px else 0,
+            "total_429": px.total_429 if px else 0,
+            "in_pool": px is not None,
+            "last_circuit_built_ts": lane.last_circuit_built_ts,
+            "renewing": lane.renewing,
+            "boot_ok": lane.boot_ok,
+            # Surfaced alongside `renewing`/`boot_ok` so the dashboard can
+            # render the `probing` (unverified) chip before the first probe has
+            # actually run, and the `healing` chip while the daemon is
+            # mid-restart/regenerate -- so the
+            # two racks' health rows carry the same flags.
+            "probing": lane.probing,
+            "healing": lane.healing,
+            "pid": pid,
+            "healthy": is_alive,
         })
-
     return {
-        "total": len(warp_manager.instances),
-        "alive": alive,
-        "dead": dead,
-        "probe": probe,
+        "total": len(tor_manager.lanes),
+        "alive": alive, "dead": dead,
+        "probe": False,
+        "tor_ready": tor_manager.status()["tor_ready"],
         "instances": results,
     }
 
 
-@app.post("/api/warp/refresh")
-def warp_refresh() -> Dict[str, Any]:
-    """Atomically refresh all WARP identities: stop, wipe, re-register, restart, sync."""
-    if not warp_manager.tools_ready():
-        raise HTTPException(409, "WARP tools not available. POST /api/warp/setup first.")
+@app.post("/api/tor/renew")
+def tor_renew(body: TorCountIn = TorCountIn()) -> Dict[str, Any]:
+    """NEWNYM quick-heal: ask every (or one specified) lane for fresh circuits.
 
-    # Hold the daemon frozen for the whole stop/wipe/re-register/restart: a
-    # periodic probe / heal cycle running into the middle of this -- probing
-    # proxies we are about to remove from the pool, or regenerate_instance on
-    # an identity we just wiped -- would race and restart half-wiped lanes.
-    # The daemon's locks are non-blocking in its own acquire, so this just
-    # skips its cycles; no deadlock.
-    with warp_health_daemon.frozen():
-        try:
-            # 1. Stop all running wireproxy instances
-            stop_result = warp_manager.stop_all()
-
-            # 2. Remove every WARP entry from the proxy pool
-            removed_ids: List[str] = []
-            for px in proxy_pool.get_all_proxies():
-                if px.id.startswith("warp-"):
-                    proxy_pool.remove(px.id)
-                    removed_ids.append(px.id)
-
-            # 3. Wipe identity directories and reset state
-            if warp_manager.identities_dir.exists():
-                for ident_dir in warp_manager.identities_dir.iterdir():
-                    if ident_dir.is_dir() and ident_dir.name.startswith("warp-"):
-                        shutil.rmtree(ident_dir)
-            for inst in warp_manager.instances:
-                inst.process = None
-                inst.private_key = ""
-                inst.address_v4 = ""
-                inst.address_v6 = ""
-
-            # 4. Re-register all identities
-            setup_result = warp_manager.setup_identities(log=log.info)
-
-            # 5. Start all + sync to pool
-            start_result = _start_warp_at_startup()
-
-            instances = warp_manager.status()["instances"]
-
-            return {
-                "message": "WARP identities refreshed",
-                "stopped": stop_result.get("stopped", 0),
-                "removed_from_pool": removed_ids,
-                "setup": setup_result,
-                "start": start_result,
-                "pool": proxy_pool.status(),
-                "instances": instances,
-            }
-        except Exception as exc:  # noqa: BLE001
-            log.exception("WARP refresh failed: %s", exc)
-            raise HTTPException(500, f"WARP refresh failed: {exc}")
-
-
-@app.get("/api/warp/probe")
-def warp_probe_results() -> Dict[str, Any]:
-    """Latest real-model probe results: per-proxy health status.
-
-    Shows which WARP exit IPs are healthy, rate-limited, or dead. The probe
-    runs at startup, periodically from the health daemon (interval_s below),
-    and on demand via POST to this path. The Egress view renders the results
-    in the identity rack so the operator can see at a glance which exits are
-    usable.
+    This is the *fast* sweep the dashboard's "Renew circuits" button fires --
+    NEWNYM is ~10s-rate-limited and does not guarantee a *new* exit IP per the
+    Tor spec, so callers wanting a guaranteed fresh exit should use
+    ``/api/tor/refresh`` instead (rebuild_circuits + await_build).
     """
-    results = warp_probe.latest_summary()
-    if results is None:
-        return {
-            "probed": False,
-            "message": "no probe has run yet",
-            "interval_s": config.PROBE_INTERVAL_S,
-            "server_time": time.time(),
-        }
-    return {
-        "probed": True,
-        "interval_s": config.PROBE_INTERVAL_S,
-        "server_time": time.time(),
-        **results,
-    }
+    lanes = _resolve_tor_lanes(body)
+    results: List[Dict[str, Any]] = []
+    for lane in lanes:
+        if not lane._is_running():
+            results.append({"index": lane.index, "ok": False, "reason": "lane not running"})
+            continue
+        results.append(tor_manager.renew_circuit(lane, log=log.info))
+    return {"results": results, "pool": proxy_pool.status()}
 
 
-@app.post("/api/warp/probe")
-def warp_probe_run() -> Dict[str, Any]:
-    """Probe every exit with a real model request now, healing as needed.
-
-    The dashboard's Probe button lands here — not on /api/warp/health, whose
-    SOCKS5 CONNECT check is blind to rate limits (a 429'd exit tunnels fine).
-    Runs the same probe + both healers + verification as the daemon's periodic
-    pass, so what the Egress rack shows afterwards is current.
+@app.post("/api/tor/refresh")
+def tor_refresh(body: TorCountIn = TorCountIn()) -> Dict[str, Any]:
+    """Reliable heal: ``rebuild_circuits`` on every running lane, falling back
+    to a full ``regenerate_lane`` for ones whose control port is dead (where a
+    control-port rebuild can't even connect). This is the "Rebuild lanes" deck
+    button -- the deeper, await_build counterpart to NEWNYM.
     """
-    if not any(p.id.startswith("warp-") for p in proxy_pool.get_all_proxies()):
-        raise HTTPException(
-            409, "the pool has no WARP exits to probe — start WARP first."
-        )
-    summary = warp_health_daemon.probe_now()
-    if summary is None:
-        # Another probe is mid-flight (periodic loop or a second click).
-        return {"busy": True, **(warp_probe.latest_summary() or {})}
-    # Mirror the startup probe's ledger row so the Ledger view shows manual
-    # probe activity too; periodic daemon probes stay console-only so the
-    # ledger doesn't grow a row every interval.
-    try:
-        usage_store.log(
-            "exit-probe", "exit-probe", "probe",
-            reason=(
-                f"{summary.healthy}/{summary.total} healthy, "
-                f"{summary.rate_limited} rate-limited, "
-                f"{summary.dead} dead"
-                + (f", {summary.probe_error} probe-error" if summary.probe_error else "")
-            ),
-            status="ok" if (
-                summary.healthy > 0
-                or (summary.probe_error > 0 and summary.dead == 0)
-            ) else "exhausted",
-            provider="warp",
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    return {"busy": False, **summary.to_dict()}
-
-
-@app.get("/api/sampler")
-def sampler_status() -> Dict[str, Any]:
-    """Post-heal sampler state plus the live routing snapshots the dashboard
-    polls this endpoint for alongside it.
-
-    The sampler blob (the latest per-(model, exit) pass, or a disabled/pending
-    envelope) is the read-only mirror of what the request path consumes via
-    ``routing.sampler.ok_exits`` to route a model onto its green exits and fail
-    fast on an OpenCode-side outage. Two siblings are surfaced here so the
-    dashboard renders the whole pool-health view from one poll:
-
-    * ``pacing_reasoning`` -- model ids pacing_memory has *learned* reason (a
-      hidden-reasoning model whose longer thinking patience is now effective),
-      so the learned set is visible rather than only consumed by _stream_pacing.
-    * ``active_streams`` -- in-flight stream counts per egress id (the load the
-      pool is carrying right now), so a stuck/busy lane is distinguishable from
-      an idle one without tailing the log.
-    """
-    snap = sampler.latest()
-    state = snap if snap is not None else {
-        "enabled": config.SAMPLER_ENABLED, "models": [], "canary_ok_exits": [],
-        "skipped_reason": "disabled" if not config.SAMPLER_ENABLED else "pending",
-    }
-    state["pacing_reasoning"] = pacing_memory.snapshot()
-    state["active_streams"] = active_streams.snapshot()
-    return state
-
-
-@app.post("/api/warp/formation")
-def warp_formation_run() -> Dict[str, Any]:
-    """Assemble distinct exit lanes now: one lane per reachable exit IP.
-
-    Rolls slots (aimed by the learned edge->exit map) until duplicates are
-    spread across every unburned exit the PoP offers, verifying placements
-    with Cloudflare's trace endpoint -- no OpenCode quota is spent. Runs in
-    the background (a full assemble can take minutes of tunnel restarts, far
-    beyond a sane HTTP timeout); progress lands in the log, the Ledger, and
-    the Egress view's next poll. Shares the daemon's probe lock, so it cannot
-    race a heal or probe pass.
-    """
-    if not any(p.id.startswith("warp-") for p in proxy_pool.get_all_proxies()):
-        raise HTTPException(
-            409, "the pool has no WARP exits to form — start WARP first."
-        )
-
-    def _run() -> None:
-        result = warp_health_daemon.formation_now()
-        if result and result.get("distinct"):
+    lanes = _resolve_tor_lanes(body)
+    results: List[Dict[str, Any]] = []
+    for lane in lanes:
+        if not lane._is_running() or not _port_is_open("127.0.0.1", lane.control_port, timeout=0.3):
+            log.info("[tor-refresh] lane #%d not running -- regenerating", lane.index)
             try:
-                usage_store.log(
-                    "lane-formation", "lane-formation", "probe",
-                    reason=(
-                        f"{result['distinct']} distinct exits across "
-                        f"{result['slots']} slots "
-                        f"({result['rolls']} rolls, {result['elapsed_s']:.0f}s)"
-                    ),
-                    status="ok",
-                    provider="warp",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+                ok = tor_manager.regenerate_lane(lane, log=log.info)
+                results.append({"index": lane.index, "ok": ok, "regenerated": True})
+            except Exception as exc:  # noqa: BLE001
+                results.append({"index": lane.index, "ok": False, "error": str(exc)})
+            continue
+        results.append(tor_manager.rebuild_circuits(lane, log=log.info))
+    # exit_ip is cleared by rebuild; the health daemon's next sweep refills it
+    # and re-syncs the pool. Fresh probes are visible on the next poll.
+    return {"results": results, "pool": proxy_pool.status()}
 
-    threading.Thread(target=_run, name="warp-formation", daemon=True).start()
-    return {"started": True}
+
+def _resolve_tor_lanes(body: TorCountIn) -> List:
+    """Translate the optional ``lane`` field (1-based index) into a 1-element
+    list, or all lanes when omitted. Raises 400 on an out-of-range index."""
+    if body.lane is None:
+        return list(tor_manager.lanes)
+    if body.lane < 1 or body.lane > tor_manager.count:
+        raise HTTPException(400, f"lane index {body.lane} out of range (1..{tor_manager.count})")
+    return [tor_manager.lanes[body.lane - 1]]
+
+
 
 
 @app.get("/api/usage")
@@ -1207,25 +1105,12 @@ def _call_dispatcher_model(messages: List[Dict[str, Any]], model: str, session_i
         raise RuntimeError(f"no provider serves dispatcher model '{model}'")
     resp, _prov, _key, _attempts = executor.execute_nonstream(
         messages, model, provs, proxy_pool=proxy_pool, session_id=session_id,
-        timeout=config.DISPATCH_TIMEOUT
+        timeout=config.DISPATCH_TIMEOUT, catalog=catalog,
     )
     return extract_assistant_text(resp)
 
 
 def _run_dispatcher(messages: List[Dict[str, Any]], had_images: bool, session_id: str = ""):
-    """Run the routing brain over the turn; return ``(target, reason, routed_by)``.
-
-    Thin wrapper over :func:`dispatcher.decide` that closes over the session id,
-    so the ``/v1/chat/completions``, ``/v1/responses`` and ``/v1/messages``
-    handlers all route through one call site. ``routed_by`` is ``"dispatcher"`` on
-    a clean decision and ``"fallback"`` when the router itself broke, so the
-    ledger can tell "the dispatcher picked this" from "the dispatcher fell over
-    and we picked for it". Any failure of the router model -- a 429, malformed
-    JSON, an id nobody serves -- is caught here: a routing outage must never drop
-    a request, so the deterministic, request-aware
-    :func:`dispatcher.fallback_model` answers instead (see the inline note on why
-    ``messages`` is passed).
-    """
     def call_model(msgs, mdl):
         return _call_dispatcher_model(msgs, mdl, session_id=session_id)
     try:
@@ -1237,34 +1122,24 @@ def _run_dispatcher(messages: List[Dict[str, Any]], had_images: bool, session_id
         # `messages` matters here: without it the fallback ignored the request and
         # returned the router's own model, so a dispatcher outage sent a refactor
         # or an image to whatever DISPATCHER_MODEL happened to be.
-        target = dispatcher.fallback_model(catalog, had_images, messages=messages)
+        # `exclude={brain}` keeps the burned brain out of its own recovery pool --
+        # otherwise a burned brain would be re-handed back as the fallback target,
+        # looping the failure. The brain is resolved live (pinned config id or the
+        # auto-promoted catalog pick) so the exclusion still means something.
+        try:
+            brain = dispatcher.dispatcher_model(catalog)
+            target = dispatcher.fallback_model(
+                catalog, had_images,
+                exclude={brain} if brain else set(), messages=messages,
+            )
+        except dispatcher.DispatcherUnavailable as unavailable:
+            # No live model anywhere AND the brain is burned too: surface a 503
+            # rather than re-hand a known-dead id to the executor (which would
+            # crash on it and recurse back here). The request handler's existing
+            # HTTPException pipeline emits the 503 cleanly.
+            raise HTTPException(503, str(unavailable)) from exc
         return target, f"dispatcher unavailable: {exc}", "fallback"
 
-
-
-# ---------------------------------------------------------------------------
-# User API keys (for authenticating clients like Cline / Claude Code)
-# ---------------------------------------------------------------------------
-class ApiKeyIn(BaseModel):
-    label: str = ""
-
-
-@app.get("/api/keys")
-def list_api_keys() -> Dict[str, Any]:
-    return {"keys": api_keys.list_keys()}
-
-
-@app.post("/api/keys")
-def create_api_key(body: ApiKeyIn) -> Dict[str, Any]:
-    key = api_keys.create_key(body.label)
-    return {"created": key}
-
-
-@app.delete("/api/keys/{kid}")
-def revoke_api_key(kid: str) -> Dict[str, Any]:
-    if not api_keys.revoke_key(kid):
-        raise HTTPException(404, f"key '{kid}' not found")
-    return {"revoked": kid}
 
 
 # ---------------------------------------------------------------------------
@@ -1276,16 +1151,23 @@ def _resolve_effort(
 ) -> Optional[str]:
     """Translate a client's ``reasoning_effort`` into one the target honours.
 
-    Runs here, not in the request parsers, because the legal values depend on
-    the model routing chose. Mutates ``params`` in place; the parameter is
-    dropped when the label is unusable or the model exposes no effort control
-    (OpenCode returns 200 for a value it ignores, so forwarding one would look
-    like it worked while changing nothing).
+    Harnesses disagree on how to name thinking depth, and each OpenCode model
+    publishes its own set of values it actually implements. Effort therefore
+    cannot be resolved until routing has chosen a model, which is why this runs
+    here rather than in the request parsers.
 
-    ``previous`` re-resolves against a different model on the failover path:
-    without it the primary's already-clamped value would be re-clamped as if the
-    client asked for it (`max` clamped to deepseek's `max`, then carried onto
-    ling, which lacks it). Returns the value actually sent, for logging.
+    Mutates ``params`` in place. The parameter is dropped entirely when the label
+    is unusable *or* when the model exposes no effort control -- OpenCode returns
+    200 for a value a model ignores, so forwarding one would look like it worked
+    while changing nothing.
+
+    ``previous`` re-resolves against a *different* model on the failover path.
+    Without it the already-clamped value for the primary model would be re-clamped
+    as if the client had asked for it: `max` clamped to deepseek's `max`, then
+    carried unchanged onto ling, which does not implement it. Passing the original
+    label makes the second resolution independent of the first.
+
+    Returns the value actually sent, for logging.
     """
     requested = params.pop("reasoning_effort", None)
     if previous is not None:
@@ -1308,79 +1190,16 @@ def _resolve_effort(
     return resolved
 
 
-def _stream_pacing(
-    model_id: str, body: Optional[Dict[str, Any]] = None,
-) -> Tuple[float, float]:
-    """Idle-watchdog budget and httpx read timeout for a stream on ``model_id``.
-
-    A hidden-reasoning model is silent on the wire while it thinks, so the
-    default budgets cut that off as a broken stream and stream_guard retries it
-    to death. Reasoning models get the longer "thinking patience" from
-    :func:`stream_idle.pacing_for`. The output is not touched: only how long a
-    silent pause is tolerated changes. See that helper and
-    ``config.STREAM_THINKING_TIMEOUT`` for the tradeoff.
-
-    "Reasoning" is decided in four layers so a *future* hidden-reasoning model
-    needs no per-model fix: (1) an operator override
-    (``config.LONG_THINKING_MODELS``), (2) the live catalog flag
-    (``LogicalModel.reasoning``), (3) a model learned from its wire behaviour
-    (:mod:`routing.pacing_memory` -- reasoning tokens in a chunk, or a stall
-    before any visible content), (4) the request body asking for reasoning this
-    turn (``reasoning_effort`` / ``thinking`` / ``reasoning``). Layer (4) also
-    *learns* the model, so a hidden-reasoning model whose listing does not
-    advertise reasoning self-heals after its first requested-thinking turn.
-    """
-    reasoning = model_id in config.LONG_THINKING_MODELS
-    if not reasoning:
-        lm = catalog.by_id(model_id)
-        reasoning = lm is not None and bool(getattr(lm, "reasoning", False))
-    if not reasoning:
-        reasoning = pacing_memory.is_reasoning(model_id)
-    if not reasoning and _body_asks_reasoning(body):
-        # The client asked the model to reason -- it supports it for this turn
-        # and will stay silent while it thinks. Grant patience now and learn the
-        # model, so turns without the param (the common case for a model whose
-        # reasoning is hidden) are patient too instead of stalling every time.
-        pacing_memory.mark_reasoning(model_id)
-        reasoning = True
-    return stream_idle.pacing_for(reasoning)
-
-
-def _body_asks_reasoning(body: Optional[Dict[str, Any]]) -> bool:
-    """The request asks the model to reason under any of the common vocabularies.
-
-    Covers the OpenAI/Chat skill (``reasoning_effort``), the Codex Responses
-    shape (``reasoning: {effort: ...}`` or a truthy flag), and the Anthropic /
-    Claude Code thinking toggle (``thinking: {type: "enabled"|"adaptive"}`` or a
-    budget). A model the client asks to reason goes silent while it thinks, so
-    this both grants patience for the turn and -- on first sight -- learns the
-    model for turns that arrive without the param.
-    """
-    if not isinstance(body, dict):
-        return False
-    if body.get("reasoning_effort"):
-        return True
-    reasoning = body.get("reasoning")
-    if isinstance(reasoning, dict) and reasoning.get("effort"):
-        return True
-    if reasoning in (True, "true", "yes", 1, "1"):
-        return True
-    thinking = body.get("thinking")
-    if isinstance(thinking, dict) and (
-        thinking.get("type") in ("enabled", "adaptive")
-        or thinking.get("budget_tokens")
-    ):
-        return True
-    return False
-
-
 def _messages_for_model(
     messages: List[Dict[str, Any]], model_id: str, has_images: bool,
 ) -> List[Dict[str, Any]]:
     """Make ``messages`` safe for ``model_id``, stripping images it cannot see.
 
-    A text-only model rejects image parts (OpenCode 400), so every fallback site
-    swaps them for the same placeholder the primary path uses. Idempotent, and a
+    ``dispatcher.fallback_model`` answers an image request from a text-only
+    model when every vision-capable one is down or burning. A text-only model
+    cannot read image parts -- OpenCode answers HTTP 400 -- so every fallback
+    site replaces them with the same placeholder the primary-target path uses
+    (see ``vision_bridge.strip_images_for_text_model``). Idempotent, and a
     no-op for a vision-capable model or a text-only request.
     """
     if not has_images:
@@ -1391,132 +1210,129 @@ def _messages_for_model(
     return messages
 
 
-# Per-model last "is this model actually gone from the free section?" recheck,
-# used to gate _flag_model_retired below. A transient "Model is unavailable"
-# burst (huge upstream traffic) fires that recheck on many concurrent requests
-# at once; without a cooldown each would force a catalog refresh.
-_retire_recheck_at: Dict[str, float] = {}
-# Guards _retire_recheck_at across the check-then-set window between the
-# cooldown test and the next-write slot: a burst of concurrent "unavailable"
-# 400s would each pass the cooldown test before any of them updated the
-# timestamp, scheduling N redundant /models refreshes for the same model.
-# The refresh itself runs outside this lock so one model's outage cannot
-# serialise the others.
-_retire_lock = threading.Lock()
+# Muse Spark's upstream intermittently completes a Responses turn with zero
+# output items and zero usage (the ledger shows 41 such rows, all logged
+# ``ok_stream``, up to four in a row). The old fix -- buffer the whole stream,
+# detect blank, silently retry with downgraded effort or a fallback model --
+# made the client stare at silence for the entire first attempt (up to 67s),
+# reopened an exhausted generator on the retry path, and could still flush the
+# empty buffer. The retry ladder below replaces it: re-run the request up to
+# three times on blank, each attempt a fresh egress pick, and if every attempt
+# comes back empty say so plainly instead of pretending the model answered.
+_RESPONSES_BLANK_MAX_ATTEMPTS = 3
 
 
-def _flag_model_retired(exc: Exception, model_id: str) -> bool:
-    """Hide a model from the catalog when its free-tier chat starts 400-ing.
-
-    A ``-free`` model that comes back from upstream with HTTP 400 "Model is
-    unavailable" has stopped being served free, even when OpenCode keeps
-    advertising it in /models -- and it keeps advertising them: the chronic
-    deepseek/musespark case is "still listed, but the backend refuses chat".
-    So the model is retired here on that signal alone; the chat path's own
-    AllFailedError already propagates to failover, and this drop keeps the
-    same model off the dashboard, /v1/models, the sampler and the dispatcher
-    until either the operator clears backend/data/retired_models.json or
-    LINGLING_RETIRED_MODEL_TTL_DAYS (7 days) drops the entry on the next
-    gateway start. There is no probation-pop anymore: a parked model stays
-    parked across refreshes and across restarts (a loaded entry is re-stamped
-    ``now`` in _load_unavailable so a fresh restart doesn't trip any "old
-    entry, must resurrect" logic; see catalog.refresh -- the self-heal pop
-    loop was removed because chronic offenders kept popping straight back to
-    "everywhere" within one refresh). A per-model cooldown keeps a burst of
-    "unavailable" 400s from firing more than one retirement per window.
-    """
-    err = getattr(exc, "last_error", None)
-    if err is None or getattr(err, "status_code", None) != 400:
-        return False
-    if "unavailable" not in str(getattr(err, "detail", "")).lower():
-        return False
-
-    now = time.time()
-    with _retire_lock:
-        last = _retire_recheck_at.get(model_id, 0.0)
-        if now - last < config.RETIRE_RECHECK_COOLDOWN_S:
-            # Decisive retirement attempt already made recently for this model;
-            # don't hammer the lock / persisted-retired set on every concurrent
-            # 400 in this burst. The parked entry is already effective across
-            # /v1/models, the dashboard, the sampler and the dispatcher.
-            return False
-        _retire_recheck_at[model_id] = now
-
-    if catalog.is_unavailable(model_id):
-        # Already parked -- a parked model stays parked across refreshes and
-        # across restarts (catalog._load_unavailable re-stamps the persisted
-        # entry to ``now`` on load), so a concurrent in-flight 400 for a model
-        # already in the retired set has nothing to do here.
-        return False
-
-    try:
-        catalog.mark_unavailable(model_id)
-    except Exception:  # noqa: BLE001
-        return False
-    log.info(
-        "catalog: retired model %s (upstream refused free-tier chat with "
-        "'unavailable' 400; parked until retired_models.json is cleared or "
-        "LINGLING_RETIRED_MODEL_TTL_DAYS drops it on the next gateway start)",
-        model_id,
+def _responses_blank_notice(model: str, attempts: int) -> str:
+    """The honest terminal for a turn that stayed empty across every retry."""
+    return (
+        f"[lingling: {model} returned an empty response {attempts} times in a "
+        f"row. The upstream is intermittently blank; retry, or pick another model.]"
     )
+
+
+def _responses_output_blank(out: Dict[str, Any]) -> bool:
+    """True when a translated Responses object carries nothing a client can use.
+
+    ``output`` is the only thing Codex renders; a response whose output is
+    missing, empty, or holds only reasoning items (no message, no tool call)
+    reads as an empty turn no matter what the upstream reported.
+    """
+    for item in out.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            return False
+        if item.get("type") == "function_call":
+            return False
     return True
 
 
-def _log_stream_attempt(event: str, data: Dict[str, Any]) -> None:
-    """Per-attempt stream lifecycle log, fired inside ``execute_stream``'s retry loop.
+async def _responses_blank_retry(
+    messages: List[Dict[str, Any]],
+    target: str,
+    target_providers: List[Any],
+    params: Dict[str, Any],
+    *,
+    session_id: str,
+    had_images: bool,
+    requested: str,
+    original_effort: Optional[str],
+    max_attempts: int = _RESPONSES_BLANK_MAX_ATTEMPTS,
+) -> Optional[Dict[str, Any]]:
+    """Re-run a non-stream Responses request until it produces output.
 
-    The responses handler's only post-arrival line used to fire *after*
-    ``execute_stream`` returned -- by which point minutes of silent
-    first-chunk waiting across burned exit IPs were invisible in the
-    backend log, indistinguishable from a client that never sent a
-    request at all. Each retry now emits a ``dispatch`` line (with the
-    proxy picked, so a wait that turns silent is no longer
-    indistinguishable from "no request was ever sent"), then either a
-    ``first_token`` line confirming the lane is live or a ``failure``
-    line with the status code naming why an IP burned. A typical
-    succeed-first turn is 2 lines; a burn-and-retry turn is 3 lines per
-    burned attempt plus a survivor pair -- a heartbeat the previous
-    single-after-the-fact summary never had.
+    Returns the first non-blank translated response, or None when every
+    attempt came back blank. Each attempt goes through the executor again, so
+    it lands on a fresh exit IP under the pool's normal policy -- the blank
+    turns are upstream intermittency, not a bad request, so the retry is the
+    same request on a different lane. ``params`` already carries the effort
+    resolved for ``target``, so attempts reuse it unchanged. The caller logs
+    the outcome; this helper never raises.
     """
-    proxy = data.get("proxy") or "direct"
-    n = data.get("n", "?")
-    prov = data.get("prov")
-    if event == "dispatch":
-        log.info(
-            "stream attempt: dispatched #%d prov=%s proxy=%s model=%s",
-            n, prov, proxy, data.get("model"),
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp, prov, key, _attempts = await _execute_with_egress_wait(
+                executor.execute_nonstream,
+                _messages_for_model(messages, target, had_images),
+                target, target_providers, proxy_pool=proxy_pool,
+                session_id=session_id, catalog=catalog, **params
+            )
+        except (executor.AllFailedError, executor.NoProviderError) as exc:
+            log.warning(
+                "responses blank retry attempt %d/%d failed to start: %s",
+                attempt, max_attempts, getattr(exc, "last_error", exc),
+            )
+            return None
+        out = responses_bridge.response_object(resp, requested, target, prov.id)
+        if not _responses_output_blank(out):
+            return out
+        log.warning(
+            "responses blank attempt %d/%d target=%s effort=%s -- upstream "
+            "completed with no output; retrying on a fresh egress",
+            attempt, max_attempts, target,
+            params.get("reasoning_effort") or original_effort or "",
         )
-    elif event == "first_token":
-        log.info(
-            "stream attempt: first_token #%d after %.0fms prov=%s proxy=%s",
-            n, data.get("elapsed_ms", -1), prov, proxy,
-        )
-    elif event == "failure":
-        log.info(
-            "stream attempt: failed #%d after %.0fms status=%s prov=%s proxy=%s",
-            n, data.get("elapsed_ms", -1), data.get("status"), prov, proxy,
-        )
+    return None
+
+
+def _is_responses_only_model(model_id: str) -> bool:
+    """Whether ``model_id`` is served only on the Responses API.
+
+    The same capability flag that routes the request to ``/v1/responses``
+    (``providers.opencode.is_responses_model``) marks the models whose
+    upstream can complete a turn with zero visible content -- hidden
+    reasoning tokens, no content delta. The chat blank-turn retry ladder
+    keys off this instead of a hardcoded id, so a new Responses-only model
+    arriving upstream gets the same recovery without a code change.
+    Operators can extend the set at runtime via ``LINGLING_RESPONSES_MODELS``;
+    the ladder follows automatically.
+    """
+    prov = providers.get("opencode")
+    check = getattr(prov, "is_responses_model", None) if prov is not None else None
+    return bool(check and check(model_id))
 
 
 async def _execute_with_egress_wait(fn, *args, **kwargs):
     """Run an executor call, waiting out a fully-cooled egress pool once.
 
-    On AllFailedError this asks the pool whether the failure was exhaustion
-    (every exit cooling) and, if so, holds the request until the soonest exit
-    returns then retries once. ``wait_for_egress`` returns 0 when waiting can't
-    help, and the original error propagates -- so the caller behaves exactly as
-    before parking existed, model fallback included.
+    The executor is synchronous, so it always goes through the threadpool. When
+    it reports that every attempt failed, this asks the proxy pool whether the
+    failure was exhaustion -- every exit in cooldown -- and if so holds the
+    request until the soonest exit returns, then tries once more.
+
+    ``parking.wait_for_egress`` returns 0 when waiting cannot help (an exit is
+    already free, there is no pool, or the wait exceeds the budget), and then the
+    original ``AllFailedError`` propagates and the caller behaves exactly as it
+    did before parking existed -- model fallback included.
     """
-    # Use the caller's proxy_pool (passed via kwargs), not the module-level one,
-    # or the egress-wait check could consult the wrong pool (visible in tests).
+    # Use the proxy_pool the caller passed, not the module-level one. The
+    # executor receives it via kwargs; the egress-wait check must consult the
+    # same pool or it can wait against an empty/wrong one (most visible in
+    # tests, where a custom pool is passed but the module-level var was used).
     pool = kwargs.get("proxy_pool", proxy_pool)
     try:
         return await run_in_threadpool(fn, *args, **kwargs)
-    except executor.AllFailedError as exc:
-        # fn is execute_nonstream/execute_stream; args[1] is the model id. If the
-        # upstream retired its free tier, stop offering the model.
-        if len(args) > 1 and isinstance(args[1], str):
-            _flag_model_retired(exc, args[1])
+    except executor.AllFailedError:
         waited = await parking.wait_for_egress(pool, config.EGRESS_WAIT_BUDGET, log)
         if not waited:
             raise
@@ -1527,7 +1343,6 @@ async def _execute_with_egress_wait(fn, *args, **kwargs):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     request_started = time.time()
-    call_type = "chat"
     client = request.client.host if request.client else "unknown"
 
     try:
@@ -1572,26 +1387,32 @@ async def chat_completions(request: Request):
             if bare != target and catalog.providers_for(bare):
                 target = bare
             else:
-                # Two distinct "no" cases, deliberately separated.
-                # is_unavailable means the recycler retired it -- the model WAS
-                # listed free and OpenCode dropped it (or the operator seeded it
-                # in LINGLING_RETIRED_MODELS), so the message points the client
-                # at /v1/models, which won't list it. The else is a genuinely
-                # unknown id -- a typo, an unrecognised provider-prefixed name, a
-                # premium id -- that was never free here, so "unknown" rather
-                # than the misleading "no longer served".
-                if catalog.is_unavailable(target):
-                    raise HTTPException(400, f"Model {requested!r} is no longer served for free by OpenCode; pick from /v1/models.")
                 raise HTTPException(400, f"Unknown or unsupported model: {requested!r}")
         reason = "user requested"
         routed_by = "user"
+        # The client explicitly named a model the recycler has retired.
+        # Both burned AND blacklisted (including retired-seed) are treated as
+        # unavailable — reroute to the nearest live substitute so the request
+        # still goes through. This fixes muse-spark explicit picks that were
+        # blacklisted but not burned: previously they bypassed this check and
+        # were dispatched to an upstream that dies mid-flight, leaving Codex
+        # with an empty reply.
+        if catalog.is_burned(target) or catalog.is_blacklisted(target):
+            fallback = dispatcher.fallback_model(
+                catalog, had_images, exclude={target}, messages=messages,
+            )
+            if not (fallback and fallback != target and catalog.providers_for(fallback)):
+                raise HTTPException(
+                    503, f"explicit pick {requested!r} is unavailable, no live substitute",
+                )
+            log.info("reroute %s -> %s (explicit pick unavailable)", target, fallback)
+            target = fallback
+            reason = f"explicit pick {requested!r} was burned; rerouted by recycler"
+            routed_by = "recycler-reroute"
 
     target_providers = catalog.providers_for(target)
     if not target_providers:
-        raise HTTPException(
-            503, f"No provider available for model '{target}'.",
-            headers=_failure_provenance_headers(target, routed_by, reason),
-        )
+        raise HTTPException(503, f"No provider available for model '{target}'.")
 
     target_lm = catalog.by_id(target)
     if target_lm is not None and not target_lm.vision:
@@ -1600,6 +1421,10 @@ async def chat_completions(request: Request):
     params = _passthrough_params(body)
     original_effort = params.get("reasoning_effort")
     _resolve_effort(params, target)
+
+    # Which of the three wire entrypoints this turn came through, for the ledger
+    # (a 429 egress burn and a 400 shape rejection read identically without it).
+    call_type = "chat"
 
     routing_meta = {
         "requested_model": requested,
@@ -1618,11 +1443,15 @@ async def chat_completions(request: Request):
             resp, prov, key, attempts = await _execute_with_egress_wait(
                 executor.execute_nonstream,
                 messages, target, target_providers, proxy_pool=proxy_pool,
-                session_id=session_id, **params
+                session_id=session_id, catalog=catalog, **params
             )
         except executor.AllFailedError as exc:
+            # Model-class burning is already done by ``executor`` at the point
+            # of failure (so chat-stream, which never falls back, still
+            # recycles). Falling through to a different model is the chat
+            # path's job -- the executor only knows about target.
             fallback = dispatcher.fallback_model(
-                catalog, had_images, exclude={target} | set(sampler.cooked_models()), messages=messages,
+                catalog, had_images, exclude={target}, messages=messages,
             )
             fallback_providers = catalog.providers_for(fallback)
             if fallback and fallback != target and fallback_providers:
@@ -1636,7 +1465,7 @@ async def chat_completions(request: Request):
                         executor.execute_nonstream,
                         _messages_for_model(messages, fallback, had_images),
                         fallback, fallback_providers, proxy_pool=proxy_pool,
-                        session_id=session_id, **retry_params
+                        session_id=session_id, catalog=catalog, **retry_params
                     )
                     attempts = exc.attempts + attempts2
                     target = fallback
@@ -1655,10 +1484,7 @@ async def chat_completions(request: Request):
                         last_upstream_status=getattr(getattr(fallback_exc, "last_error", None), "status_code", None),
                         rerouted=(routed_by == "fallback"),
                     )
-                    raise HTTPException(
-                        503, f"All providers exhausted for '{target}'.",
-                        headers=_failure_provenance_headers(target, routed_by, reason),
-                    )
+                    raise HTTPException(503, f"All providers exhausted for '{target}'.")
             else:
                 usage_store.log(
                     requested, target, routed_by, reason, status="exhausted",
@@ -1667,10 +1493,7 @@ async def chat_completions(request: Request):
                     last_upstream_status=getattr(getattr(exc, "last_error", None), "status_code", None),
                     rerouted=(routed_by == "fallback"),
                 )
-                raise HTTPException(
-                    503, f"All providers exhausted for '{target}'.",
-                    headers=_failure_provenance_headers(target, routed_by, reason),
-                )
+                raise HTTPException(503, f"All providers exhausted for '{target}'.")
 
         latency = (time.time() - started) * 1000.0
         usage = extract_usage(resp)
@@ -1688,9 +1511,103 @@ async def chat_completions(request: Request):
             **routing_meta, "provider": prov.id, "account": account_id, "attempts": attempts,
         }
         log.info(
-            "chat handled requested=%s target=%s provider=%s stream=false latency_ms=%.1f",
-            requested, target, prov.id, (time.time() - request_started) * 1000.0,
+            "%s  ----  %dms",
+            target, int((time.time() - request_started) * 1000.0),
         )
+        # A reasoning-only upstream (nemotron-style: content=="" with
+        # reasoning/reasoning_content/thinking populated) would otherwise reach
+        # an OpenAI chat client as a blank turn. Promote the first non-empty
+        # reasoning field into message.content so the answer is usable; the
+        # raw reasoning fields stay intact for clients that understand them.
+        # See providers.base.promote_reasoning_to_content.
+        if promote_reasoning_to_content(resp):
+            log.info(
+                "chat blank-turn recovery requested=%s target=%s provider=%s "
+                "stream=false -- upstream returned empty content, surfaced reasoning",
+                requested, target, prov.id,
+            )
+        # A Responses-only upstream (muse-spark-style: hidden reasoning
+        # tokens, zero visible content) can complete a turn blank even after
+        # promotion. If still empty, surface Lingling's notice and retry
+        # once (downgrade effort or fallback model) instead of returning
+        # blank. Keyed off the same capability flag that routes the model to
+        # /v1/responses, so any new Responses-only model gets the recovery
+        # without a code change.
+        choices = resp.get("choices") or [{}]
+        msg = (choices[0].get("message") if isinstance(choices[0], dict) else {}) or {}
+        is_empty = not (msg.get("content") or msg.get("tool_calls"))
+        if is_empty:
+            is_spark = _is_responses_only_model(target)
+            eff = str(params.get("reasoning_effort") or original_effort or "")
+            log.warning(
+                "chat empty after promote requested=%s target=%s effort=%s provider=%s — %s",
+                requested, target, eff, prov.id,
+                "Responses-only model has an empty reply at xhigh" if is_spark and eff.lower() in ("xhigh","max","ultra") else "blank turn",
+            )
+            # Try once: downgrade effort on same model if high effort, else fallback model.
+            downgrade_map = {"xhigh": "high", "max": "xhigh", "ultra": "max", "high": "medium"}
+            downgraded = downgrade_map.get(eff.lower()) if eff else None
+            retried = False
+            if downgraded and is_spark:
+                try:
+                    retry_params = dict(params)
+                    retry_params["reasoning_effort"] = downgraded
+                    _resolve_effort(retry_params, target)  # re-clamp to model's allowed
+                    resp2, prov2, key2, attempts2 = await _execute_with_egress_wait(
+                        executor.execute_nonstream,
+                        _messages_for_model(messages, target, had_images),
+                        target, target_providers, proxy_pool=proxy_pool,
+                        session_id=session_id, catalog=catalog, **retry_params
+                    )
+                    if promote_reasoning_to_content(resp2):
+                        log.info("chat empty retry downgraded %s -> %s succeeded via promote", eff, downgraded)
+                    c2 = (resp2.get("choices") or [{}])[0].get("message") or {}
+                    if c2.get("content") or c2.get("tool_calls"):
+                        resp = resp2
+                        prov = prov2
+                        key = key2
+                        attempts = attempts + attempts2
+                        retried = True
+                        log.info("chat empty retry downgraded %s -> %s target=%s succeeded", eff, downgraded, target)
+                except Exception as retry_exc:
+                    log.warning("chat empty retry downgraded failed: %s", retry_exc)
+            if not retried:
+                # Fallback model path (also covers non-spark empties)
+                fallback = dispatcher.fallback_model(catalog, had_images, exclude={target}, messages=messages)
+                fb_provs = catalog.providers_for(fallback) if fallback else None
+                if fallback and fb_provs:
+                    try:
+                        retry_params = dict(params)
+                        _resolve_effort(retry_params, fallback, previous=original_effort)
+                        resp2, prov2, key2, attempts2 = await _execute_with_egress_wait(
+                            executor.execute_nonstream,
+                            _messages_for_model(messages, fallback, had_images),
+                            fallback, fb_provs, proxy_pool=proxy_pool,
+                            session_id=session_id, catalog=catalog, **retry_params
+                        )
+                        if promote_reasoning_to_content(resp2):
+                            log.info("chat empty fallback %s -> %s promoted reasoning", target, fallback)
+                        c2 = (resp2.get("choices") or [{}])[0].get("message") or {}
+                        if c2.get("content") or c2.get("tool_calls"):
+                            resp = resp2
+                            prov = prov2
+                            target = fallback
+                            reason = f"empty turn on {requested}; fell back to {fallback}"
+                            routed_by = "empty-fallback"
+                            retried = True
+                            log.info("chat empty fallback %s -> %s succeeded", requested, fallback)
+                    except Exception as fb_exc:
+                        log.warning("chat empty fallback failed: %s", fb_exc)
+            if not retried:
+                log.info("chat empty still blank after retry — returning without notice per user request (empty will be retried silently on next turn) target=%s", target)
+                # No notice injected — per latest user request the empty message
+                # must never reach the CLI; the next turn's retry will handle it.
+                # Keep resp as is (empty) but don't surface a synthetic message.
+            # Refresh lingling meta after any retry/fallback injection
+            resp["lingling"] = {
+                **routing_meta, "provider": prov.id, "account": key.id if key else None, "attempts": attempts,
+                "routed_model": target, "routed_by": routed_by, "reason": reason,
+            }
         return JSONResponse(resp)
 
     # Streaming path: open the upstream SSE connection and wait for the first
@@ -1700,122 +1617,65 @@ async def chat_completions(request: Request):
     # Recovery re-emits the whole answer after a reset marker, so a client that
     # ignores the marker would render it twice. Callers can opt out per request.
     recover = bool(body.get("lingling_recover", config.STREAM_RECOVERY))
-    # A hidden-reasoning model is silent on the wire while it thinks; the default
-    # watchdog/read budgets would cut that off as a broken stream, so a reasoning
-    # target gets a longer "thinking patience" (output is untouched). pacing_for
-    # returns (idle_budget, read_timeout); reorder into the names used below.
-    stream_idle_budget, stream_read_to = _stream_pacing(target, body)
     started = time.time()
     try:
-        # execute_stream blocks until the first upstream chunk arrives (up to the
-        # per-stream read timeout below), so it cannot run on the event loop. The
-        # generator it returns is safe: StreamingResponse iterates sync iterators
-        # in a worker thread already.
+        # execute_stream blocks until the first upstream chunk arrives (up to
+        # STREAM_FIRST_TOKEN_TIMEOUT), so it cannot run on the event loop. The
+        # generator it returns is safe: StreamingResponse iterates sync
+        # iterators in a worker thread already.
         stream_iter, prov, key, attempts = await _execute_with_egress_wait(
             executor.execute_stream,
             messages, target, target_providers, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=stream_read_to,
-            on_attempt=_log_stream_attempt, **params
+            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, catalog=catalog, **params
         )
     except (executor.AllFailedError, executor.NoProviderError) as exc:
-        # Surface the actual upstream rejection (status + detail), so the
-        # dashboard, the log and the returned 503 name the real cause rather than
-        # the generic "No upstream stream started within X s" every exhaustion
-        # used to read as.
-        error = str(getattr(exc, "last_error", exc))
-        last_status = getattr(getattr(exc, "last_error", None), "status_code", None)
-        log.warning(
-            "chat stream: all upstream attempts failed target=%s last_status=%s error=%s",
-            target, last_status, error[:300],
-        )
-
-        # Pre-HTTP-200 fallback: mirror the chat non-stream path's contract (and
-        # the /v1/responses stream path). execute_stream raises while still
-        # waiting for the first chunk, so no bytes are on the wire yet -- a model
-        # swap is safe and invisible to the client, exactly the window the chat
-        # non-stream handler already fell back in. Without this the stream path
-        # returned a bare 503 on a transiently-exhausted model while a one-line
-        # curl through the non-stream branch recovered -- the streaming-vs-non-
-        # stream fallback asymmetry upstream tracks as LiteLLM #25843. Only route
-        # onto a model the sampler has not proven cooked, so a model every green
-        # exit already refused is not churned again.
+        # Parity with the non-stream path and the Responses stream path: a 429-
+        # or 5xx-burn across all egress lanes for the primary model should not
+        # surface as an empty-stream 503 when another free model is live. This
+        # was the root of "empty reply from all models" via chat streaming
+        # (Cline/dashboard) while non-stream fallback succeeded — the stream
+        # path had no pre-200 fallback at all, so a transient 429 storm
+        # produced a 503 that the client rendered as empty.
         fallback = dispatcher.fallback_model(
-            catalog, had_images,
-            exclude={target} | set(sampler.cooked_models()), messages=messages,
+            catalog, had_images, exclude={target}, messages=messages,
         )
         fallback_providers = catalog.providers_for(fallback) if fallback else None
-        if not (fallback and fallback != target and fallback_providers):
+        if fallback and fallback != target and fallback_providers:
+            try:
+                retry_params = dict(params)
+                _resolve_effort(retry_params, fallback, previous=original_effort)
+                retry_msgs = _messages_for_model(messages, fallback, had_images)
+                stream_iter, prov, key, attempts2 = await _execute_with_egress_wait(
+                    executor.execute_stream,
+                    retry_msgs, fallback, fallback_providers, proxy_pool=proxy_pool,
+                    session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, catalog=catalog, **retry_params
+                )
+                attempts = list(getattr(exc, "attempts", [])) + list(attempts2)
+                target = fallback
+                reason = f"primary stream failed ({getattr(exc, 'last_error', exc)}); fell back to {fallback}"
+                routed_by = "fallback"
+                routing_meta.update({"routed_model": target, "routed_by": routed_by, "reason": reason})
+            except (executor.AllFailedError, executor.NoProviderError) as fallback_exc:
+                error = str(getattr(fallback_exc, "last_error", fallback_exc))
+                usage_store.log(
+                    requested, target, routed_by, reason, status="exhausted",
+                    had_images=had_images, error=error[:300],
+                    call_type=call_type,
+                    attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
+                    last_upstream_status=getattr(getattr(fallback_exc, "last_error", None), "status_code", None),
+                    rerouted=(routed_by == "fallback"),
+                )
+                raise HTTPException(503, f"No upstream stream started within {config.STREAM_FIRST_TOKEN_TIMEOUT:g}s for '{target}'.")
+        else:
+            error = str(getattr(exc, "last_error", exc))
             usage_store.log(
                 requested, target, routed_by, reason, status="exhausted",
                 had_images=had_images, error=error[:300],
                 call_type=call_type, attempts=len(getattr(exc, "attempts", [])),
-                last_upstream_status=last_status,
+                last_upstream_status=getattr(getattr(exc, "last_error", None), "status_code", None),
                 rerouted=(routed_by == "fallback"),
             )
-            raise HTTPException(
-                503,
-                f"No upstream stream started within {stream_read_to:g}s for '{target}' "
-                f"(last upstream status {last_status}).",
-                headers=_failure_provenance_headers(target, routed_by, reason),
-            )
-        log.warning(
-            "chat stream rerouting %s -> %s (primary exhausted, last_status=%s)",
-            target, fallback, last_status,
-        )
-        retry_params = dict(params)
-        _resolve_effort(retry_params, fallback, previous=original_effort)
-        retry_messages = _messages_for_model(messages, fallback, had_images)
-        # The retry may land on a non-reasoning model whose thinking patience is
-        # shorter than the primary's -- re-derive pacing so the idle watchdog is
-        # not tuned for the dead model.
-        retry_idle_budget, retry_read_to = _stream_pacing(fallback, body)
-        try:
-            stream_iter, prov, key, attempts2 = await _execute_with_egress_wait(
-                executor.execute_stream,
-                retry_messages, fallback, fallback_providers, proxy_pool=proxy_pool,
-                session_id=session_id, timeout=retry_read_to,
-                on_attempt=_log_stream_attempt, **retry_params
-            )
-        except (executor.AllFailedError, executor.NoProviderError) as fallback_exc:
-            fb_error = str(getattr(fallback_exc, "last_error", fallback_exc))
-            fb_last_status = getattr(
-                getattr(fallback_exc, "last_error", None), "status_code", None,
-            )
-            log.warning(
-                "chat stream: fallback %s also exhausted target=%s last_status=%s "
-                "error=%s",
-                fallback, target, fb_last_status, fb_error[:300],
-            )
-            usage_store.log(
-                requested, target, routed_by, reason, status="exhausted",
-                had_images=had_images,
-                error=f"{error[:150]} || {fb_error[:150]}",
-                call_type=call_type,
-                attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
-                last_upstream_status=fb_last_status,
-                rerouted=(routed_by == "fallback"),
-            )
-            raise HTTPException(
-                503,
-                f"All providers exhausted for '{target}' "
-                f"(primary last status {last_status}; fallback {fallback} last "
-                f"status {fb_last_status}).",
-                headers=_failure_provenance_headers(target, routed_by, reason),
-            )
-        # The fallback opened cleanly -- rebind routing metadata the rest of the
-        # handler streams against (the row opened below, `_reopen`, the idle
-        # watchdog and the finalize envelope must all name the model the answer
-        # actually came from). Same rewrite the chat non-stream path does on a
-        # successful fallback, plus re-derived pacing so streaming recovery / idle
-        # budgets match the model now riding the wire.
-        attempts = list(getattr(exc, "attempts", [])) + list(attempts2)
-        target = fallback
-        target_providers = fallback_providers
-        params = retry_params
-        stream_idle_budget, stream_read_to = retry_idle_budget, retry_read_to
-        reason = f"primary stream failed ({getattr(exc, 'last_error', exc)}); " \
-                 f"fell back to {fallback}"
-        routed_by = "fallback"
+            raise HTTPException(503, f"No upstream stream started within {config.STREAM_FIRST_TOKEN_TIMEOUT:g}s for '{target}'.")
 
     account_id = key.id if key is not None else None  # keyless -> no account
     # Log at first chunk so a stream that dies mid-flight still leaves a record;
@@ -1828,8 +1688,8 @@ async def chat_completions(request: Request):
         last_upstream_status=None, rerouted=(routed_by == "fallback"),
     )
     log.info(
-        "chat: streaming requested=%s target=%s provider=%s first_chunk_ms=%.1f",
-        requested, target, prov.id, (time.time() - request_started) * 1000.0,
+        "%s  ----  firstchunk %dms",
+        target, int((time.time() - request_started) * 1000.0),
     )
 
     # Mid-stream recovery may land on a different model, but only when the client
@@ -1844,15 +1704,17 @@ async def chat_completions(request: Request):
     def _reopen():
         """Open a replacement upstream stream for mid-flight recovery.
 
-        Goes back through the executor for a fresh exit IP. An auto-routed turn
-        also picks a fresh model (excluding the one that broke); the chosen model
-        is recorded on `reroute` so the ledger reports where the answer came from.
+        Goes back through the executor, so the retry picks a fresh exit IP under
+        the pool's normal policy rather than reusing the one that just died. For
+        an auto-routed turn it also picks a fresh *model*, excluding the one that
+        broke. Only the generator is kept; the chosen model is recorded on
+        `reroute` so the ledger and the log can report where the answer came from.
         """
         retry_model = target
         retry_params = params
         if auto_routed:
             alternative = dispatcher.fallback_model(
-                catalog, had_images, exclude={target} | set(sampler.cooked_models()), messages=messages,
+                catalog, had_images, exclude={target}, messages=messages,
             )
             alt_providers = catalog.providers_for(alternative)
             if alternative and alternative != target and alt_providers:
@@ -1874,16 +1736,12 @@ async def chat_completions(request: Request):
         # model could; swap them for the same placeholder the non-streaming
         # fallback uses, or OpenCode answers 400 and the retry is wasted.
         retry_messages = _messages_for_model(messages, retry_model, had_images)
-        # The retry may land on a different model: re-derive its thinking
-        # patience so a reroute off a hidden-reasoning model does not carry the
-        # long budget onto a normal one (and vice versa).
-        retry_idle_budget, retry_read_to = _stream_pacing(retry_model, body)
         again, _prov, _key, _attempts = executor.execute_stream(
             retry_messages, retry_model, providers_for_retry, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=retry_read_to,
-            on_attempt=_log_stream_attempt, **retry_params
+            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT,
+            catalog=catalog, **retry_params
         )
-        return stream_idle.with_idle_timeout(again, retry_idle_budget, log)
+        return stream_idle.with_idle_timeout(again, config.STREAM_IDLE_TIMEOUT, log)
 
     def _hold_for_egress():
         """Wait for a free exit before the mid-stream retry reopens.
@@ -1897,38 +1755,223 @@ async def chat_completions(request: Request):
         )
 
     def event_stream():
-        # OpenCode's SSE bytes are forwarded verbatim. Two things layer on top:
-        # each frame is read in passing to harvest token counts (else streamed
-        # requests record zero usage), and a stream that dies before completion
-        # is retried once on a fresh exit IP (see stream_guard).
-        seen: Dict[str, int] = {}
+        # First bit goes to the client immediately: some chat SDKs (Codex CLI
+        # in particular, and any SSE client with a read-deadline under
+        # STREAM_FIRST_TOKEN_TIMEOUT) drop a streaming connection that hasn't
+        # produced bytes within a few seconds, even though Lingling is working
+        # through proxy rotation. A one-shot SSE comment line is invisible to
+        # the chat model but keeps the connection warm until first chunk.
+        yield b": lingling heartbeat -- streaming start for target=" + target.encode() + b"\n\n"
+        # OpenCode's SSE bytes are forwarded verbatim -- no re-spacing, no field
+        # mirroring, no reasoning rewriting. Two things are layered on top:
+        #   1. each frame is *read* in passing to harvest token counts, without
+        #      which every streamed request records zero usage;
+        #   2. a stream that dies before the model reported completion is
+        #      retried once on a fresh exit IP (see stream_guard).
+        seen: Dict[str, Any] = {}
         outcome = stream_guard.StreamOutcome()
         try:
-            yield from stream_guard.guarded_stream(
-                open_stream=_reopen,
-                # Wrapped in the idle watchdog: a stream that stops speaking
-                # without closing raises StreamStalled, which guarded_stream
-                # already treats as a mid-flight death and retries once. The
-                # budget is model-aware: a hidden-reasoning model is allowed a
-                # longer silent thinking pause (see _stream_pacing).
-                first=stream_idle.with_idle_timeout(
-                    stream_iter, stream_idle_budget, log),
-                outcome=outcome,
-                on_chunk=lambda raw: _harvest_stream_usage(raw, seen),
-                log=log,
-                enabled=recover,
-                hold=_hold_for_egress,
-                # Reports the model the retry landed on, so the reset frame can
-                # say "different model" rather than always claiming a new exit IP.
-                retry_model=lambda: (
-                    reroute["model"] if reroute["model"] != target else None
+            # Buffer the first stream so an empty never reaches the CLI.
+            # Per latest user request: "that message will never reach the user,
+            # Lingling will just rerun until it actually starts streaming."
+            buf: list[bytes] = []
+            for chunk in stream_with_blank_chat_recovery(
+                stream_guard.guarded_stream(
+                    open_stream=_reopen,
+                    first=stream_idle.with_idle_timeout(
+                        stream_iter, config.STREAM_IDLE_TIMEOUT, log),
+                    outcome=outcome,
+                    on_chunk=lambda raw: _harvest_stream_usage(raw, seen),
+                    log=log,
+                    enabled=recover,
+                    hold=_hold_for_egress,
+                    retry_model=lambda: (
+                        reroute["model"] if reroute["model"] != target else None
+                    ),
                 ),
-                # The resolved target: so a hidden-reasoning model can be learned
-                # from its wire behaviour (reasoning tokens, or a stall before any
-                # visible content) and given thinking patience on the retry / next
-                # turn via _stream_pacing -> pacing_memory.
-                model_id=target,
-            )
+                outcome, seen, requested, target, log,
+            ):
+                buf.append(chunk)
+            # Any visible content? A Responses-only model (muse-spark-style:
+            # hidden reasoning tokens) can stream a whole turn with visible==0
+            # even though reasoning may be present — treat any visible==0 as
+            # empty and retry silently.
+            is_empty = seen.get("_visible_content_chars", 0) == 0
+            # Retry on any empty, not just xhigh — user confirmed minimal also blanks,
+            # so the culprit is response pattern/translation, not effort. Any
+            # Responses-only model empty at any effort should be retried silently.
+            is_spark = _is_responses_only_model(target)
+            eff = str(params.get("reasoning_effort") or original_effort or "")
+            should_retry = is_empty and is_spark
+            if should_retry:
+                has_reasoning = bool(seen.get("_reasoning_text", "").strip()) or (seen.get("reasoning_tokens", 0) or 0) > 0
+                if has_reasoning:
+                    # The model was mid-think when the upstream closed the
+                    # stream (reasoning frames present, zero visible content).
+                    # A fresh lane gives the same model another shot at
+                    # completing its thinking phase and producing visible text.
+                    # This sits before the effort-downgrade step because the
+                    # model wasn't struggling with effort -- it was cut off.
+                    log.warning(
+                        "chat stream blank with reasoning (reasoning_tokens=%s) -- "
+                        "retrying same model on fresh egress before downgrade",
+                        seen.get("reasoning_tokens", 0),
+                    )
+                    try:
+                        same_params = dict(params)
+                        _resolve_effort(same_params, target, previous=original_effort)
+                        same_iter, _, _, _ = executor.execute_stream(
+                            _messages_for_model(messages, target, had_images),
+                            target, target_providers, proxy_pool=proxy_pool,
+                            session_id=session_id,
+                            timeout=config.STREAM_FIRST_TOKEN_TIMEOUT,
+                            catalog=catalog, **same_params,
+                        )
+                        same_seen: Dict[str, Any] = {}
+                        same_outcome = stream_guard.StreamOutcome()
+                        def _same_model_reopen():
+                            fresh, _, _, _ = executor.execute_stream(
+                                _messages_for_model(messages, target, had_images),
+                                target, target_providers, proxy_pool=proxy_pool,
+                                session_id=session_id,
+                                timeout=config.STREAM_FIRST_TOKEN_TIMEOUT,
+                                catalog=catalog, **same_params,
+                            )
+                            return stream_idle.with_idle_timeout(
+                                fresh, config.STREAM_IDLE_TIMEOUT, log)
+                        for chunk in stream_guard.guarded_stream(
+                            open_stream=_same_model_reopen,
+                            first=stream_idle.with_idle_timeout(
+                                same_iter, config.STREAM_IDLE_TIMEOUT, log),
+                            outcome=same_outcome,
+                            on_chunk=lambda raw: _harvest_stream_usage(raw, same_seen),
+                            log=log,
+                            enabled=recover,
+                            hold=_hold_for_egress,
+                            retry_model=lambda: None,
+                        ):
+                            yield chunk
+                        # If the fresh-lane retry produced visible content, the
+                        # model just needed a longer runway. Merge the usage
+                        # and return -- no downgrade or fallback needed.
+                        if same_seen.get("_visible_content_chars", 0) > 0:
+                            seen.update(same_seen)
+                            outcome.recovered = True
+                            outcome.rescue_succeeded = True
+                            outcome.completed = same_outcome.completed or outcome.completed
+                            return
+                        # Still blank on fresh lane -- fall through to
+                        # downgrade / fallback below.
+                        log.warning(
+                            "chat stream blank on fresh lane too -- "
+                            "falling through to downgrade/fallback"
+                        )
+                    except Exception as same_exc:
+                        log.warning(
+                            "chat stream same-model fresh-lane retry failed: %s "
+                            "-- falling through to downgrade/fallback", same_exc,
+                        )
+                # Try downgrade first if high effort, else fallback model — per user request
+                # the response pattern/translation is the culprit, not effort, so any
+                # Responses-only empty at any effort should be retried, silently, without notice.
+                downgrade_map = {"xhigh": "high", "max": "xhigh", "ultra": "max", "high": "medium", "medium": "low", "low": "minimal"}
+                downgraded = downgrade_map.get(eff.lower()) if eff else None
+                if downgraded:
+                    log.warning("chat stream blank detected target=%s effort=%s visible=0 — silent retry downgraded %s -> %s (empty never forwarded)", target, eff, downgraded, target)
+                    try:
+                        retry_params = dict(params)
+                        retry_params["reasoning_effort"] = downgraded
+                        _resolve_effort(retry_params, target)
+                        retry_iter, retry_prov, retry_key, _ = executor.execute_stream(
+                            _messages_for_model(messages, target, had_images),
+                            target, target_providers, proxy_pool=proxy_pool,
+                            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, catalog=catalog, **retry_params
+                        )
+                        def _downgrade_reopen():
+                            """Fresh stream for mid-flight retry after a
+                            downgrade-attempt break. Must NOT reuse
+                            ``retry_iter`` -- that generator is already being
+                            consumed by ``first``, so re-entering it raises
+                            "generator already executing" and the retry is
+                            wasted. Going back through ``execute_stream``
+                            picks a fresh exit IP under normal pool policy,
+                            same as the non-downgrade ``_reopen`` path."""
+                            fresh, _, _, _ = executor.execute_stream(
+                                _messages_for_model(messages, target, had_images),
+                                target, target_providers, proxy_pool=proxy_pool,
+                                session_id=session_id,
+                                timeout=config.STREAM_FIRST_TOKEN_TIMEOUT,
+                                catalog=catalog, **retry_params
+                            )
+                            return stream_idle.with_idle_timeout(
+                                fresh, config.STREAM_IDLE_TIMEOUT, log)
+                        retry_seen: Dict[str, Any] = {}
+                        retry_outcome = stream_guard.StreamOutcome()
+                        for chunk in stream_guard.guarded_stream(
+                            open_stream=_downgrade_reopen,
+                            first=stream_idle.with_idle_timeout(retry_iter, config.STREAM_IDLE_TIMEOUT, log),
+                            outcome=retry_outcome,
+                            on_chunk=lambda raw: _harvest_stream_usage(raw, retry_seen),
+                            log=log,
+                            enabled=recover,
+                            hold=_hold_for_egress,
+                            retry_model=lambda: None,
+                        ):
+                            yield chunk
+                        seen.update(retry_seen)
+                        outcome.recovered = outcome.recovered or retry_outcome.recovered
+                        outcome.error = retry_outcome.error or outcome.error
+                        outcome.completed = retry_outcome.completed or outcome.completed
+                        return
+                    except Exception as retry_exc:
+                        log.warning("chat stream empty silent retry downgraded failed: %s — trying fallback model", retry_exc)
+                # No downgrade or downgrade failed — fallback to a different free model
+                fallback = dispatcher.fallback_model(catalog, had_images, exclude={target}, messages=messages)
+                fb_provs = catalog.providers_for(fallback) if fallback else None
+                if fallback and fb_provs:
+                    log.warning("chat stream blank — fallback %s -> %s", target, fallback)
+                    try:
+                        retry_params = dict(params)
+                        _resolve_effort(retry_params, fallback, previous=original_effort)
+                        retry_iter2, _, _, _ = executor.execute_stream(
+                            _messages_for_model(messages, fallback, had_images),
+                            fallback, fb_provs, proxy_pool=proxy_pool,
+                            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, catalog=catalog, **retry_params
+                        )
+                        def _fallback_reopen():
+                            """Fresh stream for mid-flight retry after a
+                            fallback-model break. Must NOT reuse
+                            ``retry_iter2`` -- that generator is already
+                            being consumed by ``first``, so re-entering it
+                            raises "generator already executing" and the
+                            retry is wasted. Going back through
+                            ``execute_stream`` picks a fresh exit IP under
+                            normal pool policy."""
+                            fresh2, _, _, _ = executor.execute_stream(
+                                _messages_for_model(messages, fallback, had_images),
+                                fallback, fb_provs, proxy_pool=proxy_pool,
+                                session_id=session_id,
+                                timeout=config.STREAM_FIRST_TOKEN_TIMEOUT,
+                                catalog=catalog, **retry_params
+                            )
+                            return stream_idle.with_idle_timeout(
+                                fresh2, config.STREAM_IDLE_TIMEOUT, log)
+                        for chunk in stream_guard.guarded_stream(
+                            open_stream=_fallback_reopen,
+                            first=stream_idle.with_idle_timeout(retry_iter2, config.STREAM_IDLE_TIMEOUT, log),
+                            outcome=stream_guard.StreamOutcome(),
+                            on_chunk=lambda raw: _harvest_stream_usage(raw, seen),
+                            log=log,
+                            enabled=recover,
+                            hold=_hold_for_egress,
+                            retry_model=lambda: None,
+                        ):
+                            yield chunk
+                        return
+                    except Exception as fb_exc:
+                        log.warning("chat stream fallback also failed: %s", fb_exc)
+            # Not retrying or retry failed — flush the original (may be empty, but now rare)
+            yield from buf
         finally:
             if outcome.error:
                 status = "stream_broken"
@@ -1953,9 +1996,14 @@ async def chat_completions(request: Request):
                 routed_by=reroute["by"] if reroute["model"] != target else None,
                 reason=reroute["reason"] if reroute["model"] != target else None,
             )
-            if outcome.recovered:
+            if outcome.error:
+                log.warning(
+                    "chat stream rescue failed target=%s attempts=%d error=%s",
+                    reroute["model"], outcome.attempts, outcome.error,
+                )
+            elif outcome.rescue_succeeded:
                 log.info(
-                    "chat: recovered target=%s attempts=%d",
+                    "chat stream recovered target=%s attempts=%d",
                     reroute["model"], outcome.attempts,
                 )
 
@@ -1965,14 +2013,6 @@ async def chat_completions(request: Request):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            # X-Lingling-* mirror the routing decision onto the response headers
-            # so a client or operator tool can see where a turn actually went
-            # without parsing the body's ``lingling`` key (the /v1/responses and
-            # /v1/messages entrypoints carry the same set). `_header_safe`
-            # latin-1-safe sanitises the model-generated `reason` -- its em-dashes
-            # and smart quotes would otherwise abort the whole response. Stream-Mode
-            # tells the client whether a mid-flight retry ("guarded") is opt-out
-            # for this turn (see ``lingling_recover`` / STREAM_RECOVERY).
             "X-Lingling-Routed-Model": _header_safe(target),
             "X-Lingling-Routed-By": _header_safe(routed_by),
             "X-Lingling-Reason": _header_safe(reason),
@@ -1993,7 +2033,6 @@ async def responses(request: Request):
     same dispatcher, executor, proxy pool, and usage ledger as `/v1/chat/completions`.
     """
     request_started = time.time()
-    call_type = "responses"
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -2006,10 +2045,6 @@ async def responses(request: Request):
         raise HTTPException(400, str(exc))
 
     stream = bool(body.get("stream"))
-    log.info(
-        "responses: received POST requested=%s stream=%s",
-        requested, stream,
-    )
     session_id = request.headers.get("session-id") or body.get("prompt_cache_key", "")
     if not isinstance(session_id, str):
         session_id = ""
@@ -2026,28 +2061,31 @@ async def responses(request: Request):
             if bare != target and catalog.providers_for(bare):
                 target = bare
             else:
-                if catalog.is_unavailable(target):
-                    raise HTTPException(400, f"Model {requested!r} is no longer served for free by OpenCode; pick from /v1/models.")
                 raise HTTPException(400, f"Unknown or unsupported model: {requested!r}")
         reason = "user requested"
         routed_by = "user"
+        if catalog.is_burned(target) or catalog.is_blacklisted(target):
+            fallback = dispatcher.fallback_model(
+                catalog, had_images, exclude={target}, messages=messages,
+            )
+            if not (fallback and fallback != target and catalog.providers_for(fallback)):
+                raise HTTPException(
+                    503, f"explicit pick {requested!r} is unavailable, no live substitute",
+                )
+            log.info("reroute %s -> %s (explicit pick unavailable)", target, fallback)
+            target = fallback
+            reason = f"explicit pick {requested!r} was burned; rerouted by recycler"
+            routed_by = "recycler-reroute"
 
     target_providers = catalog.providers_for(target)
     if not target_providers:
-        raise HTTPException(
-            503, f"No provider available for model '{target}'.",
-            headers=_failure_provenance_headers(target, routed_by, reason),
-        )
+        raise HTTPException(503, f"No provider available for model '{target}'.")
     target_lm = catalog.by_id(target)
     if target_lm is not None and not target_lm.vision:
         messages = vision_bridge.strip_images_for_text_model(messages)
-    # Capture the client's effort before _resolve_effort mutates ``params``:
-    # afterwards ``reasoning_effort`` holds the clamped value the upstream got,
-    # and failover would re-clamp the clamps against the fallback instead of the
-    # value the client asked for (the same pitfall _resolve_effort's ``previous``
-    # branch was added to escape).
     original_effort = params.get("reasoning_effort")
     _resolve_effort(params, target)
+    call_type = "responses"
 
     if not stream:
         started = time.time()
@@ -2055,14 +2093,16 @@ async def responses(request: Request):
             resp, prov, key, attempts = await _execute_with_egress_wait(
                 executor.execute_nonstream,
                 messages, target, target_providers, proxy_pool=proxy_pool,
-                session_id=session_id, **params
+                session_id=session_id, catalog=catalog, **params
             )
         except executor.AllFailedError as exc:
             # Fall back to another model, exactly as the chat path does. Without
             # this a rate-limited free tier returned a hard 503 to Codex while
             # Cline silently got an answer from a different model.
+            # Model-class burning is owned by ``executor``, not this catch, so
+            # we do not double-count here.
             fallback = dispatcher.fallback_model(
-                catalog, had_images, exclude={target} | set(sampler.cooked_models()), messages=messages,
+                catalog, had_images, exclude={target}, messages=messages,
             )
             fallback_providers = catalog.providers_for(fallback)
             if not (fallback and fallback != target and fallback_providers):
@@ -2073,10 +2113,7 @@ async def responses(request: Request):
                     last_upstream_status=getattr(getattr(exc, "last_error", None), "status_code", None),
                     rerouted=(routed_by == "fallback"),
                 )
-                raise HTTPException(
-                    503, f"All providers exhausted for '{target}'.",
-                    headers=_failure_provenance_headers(target, routed_by, reason),
-                )
+                raise HTTPException(503, f"All providers exhausted for '{target}'.")
             try:
                 retry_params = dict(params)
                 _resolve_effort(retry_params, fallback, previous=original_effort)
@@ -2084,7 +2121,7 @@ async def responses(request: Request):
                     executor.execute_nonstream,
                     _messages_for_model(messages, fallback, had_images),
                     fallback, fallback_providers, proxy_pool=proxy_pool,
-                    session_id=session_id, **retry_params
+                    session_id=session_id, catalog=catalog, **retry_params
                 )
             except (executor.AllFailedError, executor.NoProviderError) as fallback_exc:
                 usage_store.log(
@@ -2096,17 +2133,14 @@ async def responses(request: Request):
                     last_upstream_status=getattr(getattr(fallback_exc, "last_error", None), "status_code", None),
                     rerouted=(routed_by == "fallback"),
                 )
-                raise HTTPException(
-                    503, f"All providers exhausted for '{target}'.",
-                    headers=_failure_provenance_headers(target, routed_by, reason),
-                )
+                raise HTTPException(503, f"All providers exhausted for '{target}'.")
             attempts = exc.attempts + attempts2
             target = fallback
             reason = f"primary model failed ({exc.last_error}); fell back to {fallback}"
             routed_by = "fallback"
         usage = extract_usage(resp)
         account_id = key.id if key is not None else None
-        usage_store.log(
+        row_id = usage_store.log(
             requested, target, routed_by, reason,
             tokens_in=usage["tokens_in"], tokens_out=usage["tokens_out"],
             reasoning_tokens=usage.get("reasoning_tokens", 0),
@@ -2120,134 +2154,106 @@ async def responses(request: Request):
             "requested_model": requested, "routed_by": routed_by,
             "reason": reason, "account": account_id, "attempts": attempts,
         })
+        # Muse Spark's upstream intermittently completes a turn with no output
+        # items at all (see the blank-retry helper above). The old fix retried
+        # with downgraded effort or a fallback model and, when both failed,
+        # returned the empty response anyway -- Codex rendered that as an empty
+        # assistant turn. Re-run the same request on fresh egress instead; only
+        # if every attempt comes back blank do we surface an honest notice.
+        if _responses_output_blank(out):
+            retried = await _responses_blank_retry(
+                messages, target, target_providers, params,
+                session_id=session_id, had_images=had_images,
+                requested=requested, original_effort=original_effort,
+            )
+            if retried is not None:
+                out = retried
+                out["lingling"].update({
+                    "requested_model": requested, "routed_by": routed_by,
+                    "reason": reason, "account": account_id, "attempts": attempts,
+                })
+                # The ledger row was opened with the blank first attempt's
+                # zero usage; rewrite it with the retry's real numbers so the
+                # 0/0/0 rows that made this bug visible stop being recorded.
+                ru = out.get("usage") or {}
+                rdet = ru.get("output_tokens_details") or {}
+                usage_store.finalize(
+                    row_id,
+                    tokens_in=int(ru.get("input_tokens", 0) or 0),
+                    tokens_out=int(ru.get("output_tokens", 0) or 0),
+                    reasoning_tokens=int(rdet.get("reasoning_tokens", 0) or 0),
+                )
+            else:
+                notice = _responses_blank_notice(target, _RESPONSES_BLANK_MAX_ATTEMPTS)
+                out["output"] = [{
+                    "id": f"msg_{int(time.time() * 1000)}",
+                    "type": "message", "role": "assistant", "status": "completed",
+                    "content": [{"type": "output_text", "text": notice, "annotations": []}],
+                }]
+                usage_store.finalize(
+                    row_id, error=f"blank after {_RESPONSES_BLANK_MAX_ATTEMPTS} attempts",
+                )
+                log.warning(
+                    "responses blank after %d attempts target=%s -- returning notice",
+                    _RESPONSES_BLANK_MAX_ATTEMPTS, target,
+                )
         log.info(
-            "responses: handled requested=%s target=%s provider=%s stream=false latency_ms=%.1f",
-            requested, target, prov.id, (time.time() - request_started) * 1000.0,
+            "%s  ----  %dms",
+            target, int((time.time() - request_started) * 1000.0),
         )
         return JSONResponse(out)
 
-    # Hidden-reasoning models get a longer silent-thinking patience; see chat.
-    stream_idle_budget, stream_read_to = _stream_pacing(target, body)
-    # Same recovery contract as the chat path: a stream that breaks after
-    # HTTP 200 is retried once on a fresh exit IP. Opt-out per request with
-    # `lingling_recover: false` or via LINGLING_STREAM_RECOVERY. Without it, a
-    # break here was terminal `stream_broken` (the dashboard counted 80 lost
-    # muse-spark turns in one hour on this path while the chat path recovered
-    # its 2). The Responses wire has no chat-path `lingling_reset` to discard
-    # rendered deltas; the bridge flushes in-flight items with `.done`
-    # (status `incomplete`) and the fresh-egress retry opens new
-    # `response.output_item.added` events.
-    recover = bool(body.get("lingling_recover", config.STREAM_RECOVERY))
+    original_stream_target = target
+    original_stream_reason = reason
+    original_stream_by = routed_by
     started = time.time()
     try:
         stream_iter, prov, key, attempts = await _execute_with_egress_wait(
             executor.execute_stream,
             messages, target, target_providers, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=stream_read_to,
-            on_attempt=_log_stream_attempt, **params
+            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, catalog=catalog, **params
         )
     except (executor.AllFailedError, executor.NoProviderError) as exc:
-        # Surface the actual upstream rejection. The 503 message and the usage
-        # ledger never show it today -- every exhaustion reads as the same
-        # generic "No upstream stream started within X s" -- so a Codex-shaped
-        # turn that OpenCode answers with, say, a 400 over a tool-calls payload
-        # is indistinguishable from a 429 IP burn. The status + detail here let
-        # the dashboard, the log and the returned 503 all name the real cause.
-        error = str(getattr(exc, "last_error", exc))
-        last_status = getattr(getattr(exc, "last_error", None), "status_code", None)
-        log.warning(
-            "responses stream: all upstream attempts failed target=%s last_status=%s "
-            "error=%s",
-            target, last_status, error[:300],
-        )
-
-        # Pre-HTTP-200 fallback: mirror the chat non-stream path's contract. The
-        # streaming catch is fired *before* any bytes are on the wire (execute_stream
-        # raises AllFailedError while waiting for the first chunk), so there is no
-        # half-written answer to discard and a model swap is safe -- exactly the
-        # window the chat non-stream handler already fell back in. The streaming
-        # path had no analogue, so Codex 0.146 took the terminal 503 here as a
-        # session-killing error while a one-line curl through /v1/chat/completions
-        # (whose non-stream branch falls back) recovered. Only route onto a model
-        # the sampler has not proven cooked -- retrying onto a model every green
-        # exit already refused would just exhaust again.
         fallback = dispatcher.fallback_model(
-            catalog, had_images,
-            exclude={target} | set(sampler.cooked_models()), messages=messages,
+            catalog, had_images, exclude={target}, messages=messages,
         )
         fallback_providers = catalog.providers_for(fallback) if fallback else None
-        if not (fallback and fallback != target and fallback_providers):
+        if fallback and fallback != target and fallback_providers:
+            try:
+                retry_params = dict(params)
+                _resolve_effort(retry_params, fallback, previous=original_effort)
+                retry_msgs = _messages_for_model(messages, fallback, had_images)
+                stream_iter, prov, key, attempts2 = await _execute_with_egress_wait(
+                    executor.execute_stream,
+                    retry_msgs, fallback, fallback_providers, proxy_pool=proxy_pool,
+                    session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, catalog=catalog, **retry_params
+                )
+                target = fallback
+                target_providers = fallback_providers
+                reason = f"primary stream failed ({exc.last_error}); fell back to {fallback}"
+                routed_by = "fallback"
+                attempts = list(getattr(exc, "attempts", [])) + list(attempts2)
+            except (executor.AllFailedError, executor.NoProviderError) as fallback_exc:
+                error = str(getattr(fallback_exc, "last_error", fallback_exc))
+                usage_store.log(
+                    requested, original_stream_target, original_stream_by, original_stream_reason,
+                    status="exhausted", had_images=had_images, error=error[:300],
+                    call_type=call_type,
+                    attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
+                    last_upstream_status=getattr(getattr(fallback_exc, "last_error", None), "status_code", None),
+                    rerouted=(routed_by == "fallback"),
+                )
+                raise HTTPException(503, f"No upstream stream started within {config.STREAM_FIRST_TOKEN_TIMEOUT:g}s for '{target}'.")
+        else:
+            error = str(getattr(exc, "last_error", exc))
             usage_store.log(
                 requested, target, routed_by, reason, status="exhausted",
                 had_images=had_images, error=error[:300],
                 call_type=call_type, attempts=len(getattr(exc, "attempts", [])),
-                last_upstream_status=last_status,
+                last_upstream_status=getattr(getattr(exc, "last_error", None), "status_code", None),
                 rerouted=(routed_by == "fallback"),
             )
-            raise HTTPException(
-                503,
-                f"No upstream stream started within {stream_read_to:g}s for '{target}' "
-                f"(last upstream status {last_status}).",
-                headers=_failure_provenance_headers(target, routed_by, reason),
-            )
-        log.warning(
-            "responses stream rerouting %s -> %s (primary exhausted, last_status=%s)",
-            target, fallback, last_status,
-        )
-        retry_params = dict(params)
-        _resolve_effort(retry_params, fallback, previous=original_effort)
-        retry_messages = _messages_for_model(messages, fallback, had_images)
-        # The retry may land on a non-reasoning model whose thinking patience is
-        # shorter than muse-spark's -- re-derive pacing so the idle watchdog is
-        # not tuned for the dead model.
-        retry_idle_budget, retry_read_to = _stream_pacing(fallback, body)
-        try:
-            stream_iter, prov, key, attempts2 = await _execute_with_egress_wait(
-                executor.execute_stream,
-                retry_messages, fallback, fallback_providers, proxy_pool=proxy_pool,
-                session_id=session_id, timeout=retry_read_to,
-                on_attempt=_log_stream_attempt, **retry_params
-            )
-        except (executor.AllFailedError, executor.NoProviderError) as fallback_exc:
-            fb_error = str(getattr(fallback_exc, "last_error", fallback_exc))
-            fb_last_status = getattr(
-                getattr(fallback_exc, "last_error", None), "status_code", None,
-            )
-            log.warning(
-                "responses stream: fallback %s also exhausted target=%s "
-                "last_status=%s error=%s",
-                fallback, target, fb_last_status, fb_error[:300],
-            )
-            usage_store.log(
-                requested, target, routed_by, reason, status="exhausted",
-                had_images=had_images,
-                error=f"{error[:150]} || {fb_error[:150]}",
-                call_type=call_type,
-                attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
-                last_upstream_status=fb_last_status,
-                rerouted=(routed_by == "fallback"),
-            )
-            raise HTTPException(
-                503,
-                f"All providers exhausted for '{target}' "
-                f"(primary last status {last_status}; fallback {fallback} last "
-                f"status {fb_last_status}).",
-                headers=_failure_provenance_headers(target, routed_by, reason),
-            )
-        # The fallback opened cleanly -- rebind routing metadata the rest of the
-        # handler streams against (its own headers, ledger, _reopen, watchdog
-        # frames must name the model the answer actually came from). The same
-        # rewrite the chat non-stream path does on a successful fallback, plus
-        # re-derived pacing so streaming recovery / idle-timeout budgets match
-        # the model now riding the wire.
-        attempts = list(getattr(exc, "attempts", [])) + list(attempts2)
-        target = fallback
-        target_providers = fallback_providers
-        params = retry_params
-        stream_idle_budget, stream_read_to = retry_idle_budget, retry_read_to
-        reason = f"primary stream failed ({getattr(exc, 'last_error', exc)}); " \
-                 f"fell back to {fallback}"
-        routed_by = "fallback"
+            raise HTTPException(503, f"No upstream stream started within {config.STREAM_FIRST_TOKEN_TIMEOUT:g}s for '{target}'.")
 
     account_id = key.id if key is not None else None
     row_id = usage_store.log(
@@ -2258,33 +2264,19 @@ async def responses(request: Request):
         last_upstream_status=None, rerouted=(routed_by == "fallback"),
     )
     log.info(
-        "responses: streaming requested=%s target=%s provider=%s first_chunk_ms=%.1f attempts=%d",
-        requested, target, prov.id, (time.time() - request_started) * 1000.0, len(attempts),
+        "%s  ----  firstchunk %dms",
+        target, int((time.time() - request_started) * 1000.0),
     )
 
-    # Mid-flight recovery may land on a different model, but only when the
-    # client asked the router to choose -- mirrors the chat handler's _reopen. A
-    # turn that named `muse-spark-1.2-contributor-free` is retried on the same
-    # model; `lingling-auto` is free to re-decide, which matters because the
-    # usual reason a stream dies mid-flight is the model itself stalling.
     auto_routed = requested == config.MULTIMODEL_ID
     reroute = {"model": target, "reason": reason, "by": routed_by}
 
     def _reopen():
-        """Open a replacement upstream stream for mid-flight recovery.
-
-        Mirrors the chat handler's `_reopen`: a fresh exit IP through the
-        executor, a re-decided model only when the turn was auto-routed, and
-        effort re-resolved against the client's original label. The retry yields
-        chat-completions SSE -- the bridge translates it to Responses events the
-        same way it does for the original stream.
-        """
         retry_model = target
         retry_params = params
         if auto_routed:
             alternative = dispatcher.fallback_model(
-                catalog, had_images,
-                exclude={target} | set(sampler.cooked_models()), messages=messages,
+                catalog, had_images, exclude={target}, messages=messages,
             )
             alt_providers = catalog.providers_for(alternative)
             if alternative and alternative != target and alt_providers:
@@ -2296,91 +2288,118 @@ async def responses(request: Request):
                     "reason": f"stream broke on {target}; rerouted to {retry_model}",
                     "by": "reroute",
                 })
-                log.warning(
-                    "responses stream rerouting mid-flight: %s -> %s", target, retry_model,
-                )
+                log.warning("responses stream rerouting mid-flight: %s -> %s", target, retry_model)
         providers_for_retry = catalog.providers_for(retry_model) or target_providers
-        # A text-only retry target cannot see images the stalled vision model
-        # could; swap them for the placeholder the non-streaming fallback uses,
-        # or OpenCode answers 400 and the retry is wasted.
         retry_messages = _messages_for_model(messages, retry_model, had_images)
-        # The retry may land on a different model: re-derive its thinking
-        # patience so a reroute off a hidden-reasoning model does not carry the
-        # long budget onto a normal one (and vice versa).
-        retry_idle_budget, retry_read_to = _stream_pacing(retry_model, body)
-        again, _prov, _key, _attempts = executor.execute_stream(
-            retry_messages, retry_model, providers_for_retry,
-            proxy_pool=proxy_pool, session_id=session_id, timeout=retry_read_to,
-            on_attempt=_log_stream_attempt, **retry_params
+        again, _, _, _ = executor.execute_stream(
+            retry_messages, retry_model, providers_for_retry, proxy_pool=proxy_pool,
+            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT,
+            catalog=catalog, **retry_params
         )
-        return stream_idle.with_idle_timeout(again, retry_idle_budget, log)
+        return stream_idle.with_idle_timeout(again, config.STREAM_IDLE_TIMEOUT, log)
 
     def _hold_for_egress():
-        """Wait for a free exit before the mid-stream retry reopens (responses).
-
-        Same decision as the chat path's pre-first-token wait, but running inside
-        a live SSE response, so it emits keepalive comments rather than awaiting
-        silently. Yields nothing when waiting cannot help.
-        """
-        yield from parking.hold_stream_for_egress(
-            proxy_pool, config.EGRESS_WAIT_BUDGET, log,
-        )
+        yield from parking.hold_stream_for_egress(proxy_pool, config.EGRESS_WAIT_BUDGET, log)
 
     def event_stream():
+        # See /v1/chat/completions same comment: clients (Codex CLI in particular)
+        # drop a connection that's silent across STREAM_FIRST_TOKEN_TIMEOUT while
+        # Lingling is rolling through proxies. SSE comment lines are transparent
+        # to the Responses translator but keep the socket warm.
+        yield b": lingling heartbeat -- streaming start for target=" + target.encode() + b"\n\n"
         seen: Dict[str, int] = {}
-        # stream_guard retries once on a fresh exit IP when the upstream dies
-        # mid-flight, and keeps completion honest for OpenCode's no-[DONE] wire:
-        # a usage/cost frame flips outcome.completed (the bridge's choice-level
-        # finish_reason check misses it), so a fully-successful turn that simply
-        # omitted finish_reason is no longer filed stream_broken. The bridge
-        # reports the outcome, so a recovered break is filed as ok_recovered and
-        # an unrecoverable one as stream_broken -- no more silent ok_stream on a
-        # turn the editor rendered half of.
         outcome = stream_guard.StreamOutcome()
         try:
-            yield from responses_bridge.stream_events(
-                stream_guard.guarded_stream(
+            # Muse Spark's upstream intermittently completes a stream with no
+            # content deltas and no usage (the ledger's 0/0/0 rows). The old
+            # fix buffered the entire first stream to detect that, so the
+            # client stared at silence for the whole attempt (up to 67s), then
+            # silently retried with downgraded effort or a fallback model and
+            # could still flush the empty buffer. Instead: stream the first
+            # attempt live, and only when it lands blank re-run the request on
+            # fresh egress (bounded, so a bad stretch cannot loop forever).
+            # The first non-blank attempt is streamed to the client as it
+            # arrives; if every attempt comes back blank, the honest notice is
+            # the answer.
+            for attempt in range(1, _RESPONSES_BLANK_MAX_ATTEMPTS + 1):
+                attempt_seen: Dict[str, int] = {}
+                attempt_outcome = stream_guard.StreamOutcome()
+                attempt_iter = stream_iter if attempt == 1 else None
+                if attempt_iter is None:
+                    try:
+                        attempt_iter, _prov, _key, _ = executor.execute_stream(
+                            _messages_for_model(messages, target, had_images),
+                            target, target_providers, proxy_pool=proxy_pool,
+                            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT,
+                            catalog=catalog, **params
+                        )
+                    except (executor.AllFailedError, executor.NoProviderError) as exc:
+                        log.warning(
+                            "responses stream blank retry attempt %d/%d failed to start: %s",
+                            attempt, _RESPONSES_BLANK_MAX_ATTEMPTS,
+                            getattr(exc, "last_error", exc),
+                        )
+                        break
+                guarded = stream_guard.guarded_stream(
                     open_stream=_reopen,
-                    # Idle watchdog first: an upstream that stops speaking
-                    # without closing would otherwise hold the turn open
-                    # indefinitely. StreamStalled is treated by guarded_stream
-                    # as a mid-flight death and retried once on a fresh exit IP.
-                    # The budget is model-aware so a hidden-reasoning model
-                    # (muse-spark) is not cut off mid-thought (see _stream_pacing).
                     first=stream_idle.with_idle_timeout(
-                        stream_iter, stream_idle_budget, log),
-                    outcome=outcome,
-                    on_chunk=lambda raw: _harvest_stream_usage(raw, seen),
+                        attempt_iter, config.STREAM_IDLE_TIMEOUT, log),
+                    outcome=attempt_outcome,
+                    on_chunk=lambda raw: _harvest_stream_usage(
+                        raw if isinstance(raw, bytes) else raw.encode("utf-8"),
+                        attempt_seen,
+                    ),
                     log=log,
-                    enabled=recover,
+                    enabled=bool(body.get("lingling_recover", config.STREAM_RECOVERY)),
                     hold=_hold_for_egress,
-                    # The model the retry actually landed on, so the bridge's
-                    # reset path (and the ledger) can name it; None when the
-                    # retry did not move (same model, fresh exit IP).
                     retry_model=lambda: (
                         reroute["model"] if reroute["model"] != target else None
                     ),
-                    # The resolved target so pacing_memory can learn a
-                    # hidden-reasoning model from its wire behaviour (a chunk
-                    # that carries reasoning tokens, or a stall before any
-                    # visible content) and give it thinking patience next turn.
-                    model_id=target,
-                ),
-                requested,
-                outcome,
+                )
+                # The bridge's events are the client's view of the turn; the
+                # attempt is blank when no visible text and no tool call ever
+                # reached it. Reasoning-only turns are blank too -- Codex
+                # renders them as an empty assistant message.
+                buf: list[bytes] = []
+                for ev in responses_bridge.stream_events(guarded, requested, attempt_outcome):
+                    buf.append(ev)
+                if attempt_seen.get("_visible_content_chars", 0) > 0 or attempt_seen.get("_tool_calls", 0) > 0:
+                    yield from buf
+                    seen.update(attempt_seen)
+                    outcome.completed = attempt_outcome.completed
+                    outcome.recovered = attempt_outcome.recovered
+                    outcome.rescue_succeeded = attempt_outcome.rescue_succeeded
+                    outcome.error = attempt_outcome.error
+                    outcome.attempts = attempt_outcome.attempts
+                    outcome.text_chars = attempt_outcome.text_chars
+                    return
+                log.warning(
+                    "responses stream blank attempt %d/%d target=%s effort=%s -- "
+                    "upstream completed with no content; retrying on a fresh egress",
+                    attempt, _RESPONSES_BLANK_MAX_ATTEMPTS, target,
+                    params.get("reasoning_effort") or original_effort or "",
+                )
+            # Every attempt came back blank. The honest terminal is a notice,
+            # not a silent empty turn -- Codex renders an empty response as a
+            # broken conversation, and a notice tells the user what happened.
+            notice = _responses_blank_notice(target, _RESPONSES_BLANK_MAX_ATTEMPTS)
+            yield from responses_bridge.stream_events(
+                iter([b'data: {"choices":[{"index":0,"delta":{"content":'
+                      + json.dumps(notice).encode("utf-8")
+                      + b'},"finish_reason":"stop"}]}']),
+                requested, outcome,
+            )
+            log.warning(
+                "responses stream blank after %d attempts target=%s -- returning notice",
+                _RESPONSES_BLANK_MAX_ATTEMPTS, target,
             )
         finally:
             if outcome.error:
-                log.warning(
-                    "responses stream broke target=%s provider=%s - %s",
-                    target, prov.id, outcome.error,
-                )
-            if outcome.recovered:
-                status = "ok_recovered"
-            elif outcome.error:
                 status = "stream_broken"
+            elif outcome.recovered:
+                status = "ok_recovered"
             else:
-                status = None  # keep ok_stream
+                status = None if outcome.completed else "stream_broken"
             usage_store.finalize(
                 row_id,
                 tokens_in=seen.get("tokens_in", 0),
@@ -2389,16 +2408,18 @@ async def responses(request: Request):
                 latency_ms=(time.time() - started) * 1000.0,
                 status=status,
                 error=outcome.error,
-                # A mid-flight reroute means the answer came from a different
-                # model than the row was opened with. Recording the original
-                # would make the ledger name a model that produced nothing.
                 routed_model=reroute["model"] if reroute["model"] != target else None,
                 routed_by=reroute["by"] if reroute["model"] != target else None,
                 reason=reroute["reason"] if reroute["model"] != target else None,
             )
-            if outcome.recovered:
+            if outcome.error:
+                log.warning(
+                    "responses stream rescue failed target=%s attempts=%d error=%s",
+                    reroute["model"], outcome.attempts, outcome.error,
+                )
+            elif outcome.rescue_succeeded:
                 log.info(
-                    "responses: recovered target=%s attempts=%d",
+                    "responses stream recovered target=%s attempts=%d",
                     reroute["model"], outcome.attempts,
                 )
 
@@ -2413,10 +2434,6 @@ async def responses(request: Request):
             "X-Lingling-Reason": _header_safe(reason),
             "X-Lingling-Provider": _header_safe(prov.id),
             "X-Lingling-Account": _header_safe(account_id or ""),
-            # Mirrors the chat path: tells a client (and the dashboard) whether
-            # mid-flight retry is opt-out for this turn (lingling_recover /
-            # STREAM_RECOVERY) or this is a passthrough.
-            "X-Lingling-Stream-Mode": "guarded" if recover else "passthrough",
         },
     )
 
@@ -2427,10 +2444,9 @@ async def messages(request: Request):
     Kept separate from the Codex/Responses handler on purpose: the two wire
     formats share no shape, and folding them together is how one harness's edge
     case becomes the other's regression. Everything below the translation is the
-    same machinery -- dispatcher, executor, WARP egress, parking, ledger.
+    same machinery -- dispatcher, executor, Tor egress, parking, ledger.
     """
     request_started = time.time()
-    call_type = "messages"
     try:
         body = await request.json()
         if not isinstance(body, dict):
@@ -2467,13 +2483,28 @@ async def messages(request: Request):
     else:
         reason = f"claude code asked for {requested}"
         routed_by = "user" if target == model_map.strip_alias(requested) else "alias"
+        # Same burned-reroute the other two entrypoints use, lifted verbatim.
+        # `model_map.resolve` rule-1 returns an explicit-pick by its literal id
+        # whenever the catalog still knows it -- without consulting burned
+        # state -- so a Claude Code request naming a now-burned model would
+        # otherwise be handed straight to the executor (which would 503),
+        # defeating the recycler's "remove from everywhere" intent.
+        if catalog.is_burned(target) or catalog.is_blacklisted(target):
+            fallback = dispatcher.fallback_model(
+                catalog, had_images, exclude={target}, messages=messages_in,
+            )
+            if not (fallback and fallback != target and catalog.providers_for(fallback)):
+                raise HTTPException(
+                    503, f"explicit pick {requested!r} is unavailable, no live substitute",
+                )
+            log.info("reroute %s -> %s (explicit pick unavailable)", target, fallback)
+            target = fallback
+            reason = f"explicit pick {requested!r} was burned; rerouted by recycler"
+            routed_by = "recycler-reroute"
 
     target_providers = catalog.providers_for(target)
     if not target_providers:
-        raise HTTPException(
-            503, f"No provider available for model '{target}'.",
-            headers=_failure_provenance_headers(target, routed_by, reason),
-        )
+        raise HTTPException(503, f"No provider available for model '{target}'.")
 
     target_lm = catalog.by_id(target)
     if target_lm is not None and not target_lm.vision:
@@ -2484,6 +2515,7 @@ async def messages(request: Request):
     # after routing: `low` is legal for ling and meaningless for deepseek, and
     # OpenCode answers 200 for a value it does not implement.
     _resolve_effort(params, target)
+    call_type = "messages"
 
     if not stream:
         started = time.time()
@@ -2491,14 +2523,17 @@ async def messages(request: Request):
             resp, prov, key, attempts = await _execute_with_egress_wait(
                 executor.execute_nonstream,
                 messages_in, target, target_providers, proxy_pool=proxy_pool,
-                session_id=session_id, **params
+                session_id=session_id, catalog=catalog, **params
             )
         except executor.AllFailedError as exc:
             # Same fallback the other two entrypoints do: answering from a
             # different free model beats handing Claude Code a hard failure,
             # which ends its turn.
+            # Model-class burning is owned by ``executor`` for parity with the
+            # chat/responses paths -- single source of truth avoids the
+            # double-count that MAX_MODEL_FAILURES=1 would punish hardest.
             fallback = dispatcher.fallback_model(
-                catalog, had_images, exclude={target} | set(sampler.cooked_models()), messages=messages_in,
+                catalog, had_images, exclude={target}, messages=messages_in,
             )
             fallback_providers = catalog.providers_for(fallback)
             if not (fallback and fallback != target and fallback_providers):
@@ -2509,10 +2544,7 @@ async def messages(request: Request):
                     last_upstream_status=getattr(getattr(exc, "last_error", None), "status_code", None),
                     rerouted=(routed_by == "fallback"),
                 )
-                raise HTTPException(
-                    503, f"All providers exhausted for '{target}'.",
-                    headers=_failure_provenance_headers(target, routed_by, reason),
-                )
+                raise HTTPException(503, f"All providers exhausted for '{target}'.")
             try:
                 retry_params = dict(params)
                 _resolve_effort(retry_params, fallback, previous=original_effort)
@@ -2520,7 +2552,7 @@ async def messages(request: Request):
                     executor.execute_nonstream,
                     _messages_for_model(messages_in, fallback, had_images),
                     fallback, fallback_providers, proxy_pool=proxy_pool,
-                    session_id=session_id, **retry_params
+                    session_id=session_id, catalog=catalog, **retry_params
                 )
                 target = fallback
                 reason = f"primary model failed ({exc.last_error}); fell back to {fallback}"
@@ -2535,10 +2567,7 @@ async def messages(request: Request):
                     last_upstream_status=getattr(getattr(fallback_exc, "last_error", None), "status_code", None),
                     rerouted=(routed_by == "fallback"),
                 )
-                raise HTTPException(
-                    503, f"All providers exhausted for '{target}'.",
-                    headers=_failure_provenance_headers(target, routed_by, reason),
-                )
+                raise HTTPException(503, f"All providers exhausted for '{target}'.")
 
         account_id = key.id if key is not None else None
         usage = extract_usage(resp)
@@ -2555,120 +2584,62 @@ async def messages(request: Request):
             resp, requested, target, prov.id, show_thinking=show_thinking,
         )
         log.info(
-            "messages: handled requested=%s target=%s provider=%s stream=false latency_ms=%.1f",
-            requested, target, prov.id, (time.time() - request_started) * 1000.0,
+            "%s  ----  %dms",
+            target, int((time.time() - request_started) * 1000.0),
         )
         return JSONResponse(out)
 
-    # Hidden-reasoning models get a longer silent-thinking patience; see chat.
-    stream_idle_budget, stream_read_to = _stream_pacing(target, body)
     started = time.time()
     try:
         stream_iter, prov, key, attempts = await _execute_with_egress_wait(
             executor.execute_stream,
             messages_in, target, target_providers, proxy_pool=proxy_pool,
-            session_id=session_id, timeout=stream_read_to,
-            on_attempt=_log_stream_attempt, **params
+            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, catalog=catalog, **params
         )
     except (executor.AllFailedError, executor.NoProviderError) as exc:
-        # Surface the actual upstream rejection so the 503 and the ledger name
-        # the real cause (matches the chat/responses stream paths).
-        error = str(getattr(exc, "last_error", exc))
-        last_status = getattr(getattr(exc, "last_error", None), "status_code", None)
-        log.warning(
-            "messages stream: all upstream attempts failed target=%s last_status=%s "
-            "error=%s",
-            target, last_status, error[:300],
-        )
-
-        # Pre-HTTP-200 fallback: mirror the chat/responses stream paths and this
-        # handler's own non-stream branch. execute_stream raises before any bytes
-        # are on the wire, so a model swap is invisible to Claude Code. Without
-        # this the stream path bare-503'd on a transiently-exhausted model while
-        # the non-stream branch above recovered -- the streaming-vs-non-stream
-        # fallback asymmetry upstream tracks as LiteLLM #25843. Mid-flight
-        # recovery is deliberately NOT added here: Anthropic's streaming event
-        # model has no "discard rendered deltas" marker and Claude Code honours
-        # no synthetic reset, so reopening on a fresh exit would double-render the
-        # partial answer -- the safe recovery window for Anthropic wire is
-        # pre-200 only.
+        # Parity with the chat and Responses stream paths: a 429/5xx burn across
+        # all egress lanes for the primary model should not surface as a 503
+        # when another free model is live. Claude Code renders that 503 as a
+        # dead turn, while an answer from a different model keeps the session.
         fallback = dispatcher.fallback_model(
-            catalog, had_images,
-            exclude={target} | set(sampler.cooked_models()), messages=messages_in,
+            catalog, had_images, exclude={target}, messages=messages_in,
         )
         fallback_providers = catalog.providers_for(fallback) if fallback else None
-        if not (fallback and fallback != target and fallback_providers):
+        if fallback and fallback != target and fallback_providers:
+            try:
+                retry_params = dict(params)
+                _resolve_effort(retry_params, fallback, previous=original_effort)
+                retry_msgs = _messages_for_model(messages_in, fallback, had_images)
+                stream_iter, prov, key, attempts2 = await _execute_with_egress_wait(
+                    executor.execute_stream,
+                    retry_msgs, fallback, fallback_providers, proxy_pool=proxy_pool,
+                    session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT, catalog=catalog, **retry_params
+                )
+                attempts = list(getattr(exc, "attempts", [])) + list(attempts2)
+                target = fallback
+                reason = f"primary stream failed ({exc.last_error}); fell back to {fallback}"
+                routed_by = "fallback"
+            except (executor.AllFailedError, executor.NoProviderError) as fallback_exc:
+                error = str(getattr(fallback_exc, "last_error", fallback_exc))
+                usage_store.log(
+                    requested, target, routed_by, reason, status="exhausted",
+                    had_images=had_images, error=error[:300],
+                    call_type=call_type,
+                    attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
+                    last_upstream_status=getattr(getattr(fallback_exc, "last_error", None), "status_code", None),
+                    rerouted=(routed_by == "fallback"),
+                )
+                raise HTTPException(503, f"No upstream stream started within {config.STREAM_FIRST_TOKEN_TIMEOUT:g}s for '{target}'.")
+        else:
+            error = str(getattr(exc, "last_error", exc))
             usage_store.log(
                 requested, target, routed_by, reason, status="exhausted",
                 had_images=had_images, error=error[:300],
                 call_type=call_type, attempts=len(getattr(exc, "attempts", [])),
-                last_upstream_status=last_status,
+                last_upstream_status=getattr(getattr(exc, "last_error", None), "status_code", None),
                 rerouted=(routed_by == "fallback"),
             )
-            raise HTTPException(
-                503,
-                f"No upstream stream started within {stream_read_to:g}s for '{target}' "
-                f"(last upstream status {last_status}).",
-                headers=_failure_provenance_headers(target, routed_by, reason),
-            )
-        log.warning(
-            "messages stream rerouting %s -> %s (primary exhausted, last_status=%s)",
-            target, fallback, last_status,
-        )
-        retry_params = dict(params)
-        _resolve_effort(retry_params, fallback, previous=original_effort)
-        retry_messages = _messages_for_model(messages_in, fallback, had_images)
-        # Re-derive pacing so the idle watchdog is tuned to the fallback, not the
-        # dead model (a hidden-reasoning primary's long budget would otherwise
-        # carry onto a normal fallback).
-        retry_idle_budget, retry_read_to = _stream_pacing(fallback, body)
-        try:
-            stream_iter, prov, key, attempts2 = await _execute_with_egress_wait(
-                executor.execute_stream,
-                retry_messages, fallback, fallback_providers, proxy_pool=proxy_pool,
-                session_id=session_id, timeout=retry_read_to,
-                on_attempt=_log_stream_attempt, **retry_params
-            )
-        except (executor.AllFailedError, executor.NoProviderError) as fallback_exc:
-            fb_error = str(getattr(fallback_exc, "last_error", fallback_exc))
-            fb_last_status = getattr(
-                getattr(fallback_exc, "last_error", None), "status_code", None,
-            )
-            log.warning(
-                "messages stream: fallback %s also exhausted target=%s last_status=%s "
-                "error=%s",
-                fallback, target, fb_last_status, fb_error[:300],
-            )
-            usage_store.log(
-                requested, target, routed_by, reason, status="exhausted",
-                had_images=had_images,
-                error=f"{error[:150]} || {fb_error[:150]}",
-                call_type=call_type,
-                attempts=len(getattr(exc, "attempts", [])) + len(getattr(fallback_exc, "attempts", [])),
-                last_upstream_status=fb_last_status,
-                rerouted=(routed_by == "fallback"),
-            )
-            raise HTTPException(
-                503,
-                f"All providers exhausted for '{target}' "
-                f"(primary last status {last_status}; fallback {fallback} last "
-                f"status {fb_last_status}).",
-                headers=_failure_provenance_headers(target, routed_by, reason),
-            )
-        # The fallback opened cleanly -- rebind the routing metadata the rest of
-        # the handler streams against (the row opened below, the SSE headers and
-        # the finalize must all name the model the answer came from). Same
-        # rewrite the non-stream branch above does on a successful fallback, plus
-        # re-derived pacing so the live stream's idle budget matches the model now
-        # riding the wire.
-        attempts = list(getattr(exc, "attempts", [])) + list(attempts2)
-        target = fallback
-        target_providers = fallback_providers
-        params = retry_params
-        stream_idle_budget, stream_read_to = retry_idle_budget, retry_read_to
-        reason = f"primary stream failed ({getattr(exc, 'last_error', exc)}); " \
-                 f"fell back to {fallback}"
-        routed_by = "fallback"
+            raise HTTPException(503, f"No upstream stream started within {config.STREAM_FIRST_TOKEN_TIMEOUT:g}s for '{target}'.")
 
     account_id = key.id if key is not None else None
     row_id = usage_store.log(
@@ -2679,11 +2650,72 @@ async def messages(request: Request):
         last_upstream_status=None, rerouted=(routed_by == "fallback"),
     )
     log.info(
-        "messages: streaming requested=%s target=%s provider=%s first_chunk_ms=%.1f",
-        requested, target, prov.id, (time.time() - request_started) * 1000.0,
+        "%s  ----  firstchunk %dms",
+        target, int((time.time() - request_started) * 1000.0),
     )
 
+    # Mid-stream recovery may land on a different model, but only when the
+    # client asked the router to choose (see the chat path's identical logic).
+    auto_routed = requested == config.MULTIMODEL_ID
+    reroute = {"model": target, "reason": reason, "by": routed_by}
+
+    def _reopen():
+        """Open a replacement upstream stream for mid-flight recovery.
+
+        Goes back through the executor, so the retry picks a fresh exit IP under
+        the pool's normal policy rather than reusing the one that just stalled.
+        For an auto-routed turn it also picks a fresh *model*, excluding the one
+        that broke. Only the generator is kept; the chosen model is recorded on
+        `reroute` so the ledger and the log can report where the answer came
+        from.
+        """
+        retry_model = target
+        retry_params = params
+        if auto_routed:
+            alternative = dispatcher.fallback_model(
+                catalog, had_images, exclude={target}, messages=messages_in,
+            )
+            alt_providers = catalog.providers_for(alternative)
+            if alternative and alternative != target and alt_providers:
+                retry_model = alternative
+                retry_params = dict(params)
+                _resolve_effort(retry_params, retry_model, previous=original_effort)
+                reroute.update({
+                    "model": retry_model,
+                    "reason": f"stream broke on {target}; rerouted to {retry_model}",
+                    "by": "reroute",
+                })
+                log.warning(
+                    "messages stream rerouting mid-flight: %s -> %s",
+                    target, retry_model,
+                )
+        providers_for_retry = catalog.providers_for(retry_model) or target_providers
+        retry_messages = _messages_for_model(messages_in, retry_model, had_images)
+        again, _prov, _key, _attempts = executor.execute_stream(
+            retry_messages, retry_model, providers_for_retry, proxy_pool=proxy_pool,
+            session_id=session_id, timeout=config.STREAM_FIRST_TOKEN_TIMEOUT,
+            catalog=catalog, **retry_params
+        )
+        return stream_idle.with_idle_timeout(again, config.STREAM_IDLE_TIMEOUT, log)
+
+    def _hold_for_egress():
+        """Wait for a free exit before the mid-stream retry reopens.
+
+        Same decision as the pre-first-token wait, but this one runs inside a
+        live SSE response, so it emits keepalive comments instead of awaiting
+        silently. Yields nothing when waiting cannot help.
+        """
+        yield from parking.hold_stream_for_egress(
+            proxy_pool, config.EGRESS_WAIT_BUDGET, log,
+        )
+
     def event_stream():
+        # Same heartbeat rationale as the /v1/chat/completions path: the
+        # token-by-token Anthropic Messages SSE channel has no event to emit
+        # before first byte (no ``message_start`` until upstream speaks), so
+        # the connection would sit silent across a slow proxy hand-off. A one-
+        # shot SSE comment keeps the socket warm until the first frame.
+        yield b": lingling heartbeat -- streaming start for target=" + target.encode() + b"\n\n"
         seen: Dict[str, int] = {}
         outcome = stream_guard.StreamOutcome()
         try:
@@ -2692,23 +2724,44 @@ async def messages(request: Request):
                 # closing would otherwise hold the turn open indefinitely -- one
                 # measured session sat 885s with zero tokens before giving up.
                 # StreamStalled is caught below and ends the turn honestly rather
-                # than propagating into a broken SSE response. The budget is
-                # model-aware so a hidden-reasoning model that thinks silently is
-                # not cut off mid-thought (see _stream_pacing).
+                # than propagating into a broken SSE response.
                 guarded = stream_idle.with_idle_timeout(
-                    stream_iter, stream_idle_budget, log)
+                    stream_iter, config.STREAM_IDLE_TIMEOUT, log)
                 for raw in guarded:
                     frame = raw if isinstance(raw, bytes) else raw.encode("utf-8")
                     _harvest_stream_usage(frame, seen)
                     yield frame
+            # Same mid-flight recovery the chat and Responses paths have: a
+            # stall or transport break reopens on a fresh exit IP (and, for an
+            # auto-routed turn, a fresh model) instead of ending the turn. The
+            # reset marker is an SSE comment, which the Anthropic translator
+            # skips, so Claude Code just sees the answer restart.
+            recover = bool(body.get("lingling_recover", config.STREAM_RECOVERY))
+            guarded = stream_guard.guarded_stream(
+                open_stream=_reopen,
+                first=tracked(),
+                outcome=outcome,
+                on_chunk=lambda raw: None,
+                log=log,
+                enabled=recover,
+                hold=_hold_for_egress,
+                retry_model=lambda: (
+                    reroute["model"] if reroute["model"] != target else None
+                ),
+            )
             yield from messages_stream.stream_events(
-                tracked(), requested, outcome, show_thinking=show_thinking,
+                guarded, requested, outcome, show_thinking=show_thinking,
             )
         finally:
             if outcome.error:
                 log.warning(
                     "messages stream broke target=%s provider=%s - %s",
                     target, prov.id, outcome.error,
+                )
+            elif outcome.rescue_succeeded:
+                log.info(
+                    "messages stream recovered target=%s attempts=%d",
+                    reroute["model"], outcome.attempts,
                 )
             usage_store.finalize(
                 row_id,
@@ -2718,6 +2771,9 @@ async def messages(request: Request):
                 latency_ms=(time.time() - started) * 1000.0,
                 status=None if outcome.completed else "stream_broken",
                 error=outcome.error,
+                routed_model=reroute["model"] if reroute["model"] != target else None,
+                routed_by=reroute["by"] if reroute["model"] != target else None,
+                reason=reroute["reason"] if reroute["model"] != target else None,
             )
 
     return StreamingResponse(
@@ -2731,11 +2787,6 @@ async def messages(request: Request):
             "X-Lingling-Reason": _header_safe(reason),
             "X-Lingling-Provider": _header_safe(prov.id),
             "X-Lingling-Account": _header_safe(account_id or ""),
-            # Parity with the chat/responses streams. Always "passthrough" here:
-            # Anthropic's streaming event model has no discard-and-replay marker
-            # and Claude Code honours no synthetic reset, so this path never
-            # mid-flight-retries -- recovery is pre-200 only (see the catch above).
-            "X-Lingling-Stream-Mode": "passthrough",
         },
     )
 
@@ -2747,95 +2798,8 @@ if FRONTEND_DIR.exists():
 
     @app.get("/")
     def index() -> FileResponse:
-        """Serve the dashboard and issue it a session cookie.
-
-        HttpOnly so page scripts (and any XSS) cannot read it; SameSite=strict
-        so browsers never attach it to a cross-site request. This is what the
-        dashboard authenticates with -- no key needs to be embedded in the page.
-        """
-        resp = FileResponse(str(FRONTEND_DIR / "index.html"))
-        resp.set_cookie(
-            auth.COOKIE_NAME,
-            auth.mint_session(),
-            max_age=config.SESSION_TTL_SECONDS,
-            httponly=True,
-            samesite="strict",
-            path="/",
-        )
-        return resp
-
-
-class _QuietPollFilter(logging.Filter):
-    """Drop successful dashboard polls from the terminal access log.
-
-    The frontend polls a handful of read-only endpoints every 1-8s, and each
-    request is a 200 that floods the backend terminal -- probe verdicts,
-    heals and bootstrap lines get buried under a wall of access lines nobody
-    can read. This filter drops those high-frequency GETs while leaving the
-    log honest: errors (any 4xx/5xx) and real API calls (POST completions,
-    the manual Probe button, ...) still surface.
-    """
-
-    # Exact paths that poll on a beat -- suppress only when GET succeeds.
-    _QUIET_EXACT = {"", "/", "/api/warp", "/api/proxies",
-                    "/api/health", "/api/models"}
-    # Path prefixes whose variants all poll (e.g. /api/usage/since/100).
-    _QUIET_PREFIX = ("/api/warp/probe", "/api/usage", "/static/")
-
-    def filter(self, record):  # noqa: A003 -- logging's own API name
-        args = record.args
-        if not isinstance(args, tuple) or len(args) < 5:
-            return True
-        # uvicorn.access args: (client_addr, method, path, http_version, status).
-        try:
-            status = int(args[4])
-        except (TypeError, ValueError):
-            return True
-        if not (200 <= status < 400):
-            return True  # never hide an error
-        if str(args[1]) != "GET":
-            return True  # chat completions, manual Probe (POST), ...
-        path = str(args[2])
-        if path in self._QUIET_EXACT or path.startswith(self._QUIET_PREFIX):
-            return False
-        return True
-
-
-def _build_log_config() -> Dict[str, Any]:
-    """Uvicorn's default LOGGING_CONFIG + the quiet-poll filter + a file handler.
-
-    The file handler mirrors every record to ``data/backend.log`` so the launcher
-    no longer redirects stdout there: the minimized window shows the live
-    (minimal, WARP-verbose-off) output instead of a blank pane, while the file
-    still holds a runtime crash trace after the window closes. ``uvicorn`` and
-    ``uvicorn.access`` keep uvicorn's default ``propagate = False`` (so the root
-    handler set below cannot double-emit them); ``uvicorn.error`` has no own
-    handlers and propagates up to ``uvicorn`` for one pass through console + file.
-    The file handler carries the quiet-poll filter too, so dashboard GET-200 polls
-    do not flood the file. Root catches third-party libs (httpx/urllib3/socksio)
-    at warning level only, so the window stays minimal.
-    """
-    from uvicorn.config import LOGGING_CONFIG
-
-    cfg = copy.deepcopy(LOGGING_CONFIG)
-    cfg.setdefault("filters", {})["quiet_poll"] = {"()": _QuietPollFilter}
-    cfg["handlers"]["access"]["filters"] = ["quiet_poll"]
-
-    config.ensure_data_dir()
-    cfg["handlers"]["file"] = {
-        "class": "logging.FileHandler",
-        "formatter": "default",
-        "filename": str(config.DATA_DIR / "backend.log"),
-        "mode": "a",
-        "encoding": "utf-8",
-        "filters": ["quiet_poll"],
-    }
-    cfg["root"] = {"handlers": ["default", "file"], "level": "WARNING"}
-    uvi = cfg["loggers"]["uvicorn"]
-    uvi["handlers"] = uvi.get("handlers", []) + ["file"]
-    acc = cfg["loggers"]["uvicorn.access"]
-    acc["handlers"] = acc.get("handlers", []) + ["file"]
-    return cfg
+        """Serve the dashboard. The gateway is open -- no session, no key."""
+        return FileResponse(str(FRONTEND_DIR / "index.html"))
 
 
 if __name__ == "__main__":
@@ -2852,6 +2816,11 @@ if __name__ == "__main__":
         "app:app",
         host=os.getenv("LINGLING_HOST", "127.0.0.1"),
         port=int(os.getenv("LINGLING_PORT", "8000")),
+        # The dashboard polls /api/tor + /api/proxies roughly every second. uvicorn's access log renders
+        # each poll as a one-line INFO entry, which floods the terminal and
+        # drowns the real signal (heals, escalations, startup events). Turn it
+        # off -- request errors still surface through the uvicorn.error logger
+        # at WARNING+.
+        access_log=False,
         log_level=os.getenv("LINGLING_LOG_LEVEL", "info"),
-        log_config=_build_log_config(),
     )
