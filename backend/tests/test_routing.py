@@ -849,6 +849,242 @@ def test_unit_responses_harvest_counts_tool_calls_as_visible():
     assert seen.get("_visible_content_chars", 0) == 0
 
 
+def test_unit_responses_harvest_accumulates_resume_items():
+    """``_harvest_stream_usage`` must accumulate completed upstream reasoning
+    items (with their ``encrypted_content``) from the namespaced
+    ``lingling_resume_items`` delta key the Responses-only stream reshaper
+    emits. The blank-turn recovery reads ``_resume_items`` to resume the
+    model's own thinking instead of re-running the request from scratch."""
+    from app import _harvest_stream_usage
+
+    item = {"type": "reasoning", "id": "rs_1", "encrypted_content": "abc123"}
+    seen = {}
+    _harvest_stream_usage(
+        b'data: {"choices":[{"index":0,"delta":{"lingling_resume_items":['
+        + json.dumps(item).encode("utf-8") + b']},"finish_reason":null}]}',
+        seen)
+    assert seen.get("_resume_items") == [item]
+    # A second item appends, never overwrites.
+    item2 = {"type": "reasoning", "id": "rs_2", "encrypted_content": "def456"}
+    _harvest_stream_usage(
+        b'data: {"choices":[{"index":0,"delta":{"lingling_resume_items":['
+        + json.dumps(item2).encode("utf-8") + b']},"finish_reason":null}]}',
+        seen)
+    assert seen.get("_resume_items") == [item, item2]
+    # Non-list payloads are ignored, not fatal.
+    _harvest_stream_usage(
+        b'data: {"choices":[{"index":0,"delta":{"lingling_resume_items":"nope"},"finish_reason":null}]}',
+        seen)
+    assert seen.get("_resume_items") == [item, item2]
+
+
+def test_unit_responses_blank_retry_resumes_reasoning_before_fresh_egress():
+    """A blank turn that carries completed reasoning items is the model's own
+    think-phase boundary, not upstream intermittency: ``_responses_blank_retry``
+    must resume the model's thinking by sending those items back as input
+    (``resume_items`` kwarg) pinned to the same lane (``pin_proxy_id``), and
+    only fall through to a fresh-egress re-run when the resume itself comes
+    back blank."""
+    import asyncio
+
+    from app import _responses_blank_retry, _responses_output_blank
+
+    calls = []
+
+    class _Prov:
+        id = "opencode"
+
+    def _fake_execute(messages, model_id, providers, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            # First attempt: upstream completed with nothing but a completed
+            # reasoning item carrying its encrypted continuation state.
+            return {"choices": [{"message": {"role": "assistant", "content": ""},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                    "lingling_resume_items": [
+                        {"type": "reasoning", "id": "rs_1", "encrypted_content": "abc123"},
+                    ]}, _Prov(), None, []
+        if len(calls) == 2:
+            # The resume attempt: same request plus the reasoning items, pinned
+            # to the lane that served the blank.
+            assert kwargs.get("resume_items") == [
+                {"type": "reasoning", "id": "rs_1", "encrypted_content": "abc123"},
+            ], "resume must feed the completed reasoning items back as input"
+            assert kwargs.get("pin_proxy_id") == "lane-3", \
+                "resume must pin to the lane that served the blank"
+            return {"choices": [{"message": {"role": "assistant", "content": "hi"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 3}}, _Prov(), None, []
+        return {"choices": [{"message": {"role": "assistant", "content": ""},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0}}, _Prov(), None, []
+
+    import app as app_mod
+    original = app_mod.executor.execute_nonstream
+    app_mod.executor.execute_nonstream = _fake_execute
+    try:
+        out = asyncio.run(_responses_blank_retry(
+            [{"role": "user", "content": "ping"}], "muse-spark-1.2-contributor-free",
+            [object()], {}, session_id="", had_images=False,
+            requested="muse-spark-1.2-contributor-free", original_effort="xhigh",
+            attempt_proxy_ref={"id": "lane-3"},
+        ))
+    finally:
+        app_mod.executor.execute_nonstream = original
+    assert out is not None
+    assert not _responses_output_blank(out)
+    assert len(calls) == 2, "resume must answer on the second attempt, no fresh-egress re-run"
+
+
+def test_unit_responses_blank_retry_falls_back_to_fresh_egress_when_resume_blank():
+    """When the resume attempt itself comes back blank (no continuation state
+    on the second response), the helper must fall through to the fresh-egress
+    re-run rather than giving up or looping the resume."""
+    import asyncio
+
+    from app import _responses_blank_retry, _responses_output_blank
+
+    calls = []
+
+    class _Prov:
+        id = "opencode"
+
+    def _fake_execute(messages, model_id, providers, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"choices": [{"message": {"role": "assistant", "content": ""},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                    "lingling_resume_items": [
+                        {"type": "reasoning", "id": "rs_1", "encrypted_content": "abc123"},
+                    ]}, _Prov(), None, []
+        if len(calls) == 2:
+            # Resume attempt: still blank, and no new continuation state.
+            return {"choices": [{"message": {"role": "assistant", "content": ""},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0}}, _Prov(), None, []
+        # Fresh-egress re-run (no pin, no resume): answers.
+        assert kwargs.get("pin_proxy_id") is None
+        assert kwargs.get("resume_items") is None
+        return {"choices": [{"message": {"role": "assistant", "content": "hi"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3}}, _Prov(), None, []
+
+    import app as app_mod
+    original = app_mod.executor.execute_nonstream
+    app_mod.executor.execute_nonstream = _fake_execute
+    try:
+        out = asyncio.run(_responses_blank_retry(
+            [{"role": "user", "content": "ping"}], "muse-spark-1.2-contributor-free",
+            [object()], {}, session_id="", had_images=False,
+            requested="muse-spark-1.2-contributor-free", original_effort="xhigh",
+            attempt_proxy_ref={"id": "lane-3"},
+        ))
+    finally:
+        app_mod.executor.execute_nonstream = original
+    assert out is not None
+    assert not _responses_output_blank(out)
+    assert len(calls) == 3
+
+
+def test_unit_responses_blank_retry_same_lane_when_no_continuation_state():
+    """A blank with no continuation state (the upstream cut the turn off
+    mid-think without finalizing a reasoning item) is still the model's own
+    think-phase boundary: the retry must re-run the same request on the same
+    lane (``pin_proxy_id``) instead of rotating egress, and only fall through
+    to a fresh-egress re-run when the same-lane retry is blank too."""
+    import asyncio
+
+    from app import _responses_blank_retry, _responses_output_blank
+
+    calls = []
+
+    class _Prov:
+        id = "opencode"
+
+    def _fake_execute(messages, model_id, providers, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            # First attempt: blank, no resume items at all.
+            return {"choices": [{"message": {"role": "assistant", "content": ""},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0}}, _Prov(), None, []
+        if len(calls) == 2:
+            # Same-lane retry: pinned, no resume_items, answers.
+            assert kwargs.get("pin_proxy_id") == "lane-3", \
+                "a no-state blank must re-run on the same lane"
+            assert kwargs.get("resume_items") is None
+            return {"choices": [{"message": {"role": "assistant", "content": "hi"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 3}}, _Prov(), None, []
+        return {"choices": [{"message": {"role": "assistant", "content": ""},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0}}, _Prov(), None, []
+
+    import app as app_mod
+    original = app_mod.executor.execute_nonstream
+    app_mod.executor.execute_nonstream = _fake_execute
+    try:
+        out = asyncio.run(_responses_blank_retry(
+            [{"role": "user", "content": "ping"}], "muse-spark-1.2-contributor-free",
+            [object()], {}, session_id="", had_images=False,
+            requested="muse-spark-1.2-contributor-free", original_effort="xhigh",
+            attempt_proxy_ref={"id": "lane-3"},
+        ))
+    finally:
+        app_mod.executor.execute_nonstream = original
+    assert out is not None
+    assert not _responses_output_blank(out)
+    assert len(calls) == 2, "same-lane retry must answer on the second attempt"
+
+
+def test_unit_responses_blank_retry_same_lane_then_fresh_egress():
+    """When the same-lane retry is also blank, the helper falls through to the
+    fresh-egress re-run (no pin) instead of looping the same lane."""
+    import asyncio
+
+    from app import _responses_blank_retry, _responses_output_blank
+
+    calls = []
+
+    class _Prov:
+        id = "opencode"
+
+    def _fake_execute(messages, model_id, providers, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"choices": [{"message": {"role": "assistant", "content": ""},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0}}, _Prov(), None, []
+        if len(calls) == 2:
+            assert kwargs.get("pin_proxy_id") == "lane-3"
+            return {"choices": [{"message": {"role": "assistant", "content": ""},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0}}, _Prov(), None, []
+        # Fresh-egress re-run: no pin, answers.
+        assert kwargs.get("pin_proxy_id") is None
+        return {"choices": [{"message": {"role": "assistant", "content": "hi"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3}}, _Prov(), None, []
+
+    import app as app_mod
+    original = app_mod.executor.execute_nonstream
+    app_mod.executor.execute_nonstream = _fake_execute
+    try:
+        out = asyncio.run(_responses_blank_retry(
+            [{"role": "user", "content": "ping"}], "muse-spark-1.2-contributor-free",
+            [object()], {}, session_id="", had_images=False,
+            requested="muse-spark-1.2-contributor-free", original_effort="xhigh",
+            attempt_proxy_ref={"id": "lane-3"},
+        ))
+    finally:
+        app_mod.executor.execute_nonstream = original
+    assert out is not None
+    assert not _responses_output_blank(out)
+    assert len(calls) == 3
+
+
 def test_unit_openai_responses_messages_become_input_with_system_to_developer():
     """Chat messages -> Responses `input[]` carries the AI-SDK convention that
     system instructions live under the ``developer`` role: the Responses API has
@@ -921,6 +1157,12 @@ def test_unit_openai_responses_response_becomes_chat_completion_with_usage():
     assert reply["usage"]["completion_tokens"] == 615
     assert reply["usage"]["total_tokens"] == 629
     assert reply["usage"]["completion_tokens_details"]["reasoning_tokens"] == 604
+    # The completed reasoning item's continuation state rides a namespaced key
+    # for the blank-turn recovery; it is never rendered as content.
+    assert reply["lingling_resume_items"] == [
+        {"type": "reasoning", "encrypted_content": "<opaque>"},
+    ]
+    assert reply["choices"][0]["message"]["content"] == "Hi"
 
     partial = openai_responses.response_to_chat_completion({
         "id": "resp_y", "object": "response",
@@ -1250,6 +1492,67 @@ def test_unit_openai_responses_build_body_translates_chat_params():
         f"muse-spark headroom drifted: {body2['max_output_tokens']}"
     assert openai_responses._default_max_output_tokens("unknown-model-0000") == 32000, \
         "a model with no published output limit keeps the CLI default cap"
+
+
+def test_unit_openai_responses_build_body_appends_resume_items_to_input():
+    """``resume_items`` (completed upstream reasoning items carrying their
+    ``encrypted_content``) are appended verbatim to the Responses ``input``
+    after the translated chat messages. That is the stateless-reasoning
+    continuation the official CLI uses: the model resumes its own thinking
+    instead of starting over. Only dict items are forwarded; junk is dropped.
+    """
+    from providers import openai_responses
+
+    item = {"type": "reasoning", "id": "rs_1", "encrypted_content": "abc123"}
+    body = openai_responses.build_responses_body(
+        "muse-spark-1.2-contributor-free",
+        [{"role": "user", "content": "hi"}],
+        stream=True,
+        resume_items=[item, "junk", None],
+    )
+    assert body["input"][-1] == item, "resume items must ride at the end of input"
+    assert len(body["input"]) == 2, "non-dict resume items must be dropped"
+    assert body["input"][0]["role"] == "user"
+
+    # No resume items -> input is exactly the translated messages.
+    body2 = openai_responses.build_responses_body(
+        "muse-spark-1.2-contributor-free",
+        [{"role": "user", "content": "hi"}],
+        stream=True,
+    )
+    assert len(body2["input"]) == 1
+
+
+def test_unit_openai_responses_stream_passes_completed_reasoning_items_through():
+    """The stream reshaper must emit a completed upstream reasoning item (with
+    ``encrypted_content``) as a namespaced ``lingling_resume_items`` delta so
+    usage harvesting can collect it for the blank-turn recovery. The item is
+    never rendered as content -- chat clients have no field for it."""
+    from providers import openai_responses
+
+    item = {"type": "reasoning", "id": "rs_1", "encrypted_content": "abc123"}
+    upstream = [
+        b'data: {"type":"response.output_item.done","item":' + json.dumps(item).encode("utf-8") + b'}',
+        b'data: {"type":"response.completed","response":{"status":"incomplete","usage":{"input_tokens":10,"output_tokens":5,"output_tokens_details":{"reasoning_tokens":5}}}}',
+    ]
+    chunks = list(openai_responses.chat_sse_from_responses_sse(iter(upstream), "muse-spark-1.2-contributor-free"))
+    resume_deltas = []
+    for chunk in chunks:
+        payload = chunk.decode("utf-8")
+        if not payload.startswith("data:") or payload.startswith("data: [DONE]"):
+            continue
+        obj = json.loads(payload[5:].strip())
+        for choice in obj.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("lingling_resume_items"):
+                resume_deltas.extend(delta["lingling_resume_items"])
+    assert resume_deltas == [item], "completed reasoning item must pass through for recovery"
+    # The item must never surface as visible content.
+    assert not any(
+        (ch.get("choices") or [{}])[0].get("delta", {}).get("content")
+        for ch in (json.loads(c[5:].strip()) for c in chunks
+                   if c.startswith(b"data:") and not c.startswith(b"data: [DONE]"))
+    )
 
 
 def test_unit_openai_responses_stream_renders_chat_chunks_from_responses_sse():
@@ -6006,6 +6309,47 @@ def test_unit_executor_marks_success_with_latency_ms_stream():
     # ``latency_ms`` is now passed; should be a positive float in milliseconds.
     assert isinstance(captured.get("latency_ms"), (int, float))
     assert captured["latency_ms"] >= 0.0
+
+
+def test_unit_executor_pin_proxy_id_keeps_same_lane_and_reports_it():
+    """``execute_stream`` honours ``pin_proxy_id`` (the same-lane retry the
+    reasoning-blank recovery uses: a blank turn is the model's own think-phase
+    boundary, not an egress failure, so the resume must not rotate lanes) and
+    records the serving lane's id on ``proxy_ref`` so the caller can pin the
+    next attempt to it."""
+    pool = ProxyPool.from_list([
+        {"id": "lane-a", "url": "socks5://a.invalid"},
+        {"id": "lane-b", "url": "socks5://b.invalid"},
+    ])
+    bytes_iter = [
+        b'data: {"choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+
+    import routing.executor as exec_mod
+
+    proxy_ref: Dict[str, Any] = {}
+    gen, _prov, _key, _attempts = exec_mod.execute_stream(
+        [{"role": "user", "content": "hi"}], "m",
+        [FakeProvider("pin-prov", bytes_iter, use_proxy=True)], proxy_pool=pool,
+        pin_proxy_id="lane-b", proxy_ref=proxy_ref,
+    )
+    for _ in gen:
+        pass
+    assert proxy_ref.get("id") == "lane-b", \
+        "the pinned lane must serve the request and be reported on proxy_ref"
+
+    # An unknown pin falls through to normal pool policy instead of failing.
+    proxy_ref2: Dict[str, Any] = {}
+    gen2, _, _, _ = exec_mod.execute_stream(
+        [{"role": "user", "content": "hi"}], "m",
+        [FakeProvider("pin-prov2", bytes_iter, use_proxy=True)], proxy_pool=pool,
+        pin_proxy_id="no-such-lane", proxy_ref=proxy_ref2,
+    )
+    for _ in gen2:
+        pass
+    assert proxy_ref2.get("id") in ("lane-a", "lane-b"), \
+        "an unknown pin must fall through to the pool's normal pick"
 
 
 def test_unit_executor_stream_dec_on_completion():

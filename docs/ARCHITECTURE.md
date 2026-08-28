@@ -298,7 +298,7 @@ gateway. Skip this section unless something specific needs changing.
 | `LINGLING_REQUEST_TIMEOUT` | `120` | Upstream request timeout (s) |
 | `LINGLING_CATALOG_TTL` | `600` | How often the model list refreshes (s) |
 | `LINGLING_EGRESS_WAIT_BUDGET` | `120` | Max seconds to wait for a cooled egress pool |
-| `LINGLING_STREAM_IDLE_TIMEOUT` | `90` | Treat a silent stream as broken after this (s) |
+| `LINGLING_STREAM_IDLE_TIMEOUT` | `200` | Treat a silent stream as broken after this (s) |
 
 **Egress pool**
 
@@ -407,6 +407,36 @@ mid-turn. One where you named a model never will.
 
 A stream that goes quiet *without* dying is a different failure, and gets cut off
 after `LINGLING_STREAM_IDLE_TIMEOUT` rather than hanging your session forever.
+
+### The think-phase boundary: a blank turn is the model, not the egress
+
+The free reasoning models (muse-spark-style, Responses-only) are trained to think
+in phases: they reason, end the turn with **no visible text**, and then think
+again — no input needed to trigger the next phase. OpenCode's own CLI shows the
+same behavior. Lingling recognizes this as the model's own think-phase boundary,
+**not** an upstream failure, and never treats it as one:
+
+1. **Continuation first.** If the turn ended with a finalized reasoning item
+   (OpenAI's `encrypted_content` continuation state), Lingling feeds that item
+   back as `resume_items` — the model's own resume mechanism — so it continues
+   exactly where its thinking stopped.
+2. **Same-lane re-run with budget escalation.** If the turn was cut off mid-think
+   with no continuation state, Lingling re-runs the same request on the **same
+   egress lane** (`pin_proxy_id`) — and doubles the output budget on each retry
+   (2x, 4x, capped at the model's published headroom). Live wire capture shows
+   the upstream ends a budget-clipped think phase with `response.incomplete`
+   (`reason: "max_output_tokens"`) and *no* continuation state; re-sending the
+   same request with the same cap re-blanks identically, while the same prompt
+   completes at a larger cap. Escalation is the lever that turns that blank into
+   an answer. The lane is not the problem; rotating it is what burned lanes and
+   queued regenerations in the health daemon.
+3. **No lane rotation.** A blank turn never rotates egress. Only a genuinely
+   unanswerable request (e.g. the model spent its whole token budget thinking
+   even at the escalated caps) reaches the notice after 3 attempts — the honest
+   terminal, so the agent can retry at a lower effort.
+
+Both recovery shapes are logged as `think-phase boundary` rather than
+`upstream completed with no content`, so the log reads the pattern correctly.
 
 ### The egress pool: lanes, not lies
 

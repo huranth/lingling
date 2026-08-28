@@ -126,6 +126,7 @@ class AllFailedError(Exception):
 
 def _pick_proxy(
     prov: Provider, proxy_pool: Optional[ProxyPool], session_id: str, model_id: str,
+    pin_proxy_id: Optional[str] = None,
 ) -> Optional[Any]:
     """Pick an egress proxy for this provider attempt, or None if not applicable.
 
@@ -134,11 +135,21 @@ def _pick_proxy(
     Sticky sessions (default) pin a conversation to one proxy via the
     session id; otherwise round-robin. Returns None when the pool is empty --
     callers then connect directly (backward compatible).
+
+    ``pin_proxy_id`` requests a specific lane -- the same-lane retry the
+    reasoning-blank recovery uses. A thinking-phase boundary is the model's
+    own behavior, not an egress failure, so the retry deliberately does not
+    rotate: it rides the lane that just served. The pin is best-effort: an
+    unknown, cooling, or saturated id falls through to the normal pick.
     """
     if proxy_pool is None or len(proxy_pool) == 0:
         return None
     if not prov.needs_proxy() or prov.prefer_direct(model_id):
         return None
+    if pin_proxy_id:
+        pinned = proxy_pool.get_by_id(pin_proxy_id)
+        if pinned is not None and not _is_proxy_saturated(pinned) and not pinned.in_cooldown():
+            return pinned
     if config.PROXY_STICKY_SESSIONS and session_id:
         return proxy_pool.pick_sticky(session_id)
     return proxy_pool.pick()
@@ -166,6 +177,8 @@ def execute_nonstream(
     session_id: str = "",
     timeout: Optional[float] = None,
     catalog: Any = None,
+    pin_proxy_id: Optional[str] = None,
+    proxy_ref: Optional[Dict[str, Any]] = None,
     **params: Any,
 ) -> Tuple[Dict[str, Any], Provider, Any, List[Dict[str, Any]]]:
     """Run a non-streaming completion with full cross-provider failover.
@@ -181,6 +194,12 @@ def execute_nonstream(
     connection, not the JSON body).  Extracted from ``**params`` explicitly so
     callers (e.g. the dispatcher) can set it without it being swallowed into
     the upstream request body.
+
+    ``pin_proxy_id`` and ``proxy_ref`` serve the reasoning-blank recovery: the
+    pin keeps a same-lane retry on the exit that just served (see
+    :func:`_pick_proxy`), and ``proxy_ref`` -- when given a dict -- receives
+    the id of the proxy that actually served the successful attempt, so the
+    caller can pin a follow-up attempt to it.
     """
     if not providers:
         raise NoProviderError(f"no provider serves model '{model_id}'")
@@ -203,7 +222,8 @@ def execute_nonstream(
                 else 1
             )
             for _ in range(max_proxies):
-                proxy = _pick_proxy(prov, proxy_pool, session_id, model_id)
+                proxy = _pick_proxy(prov, proxy_pool, session_id, model_id,
+                                    pin_proxy_id=pin_proxy_id)
                 proxy_url = proxy.url if proxy else None
                 # Wall-clock the round-trip so the picker can actually distinguish
                 # lanes. Without this, ``_avg_latency`` stays None for every
@@ -220,6 +240,8 @@ def execute_nonstream(
                     # Model answered: reset its burn streak; un-burn if it just cleared a cooldown trial.
                     if catalog is not None:
                         catalog.record_model_success(model_id)
+                    if proxy_ref is not None and proxy is not None:
+                        proxy_ref["id"] = proxy.id
                     return resp, prov, None, attempts
                 except UpstreamError as exc:
                     if proxy is not None and proxy_pool is not None:
@@ -246,7 +268,8 @@ def execute_nonstream(
             if key.id in tried and len(tried) >= len(prov.keys):
                 break
             tried.add(key.id)
-            proxy = _pick_proxy(prov, proxy_pool, session_id, model_id)
+            proxy = _pick_proxy(prov, proxy_pool, session_id, model_id,
+                                pin_proxy_id=pin_proxy_id)
             proxy_url = proxy.url if proxy else None
             t_start = time.monotonic()
             try:
@@ -258,6 +281,8 @@ def execute_nonstream(
                 # Model answered: reset its burn streak; un-burn if it just cleared a cooldown trial.
                 if catalog is not None:
                     catalog.record_model_success(model_id)
+                if proxy_ref is not None and proxy is not None:
+                    proxy_ref["id"] = proxy.id
                 return resp, prov, key, attempts
             except UpstreamError as exc:
                 prov.keys.mark_failure(key, exc.status_code)
@@ -288,6 +313,8 @@ def execute_stream(
     session_id: str = "",
     timeout: Optional[float] = None,
     catalog: Any = None,
+    pin_proxy_id: Optional[str] = None,
+    proxy_ref: Optional[Dict[str, Any]] = None,
     **params: Any,
 ) -> Tuple[Generator[bytes, None, None], Provider, Any, List[Dict[str, Any]]]:
     """Open a native stream and obtain its first chunk before replying to client.
@@ -301,6 +328,11 @@ def execute_stream(
     transport, *not* the request body (avoids the **params swallowing bug
     where a ``timeout`` kwarg went into the JSON body instead of the
     client kwargs).
+
+    ``pin_proxy_id`` and ``proxy_ref`` serve the reasoning-blank recovery, same
+    as :func:`execute_nonstream`: the pin keeps a same-lane retry on the exit
+    that just served, and ``proxy_ref`` receives the id of the proxy that
+    served the successful attempt.
     """
     if not providers:
         raise NoProviderError(f"no provider serves model '{model_id}'")
@@ -325,7 +357,8 @@ def execute_stream(
         # than "we burned all our chances on busy lanes".
         saturated_rejections = 0
         for _ in range(max_attempts):
-            proxy = _pick_proxy(prov, proxy_pool, session_id, model_id)
+            proxy = _pick_proxy(prov, proxy_pool, session_id, model_id,
+                                pin_proxy_id=pin_proxy_id)
             # Pick-time cap: the chosen lane already carries
             # ``PROXY_MAX_PARALLEL_STREAMS`` live streams. Without this gate,
             # three concurrent CLI sessions could each pick the same fastest
@@ -364,6 +397,8 @@ def execute_stream(
                 # ahead of the returned chain (success confirmed at first token).
                 if catalog is not None:
                     catalog.record_model_success(model_id)
+                if proxy_ref is not None and proxy is not None:
+                    proxy_ref["id"] = proxy.id
                 # Active-stream bookkeeping: the wrapped generator inc's on
                 # ``mark_success`` (here -- the stream is now live and will
                 # consume egress bandwidth) and dec's on whatever closed the

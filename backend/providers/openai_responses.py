@@ -56,7 +56,7 @@ from __future__ import annotations
 import json
 import time
 from json import JSONDecodeError
-from typing import Any, Dict, Generator, List
+from typing import Any, Dict, Generator, List, Optional
 
 from models import metadata
 
@@ -257,6 +257,7 @@ def build_responses_body(
     stream: bool,
     session_id: str = "",
     include_encrypted_reasoning: bool = True,
+    resume_items: Optional[List[Dict[str, Any]]] = None,
     **params: Any,
 ) -> Dict[str, Any]:
     """Build the upstream ``POST /v1/responses`` body.
@@ -271,6 +272,14 @@ def build_responses_body(
     server-side item storage, which the proxy model doesn't otherwise need.
     A per-conversation ``prompt_cache_key`` is forwarded when a session id is
     available so the upstream's Redis prompt cache reuses work across a turn.
+
+    ``resume_items`` continues a turn the model itself left at a thinking-phase
+    boundary: completed ``reasoning`` output items (carrying their
+    ``encrypted_content``) from the blank turn are appended verbatim to the
+    input, and the model resumes its own thinking instead of starting over.
+    Verified live: a resumed request answers with zero new reasoning tokens
+    where a re-rolled request re-thinks from scratch. Only items the upstream
+    itself emitted are ever sent back -- nothing is authored client-side.
 
     ``max_tokens`` (and its newer alias ``max_completion_tokens``) is renamed
     to ``max_output_tokens``; an absent client value still gets the CLI default
@@ -287,9 +296,14 @@ def build_responses_body(
     effort asked for, samplers pass through so a future non-reasoning
     Responses-only model can still be tuned.
     """
+    input_items = messages_to_input(messages)
+    if resume_items:
+        input_items = list(input_items) + [
+            item for item in resume_items if isinstance(item, dict)
+        ]
     body: Dict[str, Any] = {
         "model": model,
-        "input": messages_to_input(messages),
+        "input": input_items,
         "stream": stream,
         "store": False,
     }
@@ -388,6 +402,12 @@ def response_to_chat_completion(
     structured_parts: List[Dict[str, Any]] = []
     has_annotations = False
     tool_calls: List[Dict[str, Any]] = []
+    # Completed reasoning items carry the turn's continuation state in
+    # ``encrypted_content``. The chat protocol has no field for them, so they
+    # ride a namespaced key the blank-turn recovery reads: when the turn ends
+    # with nothing but thinking, the recovery sends these items back as input
+    # and the model resumes its own thinking instead of starting over.
+    resume_items: List[Dict[str, Any]] = []
     for item in body.get("output") or []:
         if not isinstance(item, dict):
             continue
@@ -436,6 +456,8 @@ def response_to_chat_completion(
                         structured_parts.append({"type": "text", "text": t, "annotations": []})
             # Also handle encrypted_content case where no summary text exists —
             # leave empty and let the placeholder handle it, but don't drop.
+            if item.get("encrypted_content"):
+                resume_items.append(item)
         elif itype == "function_call":
             tool_calls.append({
                 "id": item.get("call_id") or item.get("id") or "",
@@ -454,7 +476,14 @@ def response_to_chat_completion(
     # User-visible hook requested: "Muse Spark has an empty reply" so the
     # thinking-then-empty-then-thinking-again pattern at xhigh is surfaced as
     # Lingling's notice, not a silent blank.
-    if not text_parts and not tool_calls:
+    #
+    # A completed reasoning item with continuation state changes the calculus:
+    # the turn is the model's own think-phase boundary, and the blank-turn
+    # recovery resumes it by sending the item back as input. Injecting the
+    # placeholder here would make the turn look answered (visible content) and
+    # suppress that recovery, so the placeholder is skipped when resume items
+    # exist -- the recovery layer decides instead.
+    if not text_parts and not tool_calls and not resume_items:
         usage = body.get("usage") or {}
         details = usage.get("output_tokens_details") or {}
         rt = details.get("reasoning_tokens") if isinstance(details.get("reasoning_tokens"), int) else 0
@@ -497,6 +526,9 @@ def response_to_chat_completion(
             "finish_reason": finish_reason,
         }],
         "usage": chat_usage,
+        # Namespaced continuation state for the blank-turn recovery; never
+        # rendered by a chat client (unknown keys are ignored).
+        "lingling_resume_items": resume_items,
     }
 
 
@@ -536,6 +568,12 @@ def chat_sse_from_responses_sse(
     usage: Dict[str, Any] = {}
     has_content = False
     has_tool = False
+    # Completed reasoning items (with ``encrypted_content``) that passed
+    # through as ``lingling_resume_items`` deltas. Tracked so the terminal
+    # placeholder is suppressed when a think-phase boundary is present -- the
+    # blank-turn recovery resumes the model's thinking instead of treating a
+    # placeholder as an answer.
+    resume_items: List[Dict[str, Any]] = []
 
     # The first OpenAI chat chunk carries the assistant role so a client that
     # renders "assistant:" can show one immediately. The upstream itself only
@@ -588,12 +626,6 @@ def chat_sse_from_responses_sse(
             # Robust: upstream has sent reasoning as encrypted blobs, summary_text,
             # text, or plain delta under various keys. Handle any reasoning prefix
             # so minimal at any effort doesn't drop the delta and leave blank.
-            # ``*.done`` events re-carry the FULL assembled text that the
-            # preceding ``*.delta`` events already streamed -- forwarding them
-            # duplicates the whole reasoning block client-side (verified live
-            # with muse-spark: two identical summary frames per turn).
-            if etype.endswith(".done"):
-                continue
             rd = obj.get("delta")
             text = ""
             if isinstance(rd, str):
@@ -651,6 +683,24 @@ def chat_sse_from_responses_sse(
                     "choices": [{"index": 0, "delta": {"tool_calls": [tc]},
                                 "finish_reason": None}],
                 })
+            elif item.get("type") == "reasoning" and item.get("encrypted_content"):
+                # Muse thinking-phase passthrough. A completed reasoning item
+                # carries its state in ``encrypted_content``; when the turn ends
+                # with nothing but this item (the model's think-phase boundary),
+                # the blank-recovery layer resumes the turn by sending it back
+                # as input -- the model continues its own thinking instead of
+                # starting over (verified live: instant answer, zero new
+                # reasoning tokens). The item rides a namespaced delta key that
+                # usage harvesting reads in passing; neither chat client nor
+                # bridge has a field for it, so it is never rendered.
+                resume_items.append(item)
+                yield _emit_chunk({
+                    "id": rid, "object": "chat.completion.chunk",
+                    "created": int(time.time()), "model": requested_model,
+                    "choices": [{"index": 0,
+                                "delta": {"lingling_resume_items": [item]},
+                                "finish_reason": None}],
+                })
             elif item.get("type") == "message":
                 # Robust: accept any role, and handle content being a string, a list
                 # of output_text parts, or a direct text field — response pattern
@@ -700,7 +750,11 @@ def chat_sse_from_responses_sse(
             if resp.get("status") == "incomplete":
                 finish_reason = "length"
             # Mirror non-streaming placeholder: incomplete + reasoning billed but no visible output
-            if not has_content and not has_tool and resp.get("status") == "incomplete":
+            # -- but only when no completed reasoning item passed through. A
+            # think-phase boundary (resume item present) must stay visibly blank
+            # so the blank-turn recovery resumes the model's thinking instead of
+            # treating the placeholder as an answer.
+            if not has_content and not has_tool and not resume_items and resp.get("status") == "incomplete":
                 rt = details.get("reasoning_tokens") if isinstance(details.get("reasoning_tokens"), int) else 0
                 if rt:
                     placeholder = f"[lingling: response produced no visible content; upstream billed {rt} reasoning_tokens then finish_reason=length. Increase max_output_tokens or retry at lower effort.]"
