@@ -6,8 +6,8 @@
 backend/accounts.json
 # Egress proxy list may embed proxy credentials (scheme://user:pass@host).
 backend/proxies.json
-# Issued user API keys (plaintext ll_ tokens), usage database, WARP identities
-# (each wgcf-account.toml holds a private WireGuard key), downloaded binaries.
+# Usage database, Tor lane state (each lane's keys/ directory holds private key
+# material), downloaded binaries.
 backend/data/
 .env
 .env.*
@@ -29,7 +29,8 @@ venv/
 .agents/
 .claude/
 .hallmark/
-.zcode/
+# Machine-local dev scripts (hardcoded absolute paths, per-operator ports).
+/.zcode/*.ps1
 skills-lock.json
 
 # ---------------------------------------------------------------------------
@@ -60,3 +61,16 @@ sa/
 /_*.py
 /_*.js
 /_*.json
+
+# ---------------------------------------------------------------------------
+# Local probe / replay scratch kept out of the public tree
+# ---------------------------------------------------------------------------
+# Lives only on the operator's machine: rolled-output captures, replay JSONs,
+# per-model probes from `start.bat && curl ...`. Never production traffic.
+/.muse_resp_*.json
+/.muse_resp_*.txt
+/.muse_retest/
+/.nemotron_probe/
+/.zcode/plans/
+/.zcode/cache/
+/.zcode/memories/

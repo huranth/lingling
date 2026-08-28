@@ -1,8 +1,0 @@
-# Lingling dev/test dependencies (pip install -r requirements-dev.txt).
-#
-# Two async race-condition tests carry @pytest.mark.asyncio; without this
-# plugin they don't error loudly — pytest reports "async def functions are
-# not natively supported" and the run shows 2 failures with no code bug
-# behind them, which is exactly how a broken suite looks on a fresh clone.
-pytest==9.1.1
-pytest-asyncio==1.4.0

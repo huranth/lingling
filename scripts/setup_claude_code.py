@@ -1,6 +1,6 @@
 """Double-click me: point Claude Code at Lingling.
 
-Kept at the repo root as a plain launcher so it can be double-clicked on Windows
+Kept in ``scripts/`` as a plain launcher so it can be double-clicked on Windows
 without anyone needing to know where the package lives or what a module path is.
 Everything real happens in ``backend/claudecode/setup_gui.py``.
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 from claudecode.setup_gui import main  # noqa: E402
 

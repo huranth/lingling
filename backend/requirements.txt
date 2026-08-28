@@ -6,13 +6,13 @@
 # `python tests/test_routing.py` before committing the change.
 #
 # httpx handles every outbound call to OpenCode Zen and models.dev; the [socks]
-# extra plus socksio are what let it speak to the local WARP SOCKS5 proxies.
-# h2 is optional: when installed, Lingling negotiates HTTP/2 with the upstream,
-# which reuses a single tunneled connection for concurrent streams and cuts
-# first-token latency. Without it the code silently falls back to HTTP/1.1.
+# extra plus socksio are what let it speak to the local Tor SOCKS5 proxies.
+# stem drives the Tor controller protocol (SIGNAL NEWNYM, circuit building)
+# for the Tor egress lanes; imported lazily so a missing stem never blocks a
+# direct run.
 fastapi==0.140.0
 uvicorn[standard]==0.51.0
 httpx[socks]==0.28.1
 socksio==1.0.0
-h2==4.2.0
+stem==1.8.2
 pydantic==2.13.4
