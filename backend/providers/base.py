@@ -1,17 +1,36 @@
 """Provider abstraction.
 
-Each free-tier gateway is a :class:`Provider`: it knows its base URL, holds a
-credential pool, lists its models, and runs chat completions. OpenCode and any
-future OpenAI-compatible gateway share :class:`OpenAICompatibleProvider`, which
-implements the transport; a concrete provider supplies its base URL, how to read
-its model list, and how to decide which models are free.
+Lingling aggregates many free-tier gateways behind one router. Each gateway is a
+:class:`Provider`: it knows its base URL, holds a credential pool, can list its
+models dynamically, and can run a chat completion. Adding a new free provider is
+one small subclass.
+
+Both OpenCode and any future OpenAI-compatible gateway speak the OpenAI wire
+protocol, so the shared :class:`OpenAICompatibleProvider` implements the
+transport (POST ``{base}/chat/completions`` with a bearer credential, streaming
+and not) and a
+default ``GET /models`` reader. A concrete provider supplies its base URL, how
+to read its live model list (auth if needed), and how to decide which of its
+models are free.
+
+Connection pooling
+------------------
+``OpenAICompatibleProvider`` keeps one ``httpx.Client`` per egress proxy URL
+(bucketed under ``"<DIRECT>"`` for proxy-less calls) so back-to-back requests
+through the same SOCKS5 tunnel reuse TCP+TLS to upstream. A fresh
+``httpx.Client`` per request paid the full handshake on every call -- roughly
+300-800ms per chat request, repeated for every Codex turn and every led
+session. The pool lets a healthy proxy carry dozens of requests in a second
+without re-handshaking. ``trust_env=False`` keeps process-wide HTTP(S)_PROXY
+from hijacking the cached client across restarts; clients are closed on
+process shutdown via :meth:`close`.
 """
 
 from __future__ import annotations
 
-import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+import threading
 from typing import Any, Dict, Generator, List, Optional
 
 import httpx
@@ -21,76 +40,14 @@ from models import metadata
 from providers.key_pool import KeyPool
 
 
-# Matches any UTF-16 surrogate code point (U+D800..U+DFFF).
-_LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
-
-
-def strip_lone_surrogates(obj: Any) -> Any:
-    """Recursively drop unpaired UTF-16 surrogate code points from a body.
-
-    A client that truncates history mid-emoji can send only half of a surrogate
-    pair (e.g. ``\\ud83d``). httpx serializes the body with
-    ``json.dumps(ensure_ascii=False).encode("utf-8")``, which cannot encode a
-    lone surrogate and raises UnicodeEncodeError before any bytes leave -- so the
-    request 500s and every retry on the same body fails identically. Whole emoji
-    decode to a single non-surrogate code point and are left untouched.
-    """
-    if isinstance(obj, str):
-        # Fast path: most strings have no surrogates at all.
-        if _LONE_SURROGATE_RE.search(obj):
-            return _LONE_SURROGATE_RE.sub("", obj)
-        return obj
-    if isinstance(obj, dict):
-        return {k: strip_lone_surrogates(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [strip_lone_surrogates(v) for v in obj]
-    return obj
-
-
 class UpstreamError(Exception):
     """Raised when an upstream provider returns a non-success status."""
 
-    def __init__(self, status_code: int, detail: str = "", provider_id: str = "",
-                 retry_after: Optional[float] = None) -> None:
+    def __init__(self, status_code: int, detail: str = "", provider_id: str = "") -> None:
         super().__init__(f"[{provider_id}] upstream HTTP {status_code}: {detail[:300]}")
         self.status_code = status_code
         self.detail = detail
         self.provider_id = provider_id
-        # Parsed upstream ``Retry-After`` (seconds), when the status carried one.
-        # The executor extends the proxy's cooldown to honor the explicit backoff
-        # ask instead of the heuristic exponential -- see ``_honor_retry_after``.
-        self.retry_after = retry_after
-
-
-def _retry_after_seconds(headers: Any) -> Optional[float]:
-    """Parse an HTTP ``Retry-After`` header into seconds, or None.
-
-    The header may be delta-seconds (``"120"`` / ``"30.5"``) or an HTTP-date
-    (``Wed, 21 Oct 2026 07:28:00 GMT``). A back-dated or unparseable value
-    yields 0.0 / None so the caller keeps the heuristic base. Honored only where
-    the executor can extend a proxy's cooldown: a 429/503 advertising it parks the
-    lane for the upstream-advised window (clamped by the caller) instead of the
-    exponential guess, which would otherwise re-select the lane before the rate
-    window clears and re-burn the failover budget.
-    """
-    raw = headers.get("retry-after") if hasattr(headers, "get") else None
-    if not raw:
-        return None
-    raw = raw.strip()
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        pass
-    from email.utils import parsedate_to_datetime
-    import datetime
-    try:
-        dt = parsedate_to_datetime(raw)
-    except (TypeError, ValueError):
-        return None
-    if dt is None:
-        return None
-    now = datetime.datetime.now(dt.tzinfo)
-    return max(0.0, (dt - now).total_seconds())
 
 
 def _prettify(model_id: str) -> str:
@@ -117,6 +74,9 @@ class ProviderModel:
     # routes on real capabilities rather than guessing from the model id.
     capabilities: Dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
 
 class Provider(ABC):
     """Interface every free-tier gateway implements."""
@@ -130,8 +90,9 @@ class Provider(ABC):
 
     def __init__(self, keys: KeyPool) -> None:
         self.keys = keys
-        # Whether the most recent list_models() fetch succeeded, so the catalog
-        # can keep serving the last good list through a transient fetch failure.
+        # Whether the most recent list_models() fetch succeeded. The catalog
+        # reads this to keep serving the last good model list through a
+        # transient fetch failure instead of blanking out (see UnifiedCatalog).
         self.last_fetch_ok: bool = True
 
     # -- configuration -----------------------------------------------------
@@ -139,12 +100,18 @@ class Provider(ABC):
         return True
 
     def needs_proxy(self) -> bool:
-        """Whether requests route through the egress proxy pool. True for
-        IP-rate-limited keyless providers (OpenCode free tier)."""
+        """Whether this provider's requests should be routed through the egress
+        proxy pool. Override to True for IP-rate-limited keyless providers
+        (OpenCode free tier).
+        """
         return False
 
     def prefer_direct(self, model_id: str) -> bool:
-        """Whether latency-sensitive requests for *model_id* bypass the pool."""
+        """Whether latency-sensitive requests for *model_id* bypass egress proxies.
+
+        This is deliberately opt-in at provider level: a provider that requires
+        a proxy for connectivity can retain its normal proxy behavior.
+        """
         return False
 
     def is_configured(self) -> bool:
@@ -180,10 +147,11 @@ class Provider(ABC):
     def list_models(self) -> List[ProviderModel]:
         """Fetch live ids and build enriched models.
 
-        Returns ``[]`` on any failure so one provider never breaks the catalog.
-        ``last_fetch_ok`` records whether the fetch succeeded, so the catalog can
-        tell "no models" from "the /models call failed" and keep a good cached
-        list through a transient blip.
+        Returns ``[]`` on any failure (provider unconfigured or unreachable) so
+        one provider never breaks the whole catalog. ``last_fetch_ok`` records
+        whether the fetch actually succeeded, so the catalog can distinguish
+        "this provider genuinely has no models" from "the /models call just
+        failed" and avoid discarding a good cached list on a transient blip.
         """
         try:
             ids = self.fetch_model_ids()
@@ -195,16 +163,12 @@ class Provider(ABC):
 
     # -- transport ---------------------------------------------------------
     def auth_headers(self, secret: str) -> Dict[str, str]:
-        # Authorization is attached only when a credential is configured
-        # (OpenCode's free tier is keyless).
-        #
-        # Gotcha: the User-Agent is load-bearing. OpenCode gates its premium free
-        # models behind the official client's UA -- a `python-httpx/...` request
-        # gets an instant FreeUsageLimitError 429 regardless of IP or quota,
-        # while the identical request as `opencode/...` returns 200.
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": config.UPSTREAM_USER_AGENT,
+            # Honest User-Agent: the gateway identifies as Lingling, not spoofing
+            # opencode CLI. Docs claimed opencode/1.0 was required for free tier;
+            # live probes show it doesn't affect tier (both 200), so we keep it real.
+            "User-Agent": "lingling/0.2.0",
         }
         if secret:
             headers["Authorization"] = f"Bearer {secret}"
@@ -239,6 +203,132 @@ class Provider(ABC):
 class OpenAICompatibleProvider(Provider):
     """Shared transport for providers that speak the OpenAI wire protocol."""
 
+    # keepalive limits per cached client. A session-heavy Codex run must not
+    # accumulate hundreds of idle keepalive sockets to a single egress IP;
+    # 10 idle / 20 total caps the per-(proxy_url) footprint while still
+    # amortising ~all of the per-request handshake on warm paths.
+    _POOL_KEEPALIVE = 10
+    _POOL_MAX_CONNS = 20
+    _POOL_KEEPALIVE_EXPIRY_S = 60.0
+
+    def __init__(self, keys: KeyPool) -> None:
+        super().__init__(keys)
+        # proxy_url (or "<DIRECT>") -> httpx.Client. Lazy-built; one client per
+        # tunnel so back-to-back requests reuse the TCP+TLS handshake. A
+        # separate threading.Lock guards creation (httpx.Client is itself
+        # thread-safe; the lock protects the dict + serialises the cold build).
+        self._clients: Dict[str, httpx.Client] = {}
+        self._clients_lock = threading.Lock()
+
+    @classmethod
+    def _new_client(
+        cls, proxy_url: Optional[str], timeout: Optional[int],
+    ) -> httpx.Client:
+        """Build an httpx.Client with the right transport/timeout config."""
+        # The timeout budget is split into fields so the *read* ceiling is no
+        # longer the ``STREAM_FIRST_TOKEN_TIMEOUT`` that callers pass in as
+        # ``timeout`` for streaming. When ``timeout`` was applied as a single
+        # scalar, every inter-chunk gap on a live stream inherited the 30s
+        # first-token budget -- a thinking model pausing past it raised
+        # ``ReadTimeout`` -> ``UpstreamError(504, "read operation timed out")``
+        # -> the mid-flight break + ``lingling_reset`` seen in the live logs.
+        # The first-token budget is enforced separately (see
+        # ``executor.execute_stream``); here the client's *default* read stays
+        # at ``REQUEST_TIMEOUT`` for non-stream, and each stream applies its own
+        # per-request override via :meth:`_stream_timeout`.
+        base = float(timeout or config.REQUEST_TIMEOUT)
+        connect = min(config.PROXY_CONNECT_TIMEOUT, base) if proxy_url else base
+        kwargs: Dict[str, Any] = {
+            "timeout": httpx.Timeout(
+                connect=connect,
+                read=float(config.REQUEST_TIMEOUT),
+                write=base,
+                pool=base,
+            ),
+            # Never silently inherit HTTP(S)_PROXY/ALL_PROXY from the process;
+            # explicit proxy_url is supported via the pool only.
+            "trust_env": False,
+            "limits": httpx.Limits(
+                max_keepalive_connections=cls._POOL_KEEPALIVE,
+                max_connections=cls._POOL_MAX_CONNS,
+                keepalive_expiry=cls._POOL_KEEPALIVE_EXPIRY_S,
+            ),
+        }
+        if proxy_url:
+            kwargs["proxy"] = proxy_url
+        return httpx.Client(**kwargs)
+
+    def _client_for(
+        self, proxy_url: Optional[str], timeout: Optional[int],
+    ) -> httpx.Client:
+        """Return the cached client for *proxy_url*, building one if needed.
+
+        The dict lookup is the hot path -- the lock is contention-free on
+        warm hits; cold creates are serialised so two simultaneous first
+        requests don't both build the same client.
+        """
+        key = proxy_url or "<DIRECT>"
+        client = self._clients.get(key)
+        if client is not None:
+            return client
+        with self._clients_lock:
+            client = self._clients.get(key)
+            if client is not None:
+                return client
+            client = self._new_client(proxy_url, timeout)
+            self._clients[key] = client
+            return client
+
+    def _stream_timeout(
+        self, proxy_url: Optional[str], timeout: Optional[float],
+    ) -> httpx.Timeout:
+        """Per-request timeout for a *live* stream: short connect, long read.
+
+        ``read`` is the socket-read ceiling for every inter-chunk gap once the
+        first chunk has arrived. It must sit *above* the ``stream_idle``
+        watchdog budget so a genuine thinking pause is left to the watchdog
+        (which counts usable frames and ignores SSE keepalives) instead of
+        being misread by httpx as ``ReadTimeout`` -> a spurious 504 + reset.
+        ``connect`` stays tight so a dead SOCKS port still fails over fast, and
+        ``write``/``pool`` are bounded by the caller's budget. See
+        ``core.config.STREAM_READ_TIMEOUT`` for the rationale.
+        """
+        base = float(timeout or config.REQUEST_TIMEOUT)
+        connect = min(config.PROXY_CONNECT_TIMEOUT, base) if proxy_url else base
+        return httpx.Timeout(
+            connect=connect,
+            read=config.STREAM_READ_TIMEOUT,
+            write=base,
+            pool=base,
+        )
+
+    def _evict_proxy_client(self, proxy_url: Optional[str]) -> None:
+        """Drop the cached client for *proxy_url* and close it.
+
+        Used after a tunnel-level failure (SOCKS5 handshake, mid-stream read
+        abort). The next request through that proxy rebuilds a fresh client;
+        the old one's keepalive sockets to a possibly-dead tunnel are torn
+        down instead of waiting ``keepalive_expiry`` seconds to age out.
+        """
+        key = proxy_url or "<DIRECT>"
+        with self._clients_lock:
+            dead = self._clients.pop(key, None)
+        if dead is not None:
+            try:
+                dead.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def close(self) -> None:
+        """Close every cached client. Idempotent; safe to call repeatedly."""
+        with self._clients_lock:
+            clients, self._clients = self._clients, {}
+        for c in clients.values():
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001 -- close is best-effort
+                pass
+
     def _url(self) -> str:
         return f"{self.base_url.rstrip('/')}/chat/completions"
 
@@ -248,103 +338,63 @@ class OpenAICompatibleProvider(Provider):
     def chat_completions(
         self, messages: List[Dict[str, Any]], model: str, secret: str,
         timeout: Optional[int] = None, proxy_url: Optional[str] = None,
-        proxy_id: Optional[str] = None,
         **params: Any,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {"model": model, "messages": messages, "stream": False}
         for k, v in params.items():
             if v is not None:
                 body[k] = v
-        # A client that truncated history mid-emoji can leave a lone UTF-16
-        # surrogate in the messages; UTF-8 can't encode it and httpx would 500
-        # on serialization before any bytes leave. Drop the broken halves.
-        body = strip_lone_surrogates(body)
-        timeout_val = float(timeout or config.REQUEST_TIMEOUT)
-
-        # Reuse pooled clients so a repeat request to the same proxy skips the
-        # SOCKS5 handshake + connection setup that dominate first-token latency.
-        from providers.connection_pool import get_connection_pool
-        pool = get_connection_pool()
-        if proxy_id is None and proxy_url:
-            proxy_id = proxy_url.split("://")[-1].replace(":", "_")[:32]
-        elif proxy_id is None:
-            proxy_id = "_direct_"
-
-        # Mirror stream_chat: tell the healers' ``active_streams.active(pid) > 0``
-        # guard a non-stream request is in flight on this egress too. Without
-        # this a chat_completions call mid-request could see ``remove(pid)`` from
-        # heal_expired / rotate_burned_tor_lanes (the lane reads as idle), and
-        # the executor's retry ``mark_failure`` would then mutate a ghost Proxy.
-        # inc/dec are no-ops for a falsy egress (a direct, non-proxied call), so
-        # the registry never sees a ``_direct_`` span.
-        from providers import active_streams
-        egress_id = proxy_id if proxy_url else None
-        active_streams.inc(egress_id)
+        client = self._client_for(proxy_url, timeout)
         try:
-            try:
-                with pool.get_client(proxy_id, proxy_url, timeout_val) as client:
-                    resp = client.post(self._url(), json=body, headers=self.auth_headers(secret))
-            except httpx.HTTPError as exc:
-                raise UpstreamError(504, str(exc), self.id) from exc
-            if resp.status_code >= 400:
-                raise UpstreamError(
-                    resp.status_code, resp.text, self.id,
-                    retry_after=_retry_after_seconds(resp.headers),
-                )
-            return resp.json()
-        finally:
-            active_streams.dec(egress_id)
+            resp = client.post(
+                self._url(), json=body, headers=self.auth_headers(secret),
+            )
+        except httpx.HTTPError as exc:
+            # Proxy/connect/read failures are upstream availability failures, not
+            # application bugs. Normalizing them lets the executor cool the bad
+            # proxy and try another egress instead of returning an ASGI 500.
+            raise UpstreamError(504, str(exc), self.id) from exc
+        if resp.status_code >= 400:
+            raise UpstreamError(resp.status_code, resp.text, self.id)
+        return resp.json()
 
     def stream_chat(
         self, messages: List[Dict[str, Any]], model: str, secret: str,
         timeout: Optional[int] = None, proxy_url: Optional[str] = None,
-        proxy_id: Optional[str] = None,
         **params: Any,
     ) -> Generator[bytes, None, None]:
-        """Stream a chat completion, reusing pooled clients for speed."""
         body: Dict[str, Any] = {"model": model, "messages": messages, "stream": True}
         for k, v in params.items():
             if v is not None:
                 body[k] = v
-        # See chat_completions: strip lone UTF-16 surrogates so a truncated-emoji
-        # message doesn't 500 in httpx's UTF-8 serialization before we connect.
-        body = strip_lone_surrogates(body)
-
-        timeout_val = float(timeout or config.REQUEST_TIMEOUT)
-
-        from providers.connection_pool import get_connection_pool
-        pool = get_connection_pool()
-        if proxy_id is None and proxy_url:
-            proxy_id = proxy_url.split("://")[-1].replace(":", "_")[:32]
-        elif proxy_id is None:
-            proxy_id = "_direct_"
-
-        from providers import active_streams
-        # Only proxied requests ride a re-rollable egress (a wireproxy/tor
-        # process the healers can tear down); a direct request has no egress to
-        # protect, so it is excluded from the registry entirely -- inc/dec are
-        # no-ops for a falsy id, and dashboards never see a phantom _direct_.
-        egress_id = proxy_id if proxy_url else None
-        active_streams.inc(egress_id)
+        # Reuse the cached client (and its live TCP+TLS) for streaming too;
+        # the client lives for the life of the provider, so streaming can
+        # span many chunks across a single tunnel without re-handshaking.
+        client = self._client_for(proxy_url, timeout)
         try:
-            with pool.get_client(proxy_id, proxy_url, timeout_val) as client:
-                try:
-                    with client.stream(
-                        "POST", self._url(), json=body, headers=self.auth_headers(secret)
-                    ) as resp:
-                        if resp.status_code >= 400:
-                            detail = resp.read().decode("utf-8", "replace")
-                            raise UpstreamError(
-                                resp.status_code, detail, self.id,
-                                retry_after=_retry_after_seconds(resp.headers),
-                            )
-                        for line in resp.iter_lines():
-                            if line:
-                                yield line.encode("utf-8") if isinstance(line, str) else line
-                except httpx.HTTPError as exc:
-                    raise UpstreamError(504, str(exc), self.id) from exc
-        finally:
-            active_streams.dec(egress_id)
+            with client.stream(
+                "POST", self._url(), json=body, headers=self.auth_headers(secret),
+                timeout=self._stream_timeout(proxy_url, timeout),
+            ) as resp:
+                if resp.status_code >= 400:
+                    detail = resp.read().decode("utf-8", "replace")
+                    raise UpstreamError(resp.status_code, detail, self.id)
+                for line in resp.iter_lines():
+                    if line:
+                        yield line.encode("utf-8") if isinstance(line, str) else line
+        except httpx.TimeoutException as exc:
+            # A read/pool/write timeout is a *stall*, not a broken tunnel. The
+            # upstream simply went quiet past the read ceiling; the cached
+            # client's sockets are still valid, so we keep them for the next
+            # request instead of forcing a fresh TCP+TLS+SOCKS handshake.
+            raise UpstreamError(504, str(exc), self.id) from exc
+        except httpx.HTTPError as exc:
+            # A genuine transport failure (connection refused/reset, protocol
+            # error) *did* poison the tunnel. Drop the cached client so the
+            # next request through this proxy rebuilds a fresh one rather than
+            # waiting out keepalive on dead sockets.
+            self._evict_proxy_client(proxy_url)
+            raise UpstreamError(504, str(exc), self.id) from exc
 
     def _models_secret(self) -> Optional[str]:
         """Credential used to read the model list, if the endpoint needs one.
@@ -355,10 +405,7 @@ class OpenAICompatibleProvider(Provider):
         return None
 
     def fetch_model_ids(self) -> List[str]:
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": config.UPSTREAM_USER_AGENT,
-        }
+        headers = {"Content-Type": "application/json"}
         secret = self._models_secret()
         if secret:
             headers["Authorization"] = f"Bearer {secret}"
@@ -399,6 +446,50 @@ def extract_assistant_text(response: Dict[str, Any]) -> str:
     except (KeyError, IndexError, TypeError):
         pass
     return ""
+
+
+def promote_reasoning_to_content(response: Dict[str, Any]) -> bool:
+    """Surface a reasoning-model blank turn into ``message.content`` in place.
+
+    Reasoning-only models (notably nemotron) sometimes return
+    ``message.content == ""`` (or ``None``) plus a populated ``reasoning``,
+    ``reasoning_content`` or ``thinking`` sibling field. An OpenAI-compatible
+    chat client reading ``choices[0].message.content`` would then render a
+    blank turn even though the upstream produced text -- the same family of
+    blank-turn bug that the Claude Code bridge (``messages_response.py``,
+    already fixed) and the Responses bridge (``responses_bridge._assistant_text``,
+    already fixed) guard against. The raw chat-completions path returned the
+    upstream dict untouched, so it was the lone outlier; this mutates it in
+    place when content is blank, copying the first non-empty reasoning text
+    into ``content`` -- the reasoning fields are preserved so a client that
+    does understand them still gets them.
+
+    Args:
+        response: a non-streaming chat-completion dict (mut: message.content).
+
+    Returns:
+        True when ``content`` was overwritten, False otherwise (happy path,
+        multi-part list content, or no usable reasoning fallback found).
+    """
+    try:
+        message = response["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return False
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return False
+    if isinstance(content, list):
+        # Multi-part content was already structured upstream; do not collapse
+        # it into a single string and risk losing parts / annotations.
+        return False
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            message["content"] = value
+            return True
+    return False
 
 
 def extract_usage(response: Dict[str, Any]) -> Dict[str, int]:

@@ -1,128 +1,53 @@
-"""OpenCode provider.
+"""OpenCode provider (primary).
 
-OpenCode Zen (https://opencode.ai/zen/v1) is an OpenAI-compatible gateway whose
-free tier is keyless. A model is free by OpenCode's ``-free`` suffix or by being
-a known keyless free model in ``FREE_MODEL_CAPS`` (e.g. ``big-pickle``);
-everything else is treated as premium (fail closed). models.dev pricing is not
-consulted because it mislabels some paid models as free.
+OpenCode Zen (https://opencode.ai/zen/v1) is an OpenAI-compatible AI gateway.
+Its free tier is fully KEYLESS: both ``GET /models`` and the free models on
+``POST /chat/completions`` answer with no credential (verified live). The
+web-creatable "OpenCode Zen API key" is only enforced for PAID models, which
+Lingling does not serve -- so Lingling talks to OpenCode keyless by default.
 
-``FREE_MODEL_CAPS`` is a curated overlay of hand-verified notes, not a gate: a
-``-free`` model without an entry is still served, with capabilities inferred
-from models.dev and the id, so new free models appear with no code change.
+If account keys ARE configured (``accounts.json``) the shared key pool still
+works, but for the free tier those keys are optional, not required.
+
+A model is free if it carries OpenCode's ``-free`` suffix or models.dev prices
+it at zero; anything else is treated as premium and excluded (fail closed).
+
+Curated capabilities: OpenCode's ``/models`` returns only ``{id, object,
+created, owned_by}`` (no modalities), and models.dev does not cover several of
+OpenCode's in-house free models. ``FREE_MODEL_CAPS`` below is the authoritative,
+empirically verified capability map for the free tier -- it is what the routing
+dispatcher reads so it routes on real strengths, not guesses.
 """
 
 from __future__ import annotations
 
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
+
+import httpx
 
 from core import config
 from models import metadata
-from providers.base import OpenAICompatibleProvider
+from providers import openai_responses
+from providers.base import OpenAICompatibleProvider, UpstreamError
 
 
-def _infer_desc(model_id: str, live: Dict[str, Any]) -> str:
-    """A human-readable strengths line for a model the curated overlay lacks.
-
-    Built from live models.dev metadata plus the id itself, so a newly
-    published free model is fully first-class (dashboard and routing
-    dispatcher) with no code change. Reads like the curated ``desc`` lines so
-    the dispatcher's strength markers behave consistently.
-    """
-    parts: List[str] = []
-    if live.get("vision"):
-        parts.append("multimodal: understands images and screenshots")
-    if live.get("reasoning"):
-        parts.append("strong reasoning")
-    ctx = live.get("context_length")
-    if ctx:
-        parts.append(f"{int(ctx) // 1000}K context")
-    mid = model_id.lower()
-    if any(tok in mid for tok in ("code", "codex", "dev", "engin")):
-        parts.append("good at coding and engineering")
-    if any(tok in mid for tok in ("flash", "mini", "nano", "lite")):
-        parts.append("fast and lightweight")
-    if not parts:
-        parts.append("general-purpose assistant")
-    joined = "; ".join(parts)
-    return joined + ("; text-only" if not live.get("vision") else "")
-
-
-def _infer_caps(model_id: str, live: Dict[str, Any]) -> Dict[str, Any]:
-    """Conservative capability flags for a model with no curated entry."""
-    mid = model_id.lower()
-    caps: Dict[str, Any] = {
-        "vision": bool(live.get("vision")),
-        "reasoning": bool(live.get("reasoning")),
-    }
-    if any(tok in mid for tok in ("code", "codex", "dev", "engin")):
-        caps["coding"] = True
-    return caps
-
-
-def direct_model_ids(catalog) -> frozenset:
-    """Ids that bypass the egress pool for latency -- computed live.
-
-    Always the routing dispatcher (a stalled dispatcher blocks every
-    ``lingling-auto`` turn), plus the fastest free text-only chat model, taken
-    as the smallest published context window -- the only latency signal
-    models.dev publishes. A newly published fast model joins automatically;
-    nothing here is a hardcoded id list.
-    """
-    ids = set([config.DISPATCHER_MODEL])
-    best: Optional[str] = None
-    best_ctx = 0
-    for m in catalog.free():
-        if m.vision:
-            continue
-        ctx = m.context_length or 0
-        if best is None or ctx < best_ctx:
-            best, best_ctx = m.id, ctx
-    if best:
-        ids.add(best)
-    return frozenset(ids)
-
-
-_catalog_ref = None
-_DIRECT_CACHE: frozenset = frozenset()
-_DIRECT_AT = 0.0
-_DIRECT_TTL_S = 300.0
-
-
-def set_catalog_ref(catalog) -> None:
-    """Give the provider the live catalog so ``prefer_direct`` stays dynamic."""
-    global _catalog_ref
-    _catalog_ref = catalog
-
-
-def _current_direct_ids() -> frozenset:
-    global _DIRECT_CACHE, _DIRECT_AT
-    if _catalog_ref is None:
-        return frozenset({config.DISPATCHER_MODEL})
-    now = time.time()
-    if not _DIRECT_CACHE or now - _DIRECT_AT > _DIRECT_TTL_S:
-        _DIRECT_CACHE = direct_model_ids(_catalog_ref)
-        _DIRECT_AT = now
-    return _DIRECT_CACHE
-
-
-# Authoritative capabilities of OpenCode's free-tier models. Verified live
-# (vision/tool-call probes against the real endpoint) and cross-checked against
-# each vendor's docs. Any free model not listed here gets conservative defaults.
-# `desc` is the human-readable strength summary the dispatcher reads.
+# Curated capability overlay for OpenCode's free-tier models.
+# Verified live (vision/tool-call probes + vendor docs).  This is NOT the
+# source of truth for "is this model free" -- the live /models endpoint plus
+# the ``-free`` suffix is.  The overlay only enriches ``desc``/vision for
+# routing quality; any new ``*-free`` model not listed here is still served,
+# with a synthetic desc and metadata-derived capabilities.  Entries without a
+# ``-free`` suffix (``big-pickle``) need an explicit allowlist entry because
+# suffix alone can't identify them; operator can also add more via
+# ``LINGLING_EXTRA_FREE_MODELS`` without code change.
 #
-# NOTE: OpenCode's free tier is identified by the ``-free`` suffix OR by being a
-# known keyless free model (``big-pickle``). models.dev pricing is NOT trusted
-# for OpenCode because it mislabels some paid models (e.g. ``gpt-5.3-codex-spark``)
-# as free -- only entries here are served.
+# ``api: "responses"`` marks Responses-only models (e.g. muse-spark) that Zen
+# serves on POST /v1/responses, not /chat/completions.  The set is also
+# extendable via ``LINGLING_RESPONSES_MODELS`` env var.
 #
-# Reasoning effort is deliberately absent from this map. models.dev publishes a
-# per-model ``reasoning_options`` list -- the same data OpenCode's CLI shows under
-# ``/variants`` -- and it is not uniform: deepseek honours low/high/max, ling
-# honours low/medium/high, mimo honours none. It cannot be probed either, because
-# OpenCode returns 200 for a value the model ignores. So effort comes from
-# metadata.reasoning_effort_values() and stays current as models change; see
-# routing/effort.py.
+# Reasoning effort is deliberately absent here -- it comes from
+# models.dev ``reasoning_options`` (see routing/effort.py) which is live per
+# model and cannot be probed.
 FREE_MODEL_CAPS: Dict[str, Dict[str, Any]] = {
     "deepseek-v4-flash-free": {
         "vision": False, "reasoning": True, "coding": True, "tool_calls": True,
@@ -131,6 +56,10 @@ FREE_MODEL_CAPS: Dict[str, Dict[str, Any]] = {
     "mimo-v2.5-free": {
         "vision": True, "reasoning": True, "coding": True, "tool_calls": True,
         "desc": "multimodal: understands images/screenshots/photos; also strong general reasoning; the ONLY free vision model",
+    },
+    "ling-3.0-flash-free": {
+        "vision": False, "reasoning": True, "coding": True, "tool_calls": True,
+        "desc": "balanced general-purpose chat and light coding; fast; text-only",
     },
     "nemotron-3-ultra-free": {
         "vision": False, "reasoning": True, "coding": True, "tool_calls": True,
@@ -144,21 +73,25 @@ FREE_MODEL_CAPS: Dict[str, Dict[str, Any]] = {
         "vision": False, "reasoning": True, "coding": True, "tool_calls": True,
         "desc": "solid general-purpose assistant for everyday questions and writing; text-only",
     },
-    # Big Pickle is OpenCode's own free reasoning model (keyless, confirmed live).
-    # No -free suffix, so it must be listed here to be served.
     "big-pickle": {
         "vision": False, "reasoning": True, "coding": True, "tool_calls": True,
         "desc": "strong deliberate reasoning model for multi-step problem solving and tool use; text-only",
     },
-    # Meituan's LongCat-2.0, served by OpenCode as longcat-2.0-free. Carries the
-    # -free suffix so it is already served; this curated entry gives the
-    # dispatcher its real strengths instead of guessing from the id. 1M-token
-    # context, 131K output, tool calling, reasoning, text-only (confirmed live +
-    # modeled in models.dev: attachment=false, modalities=[text], limit.context=1M).
-    "longcat-2.0-free": {
+    "muse-spark-1.2-contributor-free": {
         "vision": False, "reasoning": True, "coding": True, "tool_calls": True,
-        "desc": "Meituan 1M-context reasoning model with tool calling; excellent for very long documents and in-depth coding; text-only",
+        "api": "responses",
+        "desc": "coding-focused reasoning model; strong code generation, complex debugging and codebase understanding; text-only",
     },
+}
+
+# Extra free ids without ``-free`` suffix, supplied at runtime (comma-separated).
+# Lets operators add a new suffix-less free model without touching code.
+_EXTRA_FREE_IDS: set[str] = {
+    s.strip() for s in __import__("os").getenv("LINGLING_EXTRA_FREE_MODELS", "").split(",") if s.strip()
+}
+# Extra Responses-only ids, same mechanism.
+_EXTRA_RESPONSES_IDS: set[str] = {
+    s.strip() for s in __import__("os").getenv("LINGLING_RESPONSES_MODELS", "").split(",") if s.strip()
 }
 
 
@@ -183,76 +116,244 @@ class OpenCodeProvider(OpenAICompatibleProvider):
         return True
 
     def prefer_direct(self, model_id: str) -> bool:
-        """Keep the fast chat route responsive when local WARP is unhealthy.
+        """Keep the fast chat route responsive when local egress is unhealthy.
 
-        Fast-path models bypass the egress proxy pool entirely. The set is
-        computed live from the catalog (the routing dispatcher plus the fastest
-        free text-only chat model) rather than hardcoded, so a newly published
-        fast model joins automatically. ``LINGLING_FAST_MODELS_DIRECT=0``
-        forces everything through the pool.
+        Fast-path models bypass the egress proxy pool entirely. Membership
+        comes from the operator, not from a hardcoded model roster:
+
+        - ``LINGLING_FAST_MODELS_DIRECT`` (comma-separated ids) names the
+          casual-chat models that must stay responsive.
+        - A pinned ``LINGLING_DISPATCHER_MODEL`` is implicitly exempt: the
+          routing brain must answer fast so lingling-auto decisions never
+          queue behind dead proxies. With no pin (the shipped default) no
+          id is implicitly exempt -- the catalog-picked brain rotates egress
+          like any other model.
+
+        Every id can be forced back through the pool by setting
+        ``LINGLING_FAST_MODELS_DIRECT=0``.
         """
         if not config.FAST_MODELS_DIRECT:
             return False
-        if model_id == config.DISPATCHER_MODEL:
-            return True   # a stalled dispatcher blocks every lingling-auto turn
-        return model_id in _current_direct_ids()
+        if model_id in config.FAST_MODELS_DIRECT_IDS:
+            return True
+        if config.DISPATCHER_MODEL:
+            return model_id == config.DISPATCHER_MODEL
+        return False
 
     def _models_secret(self) -> Optional[str]:
         return None               # /models is keyless on OpenCode
 
     def is_model_free(self, model_id: str, meta: Dict[str, Any]) -> bool:
-        # OpenCode's explicit free marker.
+        # Primary signal: the ``-free`` suffix.  This is fully dynamic -- any
+        # new ``*-free`` model OpenCode advertises tomorrow is served without a
+        # code change.
         if model_id.lower().endswith("-free"):
             return True
-        # Known keyless free models without the suffix (e.g. big-pickle). Only
-        # curated entries count -- models.dev pricing is intentionally NOT
-        # trusted here because it mislabels paid models as free.
-        if model_id in FREE_MODEL_CAPS:
+        # Suffix-less free models (e.g. ``big-pickle``) need an explicit
+        # allowlist.  The curated overlay covers known ones; the env var lets
+        # operators add new ones without touching code.
+        if model_id in FREE_MODEL_CAPS or model_id in _EXTRA_FREE_IDS:
             return True
-        # Everything else is treated as premium (fail closed).
         return False
 
     def build_model(self, model_id: str):
-        """Enrich a model id, combining curated notes with live models.dev data.
+        """Enrich a model id, combining curated overlay with live models.dev data.
 
-        OpenCode's own ``/models`` returns nothing but ``{id, object, created,
-        owned_by}``, so capabilities have to come from elsewhere. The split:
-
-        * ``FREE_MODEL_CAPS`` owns vision, tool-calling and the ``desc`` the
-          dispatcher reads -- verified by hand, because models.dev has gaps and
-          mislabels some paid models as free.
-        * models.dev owns context limits and the reasoning-effort values, because
-          both change per model release and cannot be probed reliably. An earlier
-          hardcoded copy of these drifted badly: it claimed 1M context for
-          deepseek (really 200K) and seven effort levels for models that honour
-          two or none.
+        * When a curated entry exists, its ``desc``/vision wins (hand-verified).
+        * Otherwise capabilities are synthesized from live metadata + id tokens,
+          so a brand-new ``*-free`` model is usable with no code change.
+        * Context/effort always come from live metadata.
         """
         from providers.base import ProviderModel, _prettify
+        caps = FREE_MODEL_CAPS.get(model_id)
         live = metadata.enrich(model_id, self.id)
+        if caps:
+            merged = dict(caps)
+            merged["effort"] = live.get("effort") or []
+            merged["reasoning_toggle"] = bool(live.get("reasoning_toggle"))
+            return ProviderModel(
+                id=model_id,
+                provider_id=self.id,
+                name=_prettify(model_id),
+                free=True,
+                vision=bool(caps.get("vision")),
+                reasoning=bool(caps.get("reasoning")),
+                context_length=live.get("context_length"),
+                max_output=live.get("max_output"),
+                modalities=["text", "image"] if caps.get("vision") else ["text"],
+                capabilities=merged,
+            )
+        # No curated entry: synthesize desc from id signals + live reasoning flag,
+        # so the dispatcher's capability table still has something to route on.
+        # This is the fully-dynamic path for future models.
+        base = super().build_model(model_id)
+        # If the live enrich already produced a desc-free capabilities dict,
+        # attach a synthetic one so dispatcher fallback scoring has signal.
+        if not base.capabilities.get("desc"):
+            mid = model_id.lower()
+            hints: list[str] = []
+            if base.vision:
+                hints.append("multimodal: understands images")
+            if "code" in mid:
+                hints.append("code generation")
+            if base.reasoning:
+                hints.append("reasoning")
+            if any(t in mid for t in ("flash", "mini", "lite")):
+                hints.append("fast")
+            if any(t in mid for t in ("ultra", "pro", "max")):
+                hints.append("high capability")
+            if hints:
+                base.capabilities["desc"] = "; ".join(hints)
+            else:
+                base.capabilities["desc"] = "general-purpose free model"
+        return base
 
-        # The curated overlay is optional enrichment, not a gate. It upgrades a
-        # hand-verified description when present; a model it does not cover is
-        # still served and described dynamically (from models.dev + the id), so
-        # a newly published free model appears and routes on the next catalog
-        # refresh, with no code change.
-        caps: Dict[str, Any] = dict(FREE_MODEL_CAPS.get(model_id) or {})
-        caps.setdefault("effort", live.get("effort") or [])
-        caps.setdefault("reasoning_toggle", bool(live.get("reasoning_toggle")))
-        caps.setdefault("desc", _infer_desc(model_id, live))
-        for key, value in _infer_caps(model_id, live).items():
-            caps.setdefault(key, value)
+    # -- Responses-API dispatching --------------------------------------
+    # Zen hosts a subset of its free models on the OpenAI Responses API at
+    # POST /v1/responses and exposes NOTHING for them on /chat/completions.
+    # To a chat-completions client they look like a 500-then-failover when in
+    # reality the model is healthy and just lives at a different URL. The
+    # ``api: "responses"`` capability flag (set in ``FREE_MODEL_CAPS``) marks
+    # those identifiers; the overrides below both translate chat shape <->
+    # responses shape so callers (the executor) keep operating on chat JSON
+    # regardless of which side of the upstream boundary a model lives on.
 
-        return ProviderModel(
-            id=model_id,
-            provider_id=self.id,
-            name=live.get("name") or _prettify(model_id),
-            free=self.is_model_free(model_id, live.get("_meta") or {}),
-            vision=bool(caps.get("vision")),
-            reasoning=bool(caps.get("reasoning")),
-            context_length=live.get("context_length"),
-            max_output=live.get("max_output"),
-            modalities=live.get("modalities") or (
-                ["text", "image"] if caps.get("vision") else ["text"]
-            ),
-            capabilities=caps,
+    def is_responses_model(self, model_id: str) -> bool:
+        """Whether the listed model id is served only on the Responses API."""
+        if model_id in _EXTRA_RESPONSES_IDS:
+            return True
+        caps = FREE_MODEL_CAPS.get(model_id) or {}
+        return caps.get("api") == "responses"
+
+    def _responses_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/responses"
+
+    def _responses_client_kwargs(
+        self, proxy_url: Optional[str], timeout: Optional[float],
+    ) -> Dict[str, Any]:
+        """httpx.Client kwargs for a Responses upstream call.
+
+        Mirrors the chat path's connect handling (``trust_env=False`` so the
+        process's HTTP(S)_PROXY never silently uses an egress proxy; explicit
+        ``proxy_url`` remains the proxy-pool's). Egress pool + first-token
+        timeout semantics are identical to chat, so the executor's existing
+        failure modes (cool a bad proxy, retry across the pool) keep working
+        for the Responses branch unchanged.
+        """
+        kw: Dict[str, Any] = {
+            "timeout": httpx.Timeout(timeout or config.REQUEST_TIMEOUT),
+            "trust_env": False,
+        }
+        if proxy_url:
+            kw["proxy"] = proxy_url
+            kw["timeout"] = httpx.Timeout(
+                timeout or config.REQUEST_TIMEOUT,
+                connect=min(config.PROXY_CONNECT_TIMEOUT, float(timeout or config.REQUEST_TIMEOUT)),
+            )
+        return kw
+
+    def chat_completions(
+        self, messages: List[Dict[str, Any]], model: str, secret: str,
+        timeout: Optional[int] = None, proxy_url: Optional[str] = None,
+        **params: Any,
+    ) -> Dict[str, Any]:
+        """POST the upstream chat endpoint -- or, for Responses-only models,
+        the Responses endpoint with the shapes translated by
+        ``providers.openai_responses``. The runner up here is the executor:
+        nothing in its discriminator changes whether the body that crossed
+        the wire was Chat or Responses, because by the time it sees a result
+        it is always a chat-completion dict.
+        """
+        if self.is_responses_model(model):
+            return self._responses_nonstream(
+                messages, model, secret, timeout=timeout, proxy_url=proxy_url, **params,
+            )
+        return super().chat_completions(
+            messages, model, secret, timeout=timeout, proxy_url=proxy_url, **params,
         )
+
+    def stream_chat(
+        self, messages: List[Dict[str, Any]], model: str, secret: str,
+        timeout: Optional[int] = None, proxy_url: Optional[str] = None,
+        **params: Any,
+    ) -> Generator[bytes, None, None]:
+        """Open a chat-completion stream -- or, for Responses-only models, a
+        Responses stream that is reshaped to chat-completion SSE on the way
+        out. The generator's surface is identical either way: OpenAI SSE
+        chunks terminated with ``data: [DONE]\\n\\n``.
+        """
+        if self.is_responses_model(model):
+            return self._responses_stream(
+                messages, model, secret, timeout=timeout, proxy_url=proxy_url, **params,
+            )
+        return super().stream_chat(
+            messages, model, secret, timeout=timeout, proxy_url=proxy_url, **params,
+        )
+
+    def _responses_nonstream(
+        self, messages: List[Dict[str, Any]], model: str, secret: str,
+        *, timeout: Optional[float] = None, proxy_url: Optional[str] = None,
+        **params: Any,
+    ) -> Dict[str, Any]:
+        body = openai_responses.build_responses_body(
+            model, messages, stream=False, **params,
+        )
+        # Use the cached client (set up in OpenAICompatibleProvider.__init__):
+        # one TCP+TLS handshake across an arbitrary number of chat + Responses
+        # requests through the same SOCKS5 tunnel. trust_env=False + the proxy
+        # override are already wired by _client_for; nothing Responses-shape
+        # needs to add beyond timeout choice.
+        client = self._client_for(proxy_url, timeout)
+        try:
+            resp = client.post(
+                self._responses_url(), json=body, headers=self.auth_headers(secret),
+            )
+        except httpx.HTTPError as exc:
+            # Same UpstreamError normalization as the chat path so the executor
+            # cools a dead proxy / fails over to the next egress on a 5xx-retry.
+            self._evict_proxy_client(proxy_url)
+            raise UpstreamError(504, str(exc), self.id) from exc
+        if resp.status_code >= 400:
+            raise UpstreamError(resp.status_code, resp.text, self.id)
+        try:
+            payload = resp.json()
+        except Exception as exc:  # malformed body -> 504-style availability failure
+            raise UpstreamError(502, f"non-JSON Responses body: {exc}", self.id) from exc
+        return openai_responses.response_to_chat_completion(payload, requested_model=model)
+
+    def _responses_stream(
+        self, messages: List[Dict[str, Any]], model: str, secret: str,
+        *, timeout: Optional[float] = None, proxy_url: Optional[str] = None,
+        **params: Any,
+    ) -> Generator[bytes, None, None]:
+        body = openai_responses.build_responses_body(
+            model, messages, stream=True, **params,
+        )
+        client = self._client_for(proxy_url, timeout)
+        try:
+            with client.stream(
+                "POST", self._responses_url(),
+                json=body, headers=self.auth_headers(secret),
+                timeout=self._stream_timeout(proxy_url, timeout),
+            ) as resp:
+                if resp.status_code >= 400:
+                    detail = resp.read().decode("utf-8", "replace")
+                    raise UpstreamError(resp.status_code, detail, self.id)
+                # Base camp-shape generator yields bytes; iter_lines yields
+                # str. Encode for the translator before it inspects a prefix.
+                upstream_lines = (
+                    line.encode("utf-8") if isinstance(line, str) else line
+                    for line in resp.iter_lines()
+                    if line
+                )
+                yield from openai_responses.chat_sse_from_responses_sse(
+                    upstream_lines, requested_model=model,
+                )
+        except httpx.TimeoutException as exc:
+            # A timeout mid-stream is a stall, not a poisoned tunnel: keep the
+            # cached client so the next request through this lane reuses the
+            # warm TCP+TLS instead of re-handshaking. (See base.stream_chat.)
+            raise UpstreamError(504, str(exc), self.id) from exc
+        except httpx.HTTPError as exc:
+            self._evict_proxy_client(proxy_url)
+            raise UpstreamError(504, str(exc), self.id) from exc

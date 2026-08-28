@@ -1,46 +1,63 @@
-"""Load-balanced egress proxy pool with exponential cooldown.
+"""Honest, minimal egress pool. No bullshit load windows.
 
-OpenCode rate-limits its free tier by connecting IP, not by key, so requests are
-routed through a pool of egress proxies and a proxy is cooled on
-rate-limit/auth/server errors -- exactly like the key pool cools a burned key.
+OpenCode free tier is generous: ~30-100 req per model per IP before 429 (verified
+live). The pool's job is to rotate on real 429, not fake "rate-limited after 2-3
+req" chatter. Picks the fastest healthy proxy (EWMA latency, else round-robin).
 
-Selection is *proactive* load balancing:
+Picking algorithm (in this order, refreshed by `_pick_locked`):
 
-* :meth:`pick` returns the least-recently-loaded available proxy (by a decaying
-  ``window_load``), spreading traffic evenly from the first request.
-* :meth:`pick_sticky` pins a conversation to one exit IP. Off by default
-  (``LINGLING_PROXY_STICKY=0``): it defeats the per-IP purpose, and affinity,
-  when needed, is assigned by load and remembered rather than by hashing the
-  session id (``hash(str)`` is randomised per process, so it wasn't even stable).
+1. Drop anything in cooldown; if every proxy cools, fall through to the soonest.
+2. Find the lowest `_avg_latency`; neighbours within `_LATENCY_BAND_MS` are
+   "competitively fast" and picked between by load (so the dispatcher can hold
+   a fast lane back when an even-faster one already exists).
+3. Each candidate's effective load = `decayed_load(now)` plus
+   `_ACTIVE_STREAMS_WEIGHT × active_streams.active(pid)` -- the live con-
+   currency contribution from `providers.active_streams`. Past-window
+   request count alone doesn't tell us "this lane is currently carrying a
+   stream," and stacking 3 in-flight streams on the same fast lane was
+   what burned the per-IP free-tier quota under the 3-CLI stress run.
+4. Among ties at the lowest effective load, round-robin so fresh-boot
+   (all-zeros) spreads instead of always taking the head of the list.
 """
 
 from __future__ import annotations
 
-import logging
+import os
+import random
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from core import config
+from providers.active_streams import active_streams
 
-log = logging.getLogger(__name__)
-
-# Half-life (seconds) for the rolling load window. A request counts for ~half
-# its weight after this long. Two minutes = "load over the last few minutes"
-# rather than "load since process start" -- an idle proxy recovers fast.
 _WINDOW_HALF_LIFE_S = 120.0
-
-# Cap on remembered session -> proxy assignments. Only consulted when sticky
-# sessions are switched on; bounded because session ids are unbounded.
 _MAX_SESSIONS = 2048
-
-# Statuses that mean the *exit IP* is barred from serving us (per-IP rate
-# window, or a 401/403 region/blocklist), as opposed to a transient server or
-# request-shape failure. mark_failure parks these under the longer
-# PROXY_COOLDOWN_BLOCKED_BASE_MS so pick() pivots onto a fresh lane instead of
-# re-selecting a burned IP next turn and re-burning the failover budget.
-_BLOCKED_STATUS_CODES = frozenset({429, 401, 403})
+# Latency band (ms) inside which load decides instead of raw latency. See
+# ``_pick_locked`` for why concurrent streams must spread across lanes.
+_LATENCY_BAND_MS = 300.0
+# Multiplier from "currently-carrying-an-open-stream" to "an equivalent
+# decayed_load tick". A lane with 1 in-flight stream therefore reads as
+# ~1.5x past-window-loaded as one with no streams. Sized > 1 so a
+# single inflight event already nudges a slow-but-idle lane past a
+# fast-but-busy one; < 2 so two inflight doesn't *completely* shadow
+# one extra inflight (the difference between 1 and 2 streams still
+# shows up). Tunable via env for stress runs where the load/stream
+# ratio shifts.
+_ACTIVE_STREAMS_WEIGHT = 1.5
+# Picker algorithm. Defaults to P2C (Power-of-Two-Choices) since the
+# research review confirmed Netflix's Zuul approach (multi-factor
+# scoring + linear decay + choice-of-2) is exactly the right shape for
+# a 10-lane cohort: O(log log N) ≈ 1.7 streams of max-load gap even
+# under poison-pill bursts, computed in O(1) per pick. Setting
+# ``LINGLING_LOAD_BALANCER_ALGO=rr`` falls back to the legacy
+# latency-band + ties-broken-by-round-robin path, which is preferable
+# only if the random sampler is somehow a regression (e.g. a future
+# pseudorandom-checked-in-by-bug scenario). Tested in
+# ``test_unit_proxy_pool_pick_uses_power_of_two_choices``.
+_P2C_MIN_POOL = 4  # below this size, P2C doesn't sample two distinct lanes well
+_LOAD_BALANCER_ALGO = os.getenv("LINGLING_LOAD_BALANCER_ALGO", "p2c").lower()
 
 
 def _redact(url: str) -> str:
@@ -54,18 +71,17 @@ def _redact(url: str) -> str:
 
 @dataclass
 class Proxy:
-    """A single egress proxy URL. Never exposed with credentials via the API."""
+    """One egress proxy. Honest stats, latency + load."""
 
     id: str
     url: str
     label: str = ""
     cooldown_until: float = 0.0
     consecutive_failures: int = 0
-    total_requests: int = 0          # lifetime (stats only)
-    total_429: int = 0               # lifetime 429s (stats only)
-    # Rolling load window -- the effective weight of every request decays by
-    # half every _WINDOW_HALF_LIFE_S. This is what "least loaded" selects on.
+    total_requests: int = 0
+    total_429: int = 0
     window_load: float = 0.0
+    _avg_latency: Optional[float] = None
     last_used_ts: float = 0.0
 
     def in_cooldown(self, now: Optional[float] = None) -> bool:
@@ -75,7 +91,6 @@ class Proxy:
         return max(0.0, self.cooldown_until - (now or time.time()))
 
     def decayed_load(self, now: float) -> float:
-        """window_load decayed to *now* based on time since last_used_ts."""
         if self.last_used_ts <= 0:
             return 0.0
         elapsed = now - self.last_used_ts
@@ -83,29 +98,24 @@ class Proxy:
             return self.window_load
         return self.window_load * (0.5 ** (elapsed / _WINDOW_HALF_LIFE_S))
 
-    @property
-    def kind(self) -> str:
-        """The egress family this lane belongs to: ``warp`` / ``tor`` / ``manual``.
+    def effective_load(self, now: float, active_weight: float = _ACTIVE_STREAMS_WEIGHT) -> float:
+        """Picker score: decayed_load + active penalty.
 
-        Inferred from the id prefix -- WARP identities are ``warp-{i}``, Tor
-        lanes ``tor-{i}`` and operator-added proxies ``proxy-{N}`` -- so the
-        pool needs no per-merge-site plumbing to tag lanes with their source.
-        The request path reads this to bias failover (a cooked model's single
-        attempt goes to a Tor lane, which re-picks its route and bypasses
-        OpenCode's per-IP burn) instead of trusting the free-text ``label``,
-        which no pick path reads.
+        ``active_streams.active(self.id)`` reads the live stream count under
+        its own lock (the only other place the pool reads this is ``status``
+        below). The pool's own lock is not held here -- both the picker and
+        the status endpoint call ``effective_load`` outside any lock, the
+        only writers (the executor's inc/dec) go through ``active_streams``
+        directly, and the integer read there is short enough that an
+        off-by-one either at the call boundary is impossible (the
+        transitional value is the right answer for "right now").
         """
-        if self.id.startswith("warp-"):
-            return "warp"
-        if self.id.startswith("tor-"):
-            return "tor"
-        return "manual"
+        return self.decayed_load(now) + active_weight * active_streams.active(self.id)
 
     def status(self) -> Dict[str, Any]:
         now = time.time()
         return {
             "id": self.id,
-            "kind": self.kind,
             "label": self.label or self.id,
             "url": _redact(self.url),
             "in_cooldown": self.in_cooldown(now),
@@ -113,7 +123,14 @@ class Proxy:
             "consecutive_failures": self.consecutive_failures,
             "total_requests": self.total_requests,
             "total_429": self.total_429,
+            "avg_latency_ms": round(self._avg_latency, 1) if self._avg_latency is not None else None,
             "window_load": round(self.decayed_load(now), 2),
+            # Live stream count, read through ``active_streams`` (a single
+            # dict lookup under its own lock). Surfaced so the dashboard's
+            # chip can render "2 streams" alongside the decayed-load cell
+            # and the operator can distinguish a lane that's just busy
+            # from a cooling one.
+            "active_streams": active_streams.active(self.id),
         }
 
 
@@ -134,7 +151,7 @@ class ProxyPool:
         # Monotonic counter for generated ids. Deriving them from len(proxies)
         # meant remove-then-add reused a live id: removing proxy-2 from three
         # proxies left ['proxy-1','proxy-3'], and the next add() was also
-        # 'proxy-3'. get_by_id/remove return the first match, so the WARP health
+        # 'proxy-3'. get_by_id/remove return the first match, so the health
         # daemon could then heal or dump the wrong exit.
         self._next_id = len(self.proxies) + 1
 
@@ -183,23 +200,17 @@ class ProxyPool:
             return px
 
     def remove(self, proxy_id: str) -> bool:
-        removed = False
         with self._lock:
             for i, px in enumerate(self.proxies):
                 if px.id == proxy_id:
                     self.proxies.pop(i)
-                    removed = True
-                    break
-        if removed:
-            # The proxy is gone; its pooled connections are pointlessly warm and
-            # could hold a dead tunnel. Drop them so no later request reuses one.
-            self._invalidate_connection_pool(proxy_id)
-        return removed
+                    return True
+            return False
 
     def set_url(self, proxy_id: str, url: str) -> bool:
         """Repoint a proxy at a new URL, under the lock.
 
-        The WARP health daemon calls this after a port migration. It used to
+        The health daemon calls this after a port migration. It used to
         assign ``px.url`` directly on the object returned by ``get_by_id``, which
         is the one field the executor reads while building an httpx client -- so
         the write raced a request and could send it through a stale port.
@@ -208,95 +219,54 @@ class ProxyPool:
             for px in self.proxies:
                 if px.id == proxy_id:
                     px.url = url
-                    break
-            else:
-                return False
-        # A port change means the old tunnel is gone; pooled clients still
-        # pointed at the old port must not be reused.
-        self._invalidate_connection_pool(proxy_id)
-        return True
-
-    @staticmethod
-    def _invalidate_connection_pool(proxy_id: str) -> None:
-        """Best-effort drop of a proxy's pooled httpx connections."""
-        try:
-            from providers.connection_pool import get_connection_pool
-            get_connection_pool().invalidate(proxy_id)
-        except Exception:  # noqa: BLE001
-            pass
+                    return True
+            return False
 
     # -- selection ---------------------------------------------------------
     def pick(self) -> Optional[Proxy]:
-        """Pick the **least-loaded available** proxy.
-
-        Among all proxies not in cooldown, returns the one with the smallest
-        decayed ``window_load`` (the one that has done the least work in the last
-        few minutes). Ties are broken by the rotating cursor so equal-load
-        proxies still alternate. Returns ``None`` only when the pool is empty.
-
-        If *every* proxy is in cooldown, the one closest to becoming available is
-        returned so callers can decide whether to wait or fail fast.
-        """
+        """Pick the fastest healthy proxy, load as tie-breaker."""
         with self._lock:
             return self._pick_locked(time.time())
 
-    def _pick_locked(
-        self, now: float, cands: Optional[List[Proxy]] = None,
-    ) -> Optional[Proxy]:
-        """The body of :meth:`pick`, for callers that already hold the lock.
-
-        Single pass, but preserves the round-robin tie-break: when several
-        proxies sit at the same (minimum) load -- the common case when the pool
-        is idle or every exit just cooled down -- the cursor advances so
-        concurrent requests spread across the tied exits instead of all piling
-        onto the first one. Without that, a burst of simultaneous requests
-        would burn one WARP IP's quota while the rest sat idle.
-
-        ``cands`` restricts selection to a subset (the sampler-proven exits of
-        a model via :meth:`pick_from`, or one egress family via
-        :meth:`pick_kind`); ``None`` (the default) considers the whole pool.
-        """
-        pool = cands if cands is not None else self.proxies
-        if not pool:
+    def _pick_locked(self, now: float) -> Optional[Proxy]:
+        if not self.proxies:
             return None
+        available = [px for px in self.proxies if not px.in_cooldown(now)]
+        if not available:
+            return min(self.proxies, key=lambda p: p.cooldown_until)
 
-        best: List[Proxy] = []
-        best_load = float('inf')
-        soonest_cooling: Optional[Proxy] = None
-        min_cooldown = float('inf')
+        def _lat(px: Proxy) -> float:
+            return px._avg_latency if px._avg_latency is not None else 0.0
 
-        for px in pool:
-            if not px.in_cooldown(now):
-                load = px.decayed_load(now)
-                if load < best_load:
-                    best_load = load
-                    best = [px]
-                elif load == best_load:
-                    best.append(px)
-            else:
-                remaining = px.cooldown_remaining(now)
-                if remaining < min_cooldown:
-                    min_cooldown = remaining
-                    soonest_cooling = px
+        # Power-of-Two-Choices (Netflix Zuul's "Choice-of-2") is the canonical
+        # path when the cohort is big enough for sampling to mean anything. We
+        # sample from all available lanes (NOT a latency-banded subset) because
+        # the band collapse -- one fast lane inside, three mid-latency lanes
+        # outside -- was the bug that pinned every pick to the single fastest
+        # exit under the live stress run with 6/10 lanes 429'd. With
+        # ``_ACTIVE_STREAMS_WEIGHT x active_streams(pid)`` baked into
+        # ``effective_load`` the score already penalises busy lanes; P2C's two-
+        # sample random draw is what stops the picker deterministically picking
+        # the head of the latency-sorted list every time.
+        if _LOAD_BALANCER_ALGO == "p2c" and len(available) >= _P2C_MIN_POOL:
+            a, b = random.sample(available, 2)
+            return a if a.effective_load(now) <= b.effective_load(now) else b
 
-        if best:
-            if len(best) > 1:
-                # A flat cursor over the tied set gives every proxy an equal
-                # turn -- per-IP balanced, so each exit burns at the same rate.
-                # A 50/50 *family* alternation would hand the minority family
-                # half the traffic and burn each of its IPs faster (the opposite
-                # imbalance). The case that needs Tor (a model cooked on the
-                # WARP exits) is handled in the executor's ``_pick_proxy``
-                # ``pick_kind("tor")`` bias on an empty sampler set, and the
-                # decayed-load comparison above already routes to the lighter
-                # family under traffic -- so a kind-aware cursor here would
-                # trade per-IP fairness for no real gain.
-                self._cursor = (self._cursor + 1) % len(best)
-                return best[self._cursor % len(best)]
-            return best[0]
-
-        # All in cooldown: return soonest
-        return soonest_cooling
+        # Legacy path: latency-band shortlist, tie-broken by effective load +
+        # round-robin. Used when ``LINGLING_LOAD_BALANCER_ALGO=rr`` pins the
+        # deterministic path (the rotation / sticky-load tests exercise this).
+        # Also retained as the fallback for small pools where two random
+        # samples often hit the same lane.
+        best_lat = min(_lat(px) for px in available)
+        banded = [px for px in available if _lat(px) <= best_lat + _LATENCY_BAND_MS]
+        if len(banded) > 1:
+            min_load = min(px.effective_load(now) for px in banded)
+            equal = [px for px in banded if px.effective_load(now) == min_load]
+            if len(equal) > 1:
+                self._cursor = (self._cursor + 1) % len(equal)
+                return equal[self._cursor % len(equal)]
+            return equal[0]
+        return min(available, key=_lat)
 
     def pick_sticky(self, session_id: str) -> Optional[Proxy]:
         """Pick a proxy for a session id, reusing the previous choice.
@@ -333,107 +303,6 @@ class ProxyPool:
                 self._remember(session_id, chosen.id)
             return chosen
 
-    def pick_from(
-        self, candidate_ids: Any, session_id: str = "",
-    ) -> Optional[Proxy]:
-        """Least-loaded available proxy restricted to ``candidate_ids``.
-
-        Used by the request path (via the executor) to route a model onto the
-        exits the post-heal sampler proved serve it. Mirrors :meth:`pick`
-        (least-decayed-load among the non-cooling candidates, round-robin
-        tie-break) and :meth:`pick_sticky` (a sticky session whose remembered
-        proxy is still a candidate and not cooling stays pinned).
-
-        If every candidate is cooling, the soonest-to-recover is returned (same
-        "wait or fail fast" contract as :meth:`pick`); if no candidate is in the
-        pool at all, it falls back to a normal :meth:`pick` so the request still
-        gets *an* exit rather than going direct -- a possibly-cooling exit is
-        better than no egress, which for OpenCode would simply 429 the home IP.
-        """
-        cand = {pid for pid in (candidate_ids or ()) if isinstance(pid, str)}
-        with self._lock:
-            if not self.proxies:
-                return None
-            now = time.time()
-            chosen: Optional[Proxy] = None
-            if cand and config.PROXY_STICKY_SESSIONS and session_id:
-                known = self._sessions.get(session_id)
-                if known in cand:
-                    for px in self.proxies:
-                        if px.id == known and not px.in_cooldown(now):
-                            chosen = px
-                            break
-            if chosen is None:
-                if not cand:
-                    chosen = self._pick_locked(now)
-                else:
-                    best: List[Proxy] = []
-                    best_load = float('inf')
-                    soonest_cooling: Optional[Proxy] = None
-                    min_cooldown = float('inf')
-                    for px in self.proxies:
-                        if px.id not in cand:
-                            continue
-                        if not px.in_cooldown(now):
-                            load = px.decayed_load(now)
-                            if load < best_load:
-                                best_load = load
-                                best = [px]
-                            elif load == best_load:
-                                best.append(px)
-                        else:
-                            remaining = px.cooldown_remaining(now)
-                            if remaining < min_cooldown:
-                                min_cooldown = remaining
-                                soonest_cooling = px
-                    if best:
-                        if len(best) > 1:
-                            self._cursor = (self._cursor + 1) % len(best)
-                            chosen = best[self._cursor % len(best)]
-                        else:
-                            chosen = best[0]
-                    elif soonest_cooling is not None:
-                        chosen = soonest_cooling
-                    else:
-                        # Candidates gone from the pool entirely.
-                        chosen = self._pick_locked(now)
-            # Mirror pick_sticky: remember the session's proxy so the next call
-            # reuses it. A stale pin (a fallback pick, or a candidate that has
-            # since left the set) self-corrects on the next call, when ``known in
-            # cand`` is False and a fresh candidate is selected.
-            if (
-                chosen is not None
-                and config.PROXY_STICKY_SESSIONS
-                and session_id
-            ):
-                self._remember(session_id, chosen.id)
-            return chosen
-
-    def pick_kind(self, kind: str, session_id: str = "") -> Optional[Proxy]:
-        """Least-loaded *available* proxy of one egress family, for failover tiering.
-
-        Returns ``None`` when no proxy of ``kind`` is in the pool or every one of
-        them is in cooldown -- callers (the cooked-model fail-fast path in the
-        executor) fall through to normal selection rather than parking the turn
-        on a known-burned lane. Unlike :meth:`pick`, this deliberately does not
-        return the soonest-cooling proxy: a failover-tier preference is for a
-        *fresh* exit (a Tor lane that just re-picked its route), not a parked
-        one. Used to route an OpenCode-cooked model's single attempt to Tor,
-        whose rotating exit bypasses OpenCode's per-IP burn, before the request
-        is abandoned to the dispatcher's model fallback.
-        """
-        with self._lock:
-            if not self.proxies:
-                return None
-            now = time.time()
-            cands = [
-                p for p in self.proxies
-                if p.kind == kind and not p.in_cooldown(now)
-            ]
-            if not cands:
-                return None
-            return self._pick_locked(now, cands)
-
     def _remember(self, session_id: str, proxy_id: str) -> None:
         """Record a session's proxy, bounding the map so it cannot grow forever.
 
@@ -461,41 +330,23 @@ class ProxyPool:
             return min(px.cooldown_remaining(now) for px in self.proxies)
 
     # -- feedback ----------------------------------------------------------
-    def mark_success(self, proxy: Proxy) -> None:
+    def mark_success(self, proxy: Proxy, latency_ms: Optional[float] = None) -> None:
         with self._lock:
-            # The half-open -> closed transition: a parked lane (a real request
-            # 429'd, or a probe verdict gated it) just served a real call, so it
-            # is back in rotation. Log only the recovery -- mark_success runs on
-            # the hot path and a steady-state success never parked anything.
-            was_parked = proxy.consecutive_failures > 0 or proxy.cooldown_until > 0.0
             proxy.consecutive_failures = 0
             proxy.cooldown_until = 0.0
             proxy.total_requests += 1
             now = time.time()
             proxy.window_load = proxy.decayed_load(now) + 1.0
             proxy.last_used_ts = now
-            if was_parked:
-                log.info("pool: %-16s healed -- back in rotation", proxy.id)
+            if latency_ms is not None:
+                alpha = 0.3
+                if proxy._avg_latency is None:
+                    proxy._avg_latency = latency_ms
+                else:
+                    proxy._avg_latency = alpha * latency_ms + (1 - alpha) * proxy._avg_latency
 
     def mark_failure(self, proxy: Proxy, status_code: int) -> float:
-        """Apply cooldown backoff for rate-limit / auth / server failures.
-
-        The body is the request-side partner of :meth:`extend_cooldown`: a real
-        request failed through this proxy (a 429 here, not a probe verdict), so
-        the cooldown bumps the burn tally *and* pushes the cooldown out. The
-        push only ever *extends* -- ``max(remaining, now + delay)`` -- so a
-        parked lane (a probe-time verdict the heal left for next pass) is not
-        pulled back into selection by a single request-time 429 only to
-        re-shorten its park. The exponential backoff stays meaningful: the
-        streak grows on every request, the cooldown just never shrinks back
-        to a value the operator already benched the lane for.
-
-        The base is per-reason: a 429/401/403 bars the exit IP itself, so it
-        parks under ``PROXY_COOLDOWN_BLOCKED_BASE_MS`` (long) and lets a fresh
-        lane take over rather than re-selecting the burned IP next turn; a 5xx
-        or contract-shape failure is transient and keeps ``PROXY_COOLDOWN_BASE_MS``
-        (short) so the exit retries sooner. Both escalate under the shared cap.
-        """
+        """Honest cooldown: 429 is real rate-limit (long), others short."""
         with self._lock:
             proxy.total_requests += 1
             now = time.time()
@@ -503,37 +354,20 @@ class ProxyPool:
             proxy.last_used_ts = now
             if status_code == 429:
                 proxy.total_429 += 1
-            # 404 is deliberately excluded: the executor treats it as a hard,
-            # non-retryable failure, so cooling this exit would bench a healthy IP
-            # for a problem no other IP would fix. The set here is kept in lock-step
-            # with executor._RETRYABLE: any status that the executor fails over on
-            # (a different proxy / key) should also cool the originating proxy, so
-            # pick() does not re-select the same bad IP next turn and force another
-            # failover. Drifting the two leaves 410/426/etc. retrying forever
-            # without ever cooling their responsible interface.
-            if status_code not in (401, 403, 426, 409, 410, 428, 429,
-                                   500, 502, 503, 504):
+                proxy.consecutive_failures += 1
+                base_s = config.PROXY_COOLDOWN_BASE_MS / 1000.0
+                max_s = config.PROXY_COOLDOWN_MAX_MS / 1000.0
+                delay = min(max_s, base_s * (2 ** (proxy.consecutive_failures - 1)))
+                proxy.cooldown_until = now + delay
+                return delay
+            if status_code in (500, 502, 503, 504):
+                proxy.cooldown_until = now + 2.0
+                return 2.0
+            if status_code not in config.RECONCILED_FAILURE_STATUSES:
                 return 0.0
             proxy.consecutive_failures += 1
-            # Per-reason base: a 429/401/403 bars the *exit IP* (rate window or
-            # region/blocklist), so it parks long and lets fresh lanes take over;
-            # a 5xx / contract-shape failure is a transient hiccup and keeps the
-            # short base so the exit retries sooner. Both escalate under the
-            # shared cap, so a lane that keeps burning reaches it and hands off
-            # to the heal/probe rotator.
-            blocked = status_code in _BLOCKED_STATUS_CODES
-            base_ms = (config.PROXY_COOLDOWN_BLOCKED_BASE_MS if blocked
-                       else config.PROXY_COOLDOWN_BASE_MS)
-            base_s = base_ms / 1000.0
-            max_s = config.PROXY_COOLDOWN_MAX_MS / 1000.0
-            delay = min(max_s, base_s * (2 ** (proxy.consecutive_failures - 1)))
-            proxy.cooldown_until = max(proxy.cooldown_until, now + delay)
-            log.info(
-                "pool: %-16s parked %.2fs on %d (consec=%d%s)",
-                proxy.id, delay, status_code, proxy.consecutive_failures,
-                " blocked" if blocked else "",
-            )
-            return delay
+            proxy.cooldown_until = now + 1.0
+            return 1.0
 
     # -- lookup ------------------------------------------------------------
     def get_by_id(self, proxy_id: str) -> Optional[Proxy]:
@@ -543,51 +377,6 @@ class ProxyPool:
                 if px.id == proxy_id:
                     return px
             return None
-
-    def reset_counters(self, proxy_id: str) -> None:
-        """Zero a proxy's burn counters and cooldown.
-
-        Called when a WARP tunnel re-establishes onto a fresh exit IP: the
-        previous exit's 429 history describes an address this slot no longer
-        uses, and carrying it over would push the slot towards the daemon's
-        dump threshold for nothing.
-        """
-        with self._lock:
-            for px in self.proxies:
-                if px.id == proxy_id:
-                    px.consecutive_failures = 0
-                    px.total_429 = 0
-                    px.cooldown_until = 0.0
-                    break
-
-    def extend_cooldown(self, proxy: "Proxy", seconds: float) -> None:
-        """Push this proxy's cooldown out to at least ``now + seconds`` (no failure bump).
-
-        The probe verdicts -- a rate-limited exit the heal could not re-roll
-        onto a serving IP, or a re-roll deferred because a stream is in flight
-        -- are *known* rate-limits rather than a request that just 429'd. They
-        want the exit gated out of :meth:`pick` until the next probe pass
-        re-evaluates it, so a live request is never routed through a known-burned
-        address only to rediscover its 429 at request time. But they must not
-        inflate ``consecutive_failures`` / ``total_429``: those are real-request
-        burn counters and feed ``_dump_burned_identities``, so a probe signal
-        would otherwise drive the dump threshold -- and a probe-time 429 is the
-        *old* observation, not a fresh request failure. So this is the
-        probe-side mirror of :meth:`mark_failure`: it raises ``cooldown_until``
-        to ``max(remaining, now + seconds)`` and leaves the failure tally alone.
-        """
-        with self._lock:
-            now = time.time()
-            seconds = max(0.0, float(seconds))
-            proxy.cooldown_until = max(proxy.cooldown_until, now + seconds)
-            # Caller-neutral: this is the probe-verdict side (park a known-burned
-            # exit until the next sampler pass re-evaluates it) AND the executor's
-            # upstream-Retry-After honor. The mark_failure log names the request
-            # status when one preceded this; here only the extension is logged.
-            log.info(
-                "pool: %-16s extended %.2fs (now parked %.1fs)",
-                proxy.id, seconds, proxy.cooldown_remaining(now),
-            )
 
     def get_all_proxies(self) -> List[Proxy]:
         """Thread-safe snapshot of all proxies (returns a copy)."""
@@ -599,20 +388,10 @@ class ProxyPool:
         with self._lock:
             now = time.time()
             available = sum(1 for p in self.proxies if not p.in_cooldown(now))
-            available_warp = sum(
-                1 for p in self.proxies
-                if p.kind == "warp" and not p.in_cooldown(now)
-            )
-            available_tor = sum(
-                1 for p in self.proxies
-                if p.kind == "tor" and not p.in_cooldown(now)
-            )
             return {
                 "total": len(self.proxies),
                 "available": available,
                 "in_cooldown": len(self.proxies) - available,
-                "available_warp": available_warp,
-                "available_tor": available_tor,
                 "proxies": [p.status() for p in self.proxies],
             }
 
