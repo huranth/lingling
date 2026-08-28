@@ -213,6 +213,16 @@ can spend its entire token budget thinking and never answer. Lingling reports th
 plainly rather than showing you its scratch work, with `stop_reason: max_tokens`
 so the agent can retry. If you see it, `/effort medium` usually fixes it.
 
+The free reasoning models also think in phases: they reason, end the turn with no
+visible text, then think again on their own — the same behavior you see in
+OpenCode's own CLI. Lingling recognizes that as the model's think-phase boundary,
+not a failure: it resumes the model's own encrypted reasoning when there is
+continuation state, and otherwise re-runs the request on the same egress lane
+with a doubled output budget (a budget-clipped think phase re-blanks at the same
+cap, and completes at a larger one — verified live). No lane rotation, no "blank
+response" noise. Only a genuinely unanswerable request reaches the
+empty-response notice after 3 attempts.
+
 ---
 
 ## Reasoning effort — "how hard should it think?"
@@ -593,7 +603,7 @@ requests first, or point it at a gateway that has been used.
 | `LINGLING_TOR_COUNT` | `10` | Number of Tor lanes |
 | `LINGLING_USAGE_RETENTION_DAYS` | `90` | Ledger pruning window; 0 disables |
 | `LINGLING_STREAM_RECOVERY` | `1` | Retry once when a stream dies mid-flight |
-| `LINGLING_STREAM_IDLE_TIMEOUT` | `90` | Treat an open-but-silent stream as broken after this many seconds; 0 disables |
+| `LINGLING_STREAM_IDLE_TIMEOUT` | `200` | Treat an open-but-silent stream as broken after this many seconds; 0 disables |
 | `LINGLING_EGRESS_WAIT_BUDGET` | `120` | Longest a request waits for a cooling exit before failing (s); 0 restores the old 503 |
 | `LINGLING_DATA_DIR` | `./data` | Data directory |
 | `LINGLING_STREAM_FIRST_TOKEN_TIMEOUT` | `30` | Time-to-first-token budget for SSE streams (s) |
@@ -638,7 +648,7 @@ key is optional.
    (`{"lingling_recover": false}`) and globally (`LINGLING_STREAM_RECOVERY=0`).
 3. **A silent stream is cut off, not waited on** -- an upstream that stops
    speaking while the socket stays open is treated as broken after
-   `LINGLING_STREAM_IDLE_TIMEOUT` (90 s) and handed to the normal retry. Before
+   `LINGLING_STREAM_IDLE_TIMEOUT` (200 s) and handed to the normal retry. Before
    this, one measured request sat 885 seconds with zero tokens before giving up,
    which is indistinguishable from a hang. A thinking model streams reasoning
    continuously, so a long think keeps the clock reset; only a true stall trips it.

@@ -280,7 +280,12 @@ STREAM_RECOVERY = os.getenv("LINGLING_STREAM_RECOVERY", "1") not in ("0", "false
 # Deliberately generous. A thinking free model streams `reasoning_content`
 # continuously (1203 frames for one measured turn), so a long think keeps frames
 # flowing; only a true stall goes quiet. 0 disables the watchdog.
-STREAM_IDLE_TIMEOUT = float(os.getenv("LINGLING_STREAM_IDLE_TIMEOUT", "90"))
+#
+# 200, not 90: a deep think phase can go fully silent for well over a minute
+# (measured 27s+ gaps mid-think; a real session stalled 90s+ on a long think and
+# the 90s watchdog killed it as "broken"). The watchdog must outlast the model's
+# longest natural silence, not the average one.
+STREAM_IDLE_TIMEOUT = float(os.getenv("LINGLING_STREAM_IDLE_TIMEOUT", "200"))
 
 # Soft cap on concurrent streams per egress proxy. Above this, the executor's
 # pick filter passes through to the next lane in the picker, and the saturated lane
@@ -346,10 +351,10 @@ PROXY_CONNECT_TIMEOUT = float(os.getenv("LINGLING_PROXY_CONNECT_TIMEOUT", "3"))
 # ``executor.execute_stream`` (a threadpool future wrapping only the very
 # first ``next(stream)``), so the socket read ceiling can safely exceed the
 # idle watchdog and let ``stream_idle.with_idle_timeout`` be the arbiter of
-# "gone quiet". 120 > 90 (idle) so the watchdog fires first on a real stall;
-# 120 < REQUEST_TIMEOUT+60 so a truly dead socket is still reclaimed
+# "gone quiet". 260 > 200 (idle) so the watchdog fires first on a real stall;
+# 260 < REQUEST_TIMEOUT+60 so a truly dead socket is still reclaimed
 # promptly and the reader thread in ``stream_idle`` exits on its own.
-STREAM_READ_TIMEOUT = float(os.getenv("LINGLING_STREAM_READ_TIMEOUT", "120"))
+STREAM_READ_TIMEOUT = float(os.getenv("LINGLING_STREAM_READ_TIMEOUT", "260"))
 
 
 # ---------------------------------------------------------------------------
