@@ -588,6 +588,12 @@ def chat_sse_from_responses_sse(
             # Robust: upstream has sent reasoning as encrypted blobs, summary_text,
             # text, or plain delta under various keys. Handle any reasoning prefix
             # so minimal at any effort doesn't drop the delta and leave blank.
+            # ``*.done`` events re-carry the FULL assembled text that the
+            # preceding ``*.delta`` events already streamed -- forwarding them
+            # duplicates the whole reasoning block client-side (verified live
+            # with muse-spark: two identical summary frames per turn).
+            if etype.endswith(".done"):
+                continue
             rd = obj.get("delta")
             text = ""
             if isinstance(rd, str):
