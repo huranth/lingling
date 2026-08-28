@@ -3,11 +3,8 @@
     python tools/codex_catalog.py
 
 Dumps the installed Codex binary's own catalog for a template, reads Lingling's
-live free models, and writes ``~/.codex/lingling_models.json``. By default it
-also wires the file into ``~/.codex/config.toml`` (applying the
-``model_catalog_json`` line there) and opens the API-key setup window; pass
-``--no-write-config`` to just print the config line, or ``--no-key-setup`` to
-suppress the window (useful for scripted runs).
+live free models, and writes ``~/.codex/lingling_models.json``. Prints the
+``config.toml`` line that activates it.
 
 Codex only accepts a filesystem path for ``model_catalog_json`` -- a URL is
 treated as a path and fails ("The filename, directory name, or volume label
@@ -19,7 +16,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -32,29 +28,6 @@ from models.catalog import UnifiedCatalog  # noqa: E402
 from providers import registry  # noqa: E402
 
 DEFAULT_OUT = Path.home() / ".codex" / "lingling_models.json"
-
-
-def _run_codex(argv: list, binary: str):
-    """Run ``codex debug models``, surviving bare-name launch on Windows.
-
-    npm installs codex as a ``codex.cmd``/``codex.ps1`` wrapper. ``subprocess``
-    with a bare ``["codex", ...]`` resolves that to a ``.CMD`` and then lets
-    ``CreateProcess`` try to execute it directly, which fails with
-    ``FileNotFoundError`` even though ``codex --version`` works in a shell. A
-    full path that keeps the explicit ``.cmd`` extension is handled correctly, so
-    retry with the ``shutil.which`` result. A genuinely-missing binary still gets
-    a clear error instead of a raw traceback.
-    """
-    try:
-        return subprocess.run(argv, capture_output=True)
-    except FileNotFoundError:
-        resolved = shutil.which(binary)
-        if not resolved:
-            raise SystemExit(
-                f"codex binary not found on PATH: {binary!r}. "
-                "Install it or pass --codex <path to the codex executable>."
-            )
-        return subprocess.run([resolved] + argv[1:], capture_output=True)
 
 
 def dump_codex_catalog(binary: str, bundled: bool = False) -> list:
@@ -70,8 +43,18 @@ def dump_codex_catalog(binary: str, bundled: bool = False) -> list:
     regeneration. The caller uses the refreshed dump when it contains real Codex
     models and falls back to the bundled one when it does not.
     """
-    argv = [binary, "debug", "models"] + (["--bundled"] if bundled else [])
-    proc = _run_codex(argv, binary)
+    import shutil as _shutil
+    # npm on Windows installs `codex.cmd` shim; CreateProcess cannot spawn .cmd
+    # directly, so route those through `cmd /c` — same fix as `codex/setup_gui.py`.
+    # `shutil.which` resolves bare `codex` to the full shim path so the extension
+    # check actually fires (bare `codex` has no extension).
+    resolved = _shutil.which(binary) or binary
+    _is_win_shim = sys.platform == "win32" and resolved.lower().endswith((".cmd", ".bat"))
+    if _is_win_shim:
+        argv = ["cmd", "/c", resolved, "debug", "models"] + (["--bundled"] if bundled else [])
+    else:
+        argv = [resolved, "debug", "models"] + (["--bundled"] if bundled else [])
+    proc = subprocess.run(argv, capture_output=True)
     if proc.returncode != 0:
         raise SystemExit(
             f"`{' '.join(argv[1:])}` failed ({proc.returncode}): "
@@ -137,10 +120,6 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT, help=f"output file (default: {DEFAULT_OUT})")
     ap.add_argument("--codex", default="codex", help="path to the codex binary")
     ap.add_argument("--template", default=None, help="Codex model slug to clone (default: its top-priority classic-Responses model)")
-    ap.add_argument("--no-write-config", action="store_true",
-                    help="do not edit ~/.codex/config.toml (just print the line)")
-    ap.add_argument("--no-key-setup", action="store_true",
-                    help="do not open the API-key setup window after generating")
     args = ap.parse_args()
 
     catalog = UnifiedCatalog(registry.build_providers())
@@ -183,69 +162,9 @@ def main() -> int:
     if dial_less:
         print("  (`default` = no dial published; runs on the model's own setting): "
               + ", ".join(dial_less))
-    line = f'model_catalog_json = "{args.out.as_posix()}"'
-    if args.no_write_config:
-        print("\nAdd to ~/.codex/config.toml:")
-        print(f"  {line}")
-    else:
-        cfg = Path.home() / ".codex" / "config.toml"
-        ensure_config_line(cfg, line)
-        print(f"\nwired into {cfg} (restart codex for it to take effect)")
-
-    if not args.no_key_setup:
-        _open_key_setup()
+    print("\nAdd to ~/.codex/config.toml:")
+    print(f'  model_catalog_json = "{args.out.as_posix()}"')
     return 0
-
-
-def _open_key_setup() -> None:
-    """Open the API-key setup window so the ``set LINGLING_API_KEY`` step is gone.
-
-    Launched as its own process so the generator's terminal stays usable. The
-    window auto-fills a key already on the dashboard (see
-    ``backend/codex/setup_gui.py``); ``--no-key-setup`` skips it for scripted
-    or CI runs.
-    """
-    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    flags = getattr(subprocess, "DETACHED_PROCESS", 0)
-    try:
-        subprocess.Popen(
-            [sys.executable, "-m", "codex.setup_gui"],
-            cwd=backend_dir,
-            creationflags=flags,
-        )
-        print("\nOpened the API-key setup window -- it auto-fills a key already")
-        print("issued on the dashboard. Close it when done, open a NEW terminal,")
-        print("and run codex -- no 'set LINGLING_API_KEY' step needed.")
-    except Exception as exc:  # noqa: BLE001
-        print(f"\nCould not open the API-key window ({exc}). Run it yourself:")
-        print("  double-click setup_codex.bat (or: py -3 -m codex.setup_gui)")
-
-
-def ensure_config_line(config_path: Path, line: str) -> bool:
-    """Idempotently ensure ``line`` is a top-level key in the Codex config.
-
-    ``model_catalog_json`` must sit above the first ``[section]`` header --
-    TOML scopes any key below a header into that section, and Codex reads this
-    key at top level only. The rest of the file is left byte-for-byte intact.
-    Returns True when the key is present afterwards (added or already there).
-    """
-    path = Path(config_path)
-    key = line.split("=", 1)[0].strip()
-    if path.exists():
-        text = path.read_text(encoding="utf-8")
-        if any(l.strip().startswith(key) and "=" in l for l in text.splitlines()):
-            return True
-        lines = text.splitlines(keepends=True)
-        idx = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")), None)
-        if idx is None:
-            lines.append(line + "\n")
-        else:
-            lines.insert(idx, line + "\n")
-        path.write_text("".join(lines), encoding="utf-8")
-        return True
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(line + "\n", encoding="utf-8")
-    return True
 
 
 if __name__ == "__main__":
