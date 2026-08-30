@@ -111,6 +111,11 @@ class HealthDaemon:
                 continue
 
             verdict = self.probe_lane(lane)
+            # A 429 seen by real traffic outranks the metadata probe: the
+            # models list isn't throttled the way inference is.
+            if (verdict == "healthy" and lane.healthy is False
+                    and lane.burned_cycles > 0):
+                verdict = "burned"
             if verdict == "healthy":
                 was = lane.healthy
                 lane.healthy = True

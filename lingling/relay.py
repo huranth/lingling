@@ -133,7 +133,23 @@ class Relay:
         ]
         if not candidates:
             return None
-        return min(candidates, key=lambda l: l.active)
+        # Least busy first, then least recently used -- sequential calls
+        # rotate lanes instead of pinning the first one forever.
+        lane = min(candidates, key=lambda l: (l.active, l.last_used_at))
+        lane.last_used_at = time.perf_counter_ns()
+        return lane
+
+    def report_burn(self, lane: Lane) -> None:
+        """A real request just got 429'd through this lane: park it now and
+        let the health daemon re-cook it from scratch."""
+        lane.healthy = False
+        lane.burned_cycles += 1
+        self._emit({
+            "type": "lane", "kind": "burn", "t": time.time(),
+            "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
+            "msg": f"lane {lane.index} hit a hidden limit -- traffic moved, "
+                   f"re-cooking it fresh",
+        })
 
     # -- connection handling --------------------------------------------------
     async def _handle(self, reader: asyncio.StreamReader,

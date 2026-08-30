@@ -205,46 +205,77 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
         model = _model_of(body) if body and method == "POST" else ""
         call_n += 1
 
-        lane = relay.pick_lane()
-        if lane is None:
-            client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n"
-                           b"Content-Length: 0\r\n\r\n")
-            return
-        t0 = time.time()
-        emit({
-            "type": "call", "t": t0, "n": seq, "c": call_n,
-            "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
-            "method": method, "path": path, "model": model, "host": host,
-        })
-
-        err = _roundtrip(client, lane, host, port, method, path, headers,
-                         body, emit, seq, call_n, t0)
-        if err:
-            emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
-                  "lane": lane.index, "cc": lane.exit_country,
-                  "status": 0, "kb": 0, "secs": round(time.time() - t0, 1),
-                  "err": err})
-            return
+        held = b""
+        tried = set()
+        while True:
+            lane = relay.pick_lane(exclude=tried)
+            if lane is None:
+                # Every lane just 429'd us: hand back the last one verbatim.
+                if held:
+                    client.sendall(held)
+                else:
+                    client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n"
+                                   b"Content-Length: 0\r\n\r\n")
+                return
+            t0 = time.time()
+            emit({
+                "type": "call", "t": t0, "n": seq, "c": call_n,
+                "lane": lane.index, "cc": lane.exit_country,
+                "ip": lane.exit_ip,
+                "method": method, "path": path, "model": model, "host": host,
+            })
+            with lane.lock:
+                lane.active += 1
+            try:
+                err, status, held = _roundtrip(
+                    client, lane, host, port, method, path, headers,
+                    body, emit, seq, call_n, t0)
+            finally:
+                with lane.lock:
+                    lane.active -= 1
+            if err:
+                return
+            if status == 429:
+                relay.report_burn(lane)
+                tried.add(lane.index)
+                continue
+            break
 
 
 def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                method: str, path: str, headers: dict, body: bytes,
-               emit, seq: int, call_n: int, t0: float) -> str:
-    """Returns "" on success (connection may continue) or an error string."""
+               emit, seq: int, call_n: int, t0: float
+               ) -> "tuple[str, int, bytes]":
+    """Returns (err, status, held). A 429 is fully buffered into ``held``
+    instead of forwarded, so the caller can retry on a fresh lane."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(60)
     try:
         sock.connect(("127.0.0.1", lane.socks_port))
         err = netutil.socks5_open(sock, host, port)
         if err:
-            return err
+            return err, 0, b""
         up = ssl.create_default_context().wrap_socket(sock,
                                                       server_hostname=host)
     except (ssl.SSLError, OSError) as exc:
         sock.close()
-        return f"{type(exc).__name__}"
+        err = f"{type(exc).__name__}"
+        emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
+              "lane": lane.index, "cc": lane.exit_country, "status": 0,
+              "kb": 0, "secs": round(time.time() - t0, 1), "err": err})
+        return err, 0, b""
 
     total = 0
+    held = bytearray()
+
+    def _send(data: bytes) -> None:
+        nonlocal total
+        total += len(data)
+        if held is not None:
+            held.extend(data)
+        else:
+            client.sendall(data)
+
     try:
         # Rebuild the request head; force identity-ish framing we understand.
         out_head = f"{method} {path} HTTP/1.1\r\n".encode("latin1")
@@ -263,9 +294,11 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         uf = up.makefile("rb")
         rhead = _read_head(uf)
         if rhead is None:
-            return "upstream closed"
-        client.sendall(rhead)
-        total += len(rhead)
+            err = "upstream closed"
+            emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
+                  "lane": lane.index, "cc": lane.exit_country, "status": 0,
+                  "kb": 0, "secs": round(time.time() - t0, 1), "err": err})
+            return err, 0, b""
         status = 0
         try:
             status = int(rhead.split(b" ", 2)[1])
@@ -277,14 +310,17 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                 k, v = raw.split(b":", 1)
                 rheaders[k.strip().lower()] = v.strip()
 
+        if status != 429:
+            held = None  # stream straight to the client from here on
+        _send(rhead)
+
         if b"chunked" in rheaders.get(b"transfer-encoding", b""):
             # Stream chunk frames verbatim -- SSE flows through as it lands.
             while True:
                 size_line = uf.readline()
                 if not size_line:
                     break
-                client.sendall(size_line)
-                total += len(size_line)
+                _send(size_line)
                 try:
                     size = int(size_line.strip().split(b";")[0], 16)
                 except ValueError:
@@ -295,38 +331,38 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                         tl = uf.readline()
                         if not tl:
                             break
-                        client.sendall(tl)
-                        total += len(tl)
+                        _send(tl)
                         if tl in (b"\r\n", b"\n"):
                             break
                     break
-                chunk = _read_exact(uf, size + 2)
-                client.sendall(chunk)
-                total += len(chunk)
+                _send(_read_exact(uf, size + 2))
         elif b"content-length" in rheaders:
             remaining = int(rheaders[b"content-length"])
             while remaining > 0:
                 chunk = uf.read(min(65536, remaining))
                 if not chunk:
                     break
-                client.sendall(chunk)
-                total += len(chunk)
+                _send(chunk)
                 remaining -= len(chunk)
         else:
             while True:
                 chunk = uf.read(65536)
                 if not chunk:
                     break
-                client.sendall(chunk)
-                total += len(chunk)
+                _send(chunk)
 
         emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
               "lane": lane.index, "cc": lane.exit_country, "status": status,
               "kb": round(total / 1024, 1),
               "secs": round(time.time() - t0, 1), "err": ""})
-        return ""
+        return "", status, bytes(held or b"")
     except (ssl.SSLError, OSError) as exc:
-        return f"{type(exc).__name__}"
+        err = f"{type(exc).__name__}"
+        emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
+              "lane": lane.index, "cc": lane.exit_country, "status": 0,
+              "kb": round(total / 1024, 1),
+              "secs": round(time.time() - t0, 1), "err": err})
+        return err, 0, b""
     finally:
         try:
             up.close()

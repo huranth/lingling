@@ -62,6 +62,8 @@ class Lane:
     last_sideline_at: float = 0.0
     #: Live in-flight relay tunnels through this lane (relay maintains it).
     active: int = 0
+    #: Last time the picker handed this lane out (drives round-robin).
+    last_used_at: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def cookie_path(self) -> Path:
