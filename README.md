@@ -11,7 +11,10 @@ lingling               # = opencode, but through the lanes
 lingling --help        # anything after `lingling` goes to opencode untouched
 ```
 
-First run downloads the Tor Expert Bundle (~30 MB) into `data/tools/`. After
+First run downloads the Tor Expert Bundle (~30 MB) into Lingling's per-user
+data directory (`%LOCALAPPDATA%\lingling` on Windows, `~/.local/share/lingling`
+on Linux, `~/Library/Application Support/lingling` on macOS; override with
+`LINGLING_DATA_DIR`). After
 that, a launch looks like this: a few seconds of kitchen noises while the
 first lane cooks, then opencode opens and the remaining lanes register in the
 background while you work.
@@ -59,7 +62,7 @@ be revived sits out and is retried later.
 
 opencode holds one TLS connection open for a whole session, so a blind proxy
 can only see tunnels, not requests. To show each call, Lingling mints a local
-throwaway CA (`data/mitm/`) and tells opencode to trust it via
+throwaway CA (in the data directory's `mitm/` folder) and tells opencode to trust it via
 `NODE_EXTRA_CA_CERTS`. TLS to `opencode.ai` is then terminated **on your own
 machine**, the model name is read from each request, and the request is
 re-encrypted through a fresh lane tunnel to the real server. Everything stays
@@ -94,8 +97,10 @@ lingling/proof.py    the proof window (event log + live tail)
 lingling/netutil.py  raw SOCKS5 / HTTPS-over-SOCKS primitives
 lingling/demo.py     lingling --demo
 lingling/winjob.py   Windows Job Object so tor.exe dies with us
-data/                runtime state (tor, lanes, proof log) — gitignored
 ```
+
+Runtime state (tor, lanes, proof log, local CA) lives in the per-user data
+directory, never in the package or your project folder.
 
 Requirements: Python 3.11+, Windows/macOS/Linux, and `opencode` on your PATH.
 Runs entirely on your machine; nothing calls home.

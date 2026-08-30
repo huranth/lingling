@@ -1,22 +1,8 @@
 """Lane health daemon -- this is what makes rate limits invisible.
 
-A TLS tunnel can't be inspected by the relay, so a 429 can't be seen *in
-flight*. Instead, every ``check_interval`` seconds each lane fires a real
-``GET https://opencode.ai/zen/v1/models`` (with the ``opencode/1.0``
-User-Agent, without which the free tier instantly 429s) through its own
-SOCKS port, plus an IsTor probe that fingerprints the lane's real exit IP.
-
-Verdicts:
-  * probe raises / port dead      -> lane dead: restart, then regenerate
-  * probe returns 429             -> destination burn: the lane leaves
-                                     rotation instantly (traffic moves to
-                                     other lanes) and is re-cooked from
-                                     scratch; repeat burns also rotate its
-                                     exit country
-  * 2xx (or any non-429 status)   -> healthy; lane serves traffic
-
-A burned or dead lane leaves rotation *before* your next request would have
-used it, so the limit you never see is the one that was already healed.
+A TLS tunnel can't be inspected by the relay, so each lane periodically
+probes the real upstream through its own SOCKS port and is healed (restarted
+or regenerated from scratch) before your next request would have used it.
 """
 
 from __future__ import annotations
@@ -32,19 +18,15 @@ from .lanes import Lane, TorManager
 
 UPSTREAM_HOST = "opencode.ai"
 UPSTREAM_PROBE_PATH = "/zen/v1/models"
-# The free tier instantly 429s requests without this UA -- verified live by
-# the old gateway. A probe without it would call every healthy lane burned.
+# The free tier instantly 429s requests without this UA; a probe lacking it would call every lane burned.
 UPSTREAM_UA = os.environ.get("LINGLING_UPSTREAM_USER_AGENT", "opencode/1.0")
 
 PROBE_TIMEOUT = 15.0
-# Consecutive failed cycles before a dead lane escalates from restart to a
-# wholesale regenerate.
+# Consecutive failed cycles before a dead lane escalates from restart to regenerate.
 _ESCALATE_AFTER = 2
-# Consecutive 429 probes before the cheap heals (NEWNYM/rebuild, tried every
-# cycle) give way to rotating the exit country + regenerating.
+# Consecutive 429 probes before cheap heals give way to rotating the exit country + regenerating.
 _BURN_ESCALATE_AFTER = 3
-# Minimum wall-clock gap between regenerates of the same lane; Tor's full
-# bootstrap is 30-90s and re-rolling faster just keeps the lane in boot.
+# Min gap between regenerates; Tor bootstrap is 30-90s and re-rolling faster just keeps the lane booting.
 _REGEN_COOLDOWN_S = 1200.0
 # A sidelined lane gets one re-probe after this long; blocks do lift.
 _SIDELINE_RECHECK_S = 3600.0
@@ -82,7 +64,6 @@ class HealthDaemon:
             self._thread.join(timeout=5)
             self._thread = None
 
-    # ------------------------------------------------------------------
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -142,8 +123,7 @@ class HealthDaemon:
                 continue
 
             lane.healthy = False
-            # Warmup grace: a port-open lane whose first probe fails is still
-            # building its first circuit, not broken.
+            # Warmup grace: first failed probe on a live port means the first circuit is still building.
             if self._warmup and netutil.port_is_open(
                     "127.0.0.1", lane.socks_port, timeout=netutil.PORT_CHECK_TIMEOUT):
                 continue
@@ -158,21 +138,9 @@ class HealthDaemon:
                 self._heal_dead(lane)
         self._warmup = False
 
-    # ------------------------------------------------------------------
     def _heal_burn(self, lane: Lane) -> None:
-        """429 from the destination. User experience first: the lane is
-        already out of rotation (``healthy=False`` was set by the caller
-        before we ran), so traffic flows to the other lanes immediately.
-        Then the burned lane is dropped and re-cooked from scratch -- fresh
-        DataDirectory, fresh guards, fresh exit IP. No half-measures like
-        NEWNYM: a throttled persona goes in the bin, not in the recycle bin.
-
-        A burn that persists across regenerates means the whole country
-        persona is throttled, so on the third strike we also rotate the
-        lane's exit country before re-cooking. A regenerate cooldown keeps a
-        stubborn block from re-burning Tor's slow bootstrap every cycle; a
-        lane waiting out the cooldown simply stays out of rotation.
-        """
+        """429 from upstream: lane is already out of rotation (caller set
+        healthy=False); re-cook from scratch, rotating exit country on repeat burns."""
         lane.healing = True
         try:
             cooldown_left = (_REGEN_COOLDOWN_S

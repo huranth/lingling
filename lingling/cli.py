@@ -1,13 +1,7 @@
 """lingling -- official OpenCode, riding rotating Tor lanes.
 
-    lingling [anything opencode accepts]
-
-Boot order: download tor (first run only) -> cook the lanes -> probe each
-lane against the real upstream until at least one is verifiably carrying
-traffic -> start the local relay -> open the proof window -> exec opencode
-with HTTPS_PROXY pointed at the relay. Everything you type after `lingling`
-is handed to opencode untouched, so every flag, subcommand and future
-opencode feature just works.
+CLI entrypoint: boots Tor lanes, starts the local relay, then execs opencode
+with HTTPS_PROXY pointed at it; all other args pass through untouched.
 """
 
 from __future__ import annotations
@@ -21,12 +15,12 @@ import threading
 import time
 from pathlib import Path
 
-from . import __version__, proof
+from . import __version__, data_dir, proof
 from .health import HealthDaemon
 from .lanes import TorManager
 from .relay import Relay
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = data_dir()
 PROOF_LOG = DATA_DIR / "proof.log"
 
 DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
@@ -39,8 +33,6 @@ _KITCHEN_LINES = [
 
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-# Warm kitchen palette: each phrase gets its own color so the single line
-# feels alive instead of terminal-grey.
 _PHRASE_COLORS = ["38;5;215", "38;5;222", "38;5;180", "38;5;173",
                   "38;5;114", "38;5;109", "38;5;139", "38;5;175"]
 
@@ -52,10 +44,7 @@ def _c(text: str, code: str) -> str:
 
 
 class _Loader:
-    """Single self-rewriting status line: a colored spinner plus a message
-    that rotates through the kitchen lines. Deliberately no counts, no lane
-    chatter, no progress bar -- the user doesn't know how many lanes there
-    are, so there is nothing to report but the vibe."""
+    """Self-rewriting status line; deliberately vibe-only, no lane counts or progress bar."""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
@@ -95,7 +84,7 @@ class _Loader:
 
 
 def _parse_args(argv: list[str]) -> dict:
-    """Pull lingling's own flags out; everything else passes to opencode."""
+    """Split lingling's own flags from args passed through to opencode."""
     opts = {
         "lanes": int(os.environ.get("LINGLING_TOR_COUNT", "5") or 5),
         "no_tor": False,
@@ -180,14 +169,11 @@ def main(argv: list[str]) -> int:
                 daemon = HealthDaemon(manager, event=emit,
                                       log=lambda *a: None)
 
-                # Only lane 1 cooks in the foreground; the rest register in
-                # the background once the user is already inside opencode.
+                # Boot order: only lane 1 cooks in the foreground; the rest follow in background.
                 first = manager.lanes[0]
                 manager.start_lanes([first])
 
-                # Block until lane 1 provably carries traffic -- better to
-                # cook a few extra seconds here than to hand the user a
-                # session whose first prompt dies.
+                # Block until lane 1 provably carries traffic, else the user's first prompt dies.
                 deadline = time.time() + 150
                 while time.time() < deadline:
                     verdict = daemon.probe_lane(first)
@@ -216,9 +202,7 @@ def main(argv: list[str]) -> int:
         relay = Relay(manager, event=emit)
         port = relay.start()
 
-        # Per-request proof: terminate TLS locally for opencode.ai so each
-        # model call shows up with its lane. Best-effort -- if the CA can't
-        # be built we silently fall back to blind tunnels.
+        # Per-request proof via local TLS termination; best-effort, falls back to blind tunnels.
         ca_pem = None
         if os.environ.get("LINGLING_NO_MITM", "").lower() not in ("1", "true"):
             try:
@@ -233,9 +217,7 @@ def main(argv: list[str]) -> int:
         if not opts["no_proof"]:
             proof.spawn_proof_window(PROOF_LOG)
 
-        # The other lanes cook in the background while the user works. As
-        # each finishes bootstrapping, the health daemon's probes pick it up
-        # and it joins the rotation -- visible in the proof window.
+        # Remaining lanes bootstrap in background; health probes join them to rotation as they come up.
         rest = manager.lanes[1:]
         if rest:
             def _cook_rest() -> None:
@@ -274,7 +256,7 @@ def main(argv: list[str]) -> int:
 
 def _run_opencode(binary: str, args: list[str],
                   env: dict | None) -> int:
-    """Exec opencode with stdio fully inherited -- it owns the terminal."""
+    """Exec opencode with stdio inherited so it owns the terminal."""
     try:
         proc = subprocess.Popen([binary, *args], env=env)
     except OSError as exc:

@@ -1,14 +1,7 @@
-"""Windows Job Object: tor.exe children die with this process.
-
-Closing the terminal kills Python but on Windows nothing kills the long-lived
-``tor.exe`` children -- they survive as orphans holding their ports. A Job
-Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` fixes it at the OS level:
-when the last handle to the job closes (our process exits by any path),
-Windows terminates every process in the job. No-op on POSIX.
-
-Gotcha: kernel32 returns 64-bit HANDLEs, and ``ctypes.windll``'s default
-32-bit return type truncates them -- ``_kernel()`` sets explicit
-restypes/argtypes so handles round-trip intact.
+"""Windows Job Object with KILL_ON_JOB_CLOSE so tor.exe children die with
+this process instead of orphaning and holding their ports. No-op on POSIX.
+Gotcha: kernel32 HANDLEs are 64-bit and ctypes defaults truncate them --
+``_kernel()`` sets explicit restypes/argtypes so handles round-trip intact.
 """
 
 from __future__ import annotations
@@ -63,7 +56,7 @@ class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
 
 
 def _kernel():
-    """Kernel32 with 64-bit HANDLEs wired up (the silent-failure killer)."""
+    """kernel32 with 64-bit HANDLE restypes wired up (silent-failure killer)."""
     global _kernel32
     if _kernel32 is None:
         k = ctypes.WinDLL("kernel32", use_last_error=True)

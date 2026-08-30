@@ -6,11 +6,31 @@ build-backend = "setuptools.build_meta"
 name = "lingling"
 version = "2.0.0"
 description = "Official OpenCode, but your requests ride rotating Tor exit lanes."
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "LicenseRef-Lingling" }
+authors = [{ name = "huranth" }]
+keywords = ["opencode", "tor", "proxy", "llm", "rate-limit"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: Proxy Servers",
+]
 dependencies = ["stem==1.8.2", "cryptography>=41"]
+
+[project.urls]
+Homepage = "https://github.com/huranth/lingling"
+Repository = "https://github.com/huranth/lingling"
+Issues = "https://github.com/huranth/lingling/issues"
 
 [project.scripts]
 lingling = "lingling.cli:entry"
 
 [tool.setuptools]
 packages = ["lingling"]
+license-files = ["LICENSE"]

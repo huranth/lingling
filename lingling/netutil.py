@@ -1,10 +1,5 @@
-"""Loopback + SOCKS5 network helpers.
-
-Everything here is raw-socket on purpose: httpx et al. cannot be trusted to
-bound the SOCKS5 handshake (their sync backends turn a stuck lane into an
-unbounded ``recv``), so the health probe and the relay's upstream dial both
-go through these primitives with one socket timeout covering the lot.
-"""
+"""Loopback + SOCKS5 network helpers. Raw-socket by design: httpx cannot be
+trusted to bound the SOCKS5 handshake, so one socket timeout covers the lot."""
 
 from __future__ import annotations
 
@@ -39,9 +34,8 @@ def port_is_open(host: str, port: int, timeout: float = 0.2) -> bool:
 
 
 def bindable(port: int, host: str = "127.0.0.1") -> bool:
-    """True if a fresh socket can actually bind+listen -- catches Windows'
-    administratively excluded port ranges (Hyper-V/WSL), which report free
-    but fail bind with WSAEACCES."""
+    """True if a fresh socket can bind+listen -- catches Windows' excluded
+    port ranges (Hyper-V/WSL), which report free but fail bind (WSAEACCES)."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -119,8 +113,7 @@ def kill_pid(pid: int, grace_s: float = 2.0) -> bool:
 
 
 def socks5_open(sock: socket.socket, host: str, port: int) -> str:
-    """Run the SOCKS5 no-auth CONNECT handshake on an already-connected
-    socket. Returns "" on success, else a short reason string."""
+    """SOCKS5 no-auth CONNECT on a connected socket; "" on success, else a reason."""
     try:
         sock.sendall(bytes([0x05, 0x01, 0x00]))
         resp = sock.recv(2)
@@ -165,12 +158,8 @@ def https_via_socks(proxy_port: int, host: str, method: str, path: str,
                     extra_headers: Optional[dict] = None,
                     timeout: float = 15.0,
                     max_body: int = 8 * 1024 * 1024) -> Tuple[int, bytes]:
-    """HTTPS request through a Tor lane's SOCKS5 port.
-
-    Returns ``(status_code, body)``. Raises on transport failure -- callers
-    treat "raised" as lane-dead and ``status == 429`` as lane-burned, which
-    are different problems with different heals.
-    """
+    """HTTPS request through a Tor lane's SOCKS5 port; returns (status, body).
+    Raises on transport failure (lane-dead); status 429 means lane-burned."""
     sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=timeout)
     try:
         err = socks5_open(sock, host, 443)
@@ -251,6 +240,6 @@ def _decode_chunked(body: bytes) -> bytes:
 def https_get_via_socks(proxy_port: int, host: str, path: str,
                         user_agent: str, timeout: float = 15.0
                         ) -> Tuple[int, bytes]:
-    """HTTPS GET through a Tor lane's SOCKS5 port (health-probe path)."""
+    """HTTPS GET through a lane's SOCKS5 port (health-probe path)."""
     return https_via_socks(proxy_port, host, "GET", path, user_agent,
                            timeout=timeout, max_body=65536)

@@ -1,27 +1,22 @@
 """``lingling --demo`` -- fire one real Muse Spark request through a real
-lane and show the receipts: which lane, which exit IP, and what the model
-actually answered.
+lane and show the receipts: which lane, which exit IP, and the reply.
 
-Muse Spark lives only on OpenCode's Responses API (``POST /zen/v1/responses``),
-not on chat/completions -- the old gateway's catalog verified that live. We
-send the same keyless, ``store:false`` shape any client would, just through
-a Tor lane's SOCKS port so the exit IP is the lane's.
+Muse Spark lives only on the Responses API (``POST /zen/v1/responses``), not chat/completions.
 """
 
 from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
-from . import netutil
+from . import data_dir, netutil
 from .health import UPSTREAM_HOST, UPSTREAM_UA, HealthDaemon
 from .lanes import TorManager
 
 DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
 MODEL = "muse-spark-1.2-contributor-free"
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = data_dir()
 
 
 def _say(msg: str) -> None:

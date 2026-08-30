@@ -1,16 +1,6 @@
-"""Proof pane -- the "no gaslighting" window.
-
-Every request the relay tunnels and every lane event the health daemon fires
-is appended as one JSON line to ``data/proof.log``. The proof terminal is a
-second console window running ``python -m lingling --proof <logfile>`` which
-tails it and renders one human line per event:
-
-    14:22:01  #42  lane 2 {de} 185.220.101.1  ->  opencode.ai:443
-    14:22:13  lane 3 hit a hidden limit -- fresh circuits cooking
-
-The tailer exits when it sees a {"type": "done"} sentinel (written by the
-CLI on shutdown) or when its window is closed -- either way nothing lingers.
-"""
+"""Proof pane: relay and lane events are appended as JSON lines to
+``data/proof.log``; a second console tails it and renders one human line
+per event until a {"type": "done"} sentinel or the window closes."""
 
 from __future__ import annotations
 
@@ -62,7 +52,6 @@ def _render(ev: Dict) -> str:
                 f"{_c('no lane free', '31')}  ->  {target} "
                 f"{_c('(' + ev.get('note', '') + ')', '90')}")
     if ev.get("type") == "call":
-        # One intercepted model/API request -- the headline proof line.
         n = ev.get("n", 0)
         c = ev.get("c", 0)
         lane = ev.get("lane", 0)
@@ -90,10 +79,8 @@ def _render(ev: Dict) -> str:
                 f"{_c(f'#{n}.{c}', '90')} {verdict} "
                 f"{_c(f'{kb} KB in {secs}s', '90')}")
     if ev.get("type") == "flow":
-        # A long-lived tunnel is still moving bytes -- TLS keeps individual
-        # requests invisible, so this heartbeat is the proof of activity.
-        # Rendered as a dim continuation of its parent tunnel, not a new
-        # request: opencode holds one CONNECT open for the whole session.
+        # TLS hides individual requests, so this heartbeat is the only proof
+        # of activity on a long-lived tunnel; dim it as a continuation.
         n = ev.get("n", 0)
         kb = ev.get("kb", 0)
         return (f"{_c(ts, '90')}    {_c('|', '90')} "
@@ -153,7 +140,7 @@ def spawn_proof_window(log_path: Path) -> bool:
     from shutil import which
 
     cmd = [sys.executable, "-m", "lingling", "--proof", str(log_path)]
-    cwd = str(Path(__file__).resolve().parent.parent)
+    cwd = str(Path.home())
     try:
         if os.name == "nt":
             subprocess.Popen(

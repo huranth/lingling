@@ -1,19 +1,7 @@
-"""Per-request MITM for opencode.ai -- the "which lane did THIS call ride"
-machinery.
-
-A blind CONNECT tunnel carries a whole opencode session inside one TLS
-pipe, so the proof pane could never show individual model calls. The only
-honest way to see them is to terminate TLS locally: lingling mints its own
-throwaway CA (stored under data/mitm/, trusted only because we pass it to
-opencode via NODE_EXTRA_CA_CERTS), unwraps requests to opencode.ai, reads
-the model out of the JSON body, then re-encrypts the request through a
-lane's SOCKS5 tunnel to the real server. The outside path is still
-end-to-end TLS over Tor; the new trust point is the user's own machine.
-
-Everything here is blocking-socket code running on daemon threads -- one
-per intercepted connection -- kept deliberately separate from the asyncio
-relay so SSE streaming never stalls the event loop.
-"""
+"""Per-request MITM for opencode.ai: terminate TLS locally with a throwaway
+CA (trusted via NODE_EXTRA_CA_CERTS) so individual model calls become
+visible, then re-encrypt through a lane's SOCKS5 tunnel. Blocking-socket
+code on daemon threads, kept off the asyncio loop so SSE never stalls it."""
 
 from __future__ import annotations
 
@@ -29,8 +17,7 @@ from typing import Callable, Dict, Optional
 from . import netutil
 from .lanes import Lane, TorManager
 
-#: Hosts worth unwrapping. opencode.ai serves the model API; everything
-#: else (npm registry etc.) stays a blind tunnel.
+#: Only opencode.ai is unwrapped; everything else stays a blind tunnel.
 MITM_HOSTS = ("opencode.ai",)
 
 _ca_lock = threading.Lock()
@@ -38,7 +25,7 @@ _ca_ctx: Dict[Path, "tuple"] = {}  # dir -> (ca_cert, ca_key, ssl.SSLContext cac
 
 
 def _ensure_ca(mitm_dir: Path):
-    """Create (or load) the local root CA. Returns (cert, key, ca_pem_path)."""
+    """Create (or load) the local root CA."""
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
@@ -182,8 +169,8 @@ def handle_conn(raw: socket.socket, host: str, port: int, seq: int,
 
 def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
            manager: TorManager, emit: Callable[[Dict], None], relay) -> None:
-    """HTTP/1.1 keep-alive loop: one upstream lane tunnel per request so
-    consecutive calls visibly rotate lanes in the proof pane."""
+    """HTTP/1.1 keep-alive loop; one lane tunnel per request so consecutive
+    calls visibly rotate lanes."""
     cf = client.makefile("rb")
     call_n = 0
     while True:
@@ -243,8 +230,7 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
 def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                method: str, path: str, headers: dict, body: bytes,
                emit, seq: int, call_n: int, t0: float) -> str:
-    """Forward one request through the lane and stream the response back.
-    Returns "" on success (connection may continue) or an error string."""
+    """Returns "" on success (connection may continue) or an error string."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(60)
     try:
@@ -304,8 +290,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                 except ValueError:
                     break
                 if size == 0:
-                    # Trailer section: header lines (usually none) then an
-                    # empty line. Read line by line -- a bare CRLF terminates.
+                    # Trailer: header lines (usually none), then a bare CRLF.
                     while True:
                         tl = uf.readline()
                         if not tl:
@@ -315,7 +300,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                         if tl in (b"\r\n", b"\n"):
                             break
                     break
-                chunk = _read_exact(uf, size + 2)  # data + CRLF
+                chunk = _read_exact(uf, size + 2)
                 client.sendall(chunk)
                 total += len(chunk)
         elif b"content-length" in rheaders:

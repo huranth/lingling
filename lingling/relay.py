@@ -1,16 +1,6 @@
-"""Local rotating CONNECT relay -- the proxy that sits in front of OpenCode.
-
-OpenCode is launched with ``HTTPS_PROXY=http://127.0.0.1:<port>`` so every
-request it makes arrives here as a ``CONNECT host:443``. We pick the
-least-busy healthy lane, open a SOCKS5 tunnel through its tor.exe to the
-target, answer ``200 Connection Established``, and pipe bytes both ways.
-Everything is end-to-end TLS beyond this point -- we never see content,
-which is exactly why the health daemon does the 429 detection proactively.
-
-Lane selection is least-active among healthy lanes (round-robin on ties), so
-load spreads across distinct exit IPs by construction and a freshly burned
-lane simply stops being picked.
-"""
+"""Local rotating CONNECT relay in front of OpenCode: picks the least-busy
+healthy lane, tunnels each CONNECT through its tor.exe SOCKS5, and pipes
+bytes blindly (end-to-end TLS -- the health daemon detects 429s instead)."""
 
 from __future__ import annotations
 
@@ -45,9 +35,8 @@ class Relay:
         self.port = port  # 0 = ask the OS; read .port after start()
         self._emit = event or (lambda e: None)
         self.dial_timeout = dial_timeout
-        #: How long a request waits for a lane to become usable before we
-        #: admit defeat with a 502. OpenCode retries a failed connect loudly
-        #: ("Cannot connect to API"); a quiet hold is invisible to the user.
+        #: Hold quietly instead of an instant 502, which OpenCode surfaces
+        #: loudly as "Cannot connect to API".
         self.wait_budget = float(
             __import__("os").environ.get("LINGLING_LANE_WAIT", "60"))
         self._server: Optional[asyncio.AbstractServer] = None
@@ -69,10 +58,8 @@ class Relay:
         return self.port
 
     def _run(self) -> None:
-        # Selector loop, not Proactor: Proactor keeps an overlapped recv
-        # pending at all times, which eats the client's TLS ClientHello
-        # before our MITM thread's dup'd socket can see it (and aborts the
-        # connection on close). The selector loop only reads when asked.
+        # Selector, not Proactor: Proactor's pending overlapped recv would
+        # eat the TLS ClientHello before the MITM thread's dup'd socket sees it.
         if os.name == "nt":
             asyncio.set_event_loop_policy(
                 asyncio.WindowsSelectorEventLoopPolicy())
@@ -111,19 +98,16 @@ class Relay:
     async def _handle_mitm(self, host: str, port: int, seq: int,
                            reader: asyncio.StreamReader,
                            writer: asyncio.StreamWriter) -> None:
-        """Hand the accepted socket to a blocking MITM thread. We answer
-        200 first, dup the socket (the transport owns its fd), then close
-        the asyncio side -- the dup keeps the TCP connection alive for the
-        thread that now terminates TLS and logs each request."""
+        """Answer 200, dup the socket (the transport owns its fd), close the
+        asyncio side, and hand the dup to a blocking MITM thread."""
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
         transport_sock = writer.get_extra_info("socket")
         if transport_sock is None:
             writer.close()
             return
-        # Stop the event loop from consuming TLS bytes before the MITM
-        # thread's dup'd socket can read them. The client can't have sent
-        # anything yet -- it was waiting for our 200.
+        # Keep the loop from consuming TLS bytes before the MITM thread's
+        # dup'd socket can read them.
         transport = writer.transport
         try:
             transport.pause_reading()
@@ -166,8 +150,7 @@ class Relay:
             writer.close()
             return
         if method.upper() != "CONNECT":
-            # Drain headers, then refuse: only tunnelling is supported. Plain
-            # HTTP forwarding would mean terminating requests in cleartext.
+            # Only tunnelling: plain-HTTP forwarding would mean cleartext.
             try:
                 while True:
                     h = await asyncio.wait_for(reader.readline(), timeout=5)
@@ -187,7 +170,6 @@ class Relay:
         except ValueError:
             writer.close()
             return
-        # Drain the client's remaining CONNECT headers.
         try:
             while True:
                 h = await asyncio.wait_for(reader.readline(), timeout=5)
@@ -231,9 +213,7 @@ class Relay:
                     lane = None
             if lane is not None:
                 break
-            # No lane usable right now (still cooking, or all burned at
-            # once). Hold the connection quietly and re-check -- far better
-            # than an instant 502 that surfaces as "Cannot connect to API".
+            # Hold quietly and re-check rather than an instant 502.
             if time.time() >= deadline:
                 break
             if not held:
@@ -284,9 +264,8 @@ class Relay:
 
     async def _dial(self, lane: Lane, host: str, port: int
                     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """Open a connection to the lane's SOCKS5 port and CONNECT through
-        it to (host, port). Domain form (atyp=0x03) so DNS resolves at the
-        exit -- the exit IP must be the lane's, not ours."""
+        """SOCKS5 CONNECT to (host, port) through the lane; atyp=0x03 so DNS
+        resolves at the exit -- the exit IP must be the lane's, not ours."""
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection("127.0.0.1", lane.socks_port),
             timeout=self.dial_timeout)
@@ -313,7 +292,7 @@ class Relay:
                 await reader.readexactly(ln)
             elif atyp == 0x04:
                 await reader.readexactly(16)
-            await reader.readexactly(2)  # bound port
+            await reader.readexactly(2)
             return writer
 
         try:
@@ -330,13 +309,9 @@ class Relay:
                     upstream_writer: asyncio.StreamWriter) -> None:
         """Shuttle bytes both ways until either side closes.
 
-        The tunnel is end-to-end TLS, so individual HTTP requests inside it
-        are invisible -- but their bytes are not. We count both directions
-        and emit a periodic "still flowing" event while traffic moves (so
-        the proof pane keeps breathing during a long opencode conversation,
-        which typically reuses one CONNECT for dozens of turns), plus a
-        close event with the totals when the tunnel dies.
-        """
+        Requests inside the TLS tunnel are invisible, so we count bytes and
+        emit a periodic "still flowing" heartbeat (one CONNECT often carries
+        a whole opencode session) plus a close event with totals."""
         stats = {"up": 0, "down": 0}
         started = time.time()
 

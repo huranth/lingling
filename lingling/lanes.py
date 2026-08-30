@@ -1,22 +1,8 @@
-"""Tor egress lanes -- genuine exit-IP diversity from one machine.
-
-Each lane is a separate ``tor.exe`` pinned to a *different* exit country via
-``StrictNodes`` + disjoint ``ExitNodes {cc}``, so exit IPs are distinct by
-construction. A manager owns N lanes, each a local SOCKS5 proxy on
-127.0.0.1:52001+ with a control port on 52301+.
-
-``stem`` is imported lazily; a missing stem or tor binary degrades to
-"Tor unavailable" rather than crashing the launcher. tor.exe children join a
-kill-on-close Windows Job Object so closing the terminal never orphans them.
-
-Heals available to the health daemon, cheapest first:
-  * NEWNYM (``renew``) -- "switch to clean circuits", ~10s rate-limited, does
-    NOT guarantee a new IP.
-  * ``rebuild_circuits`` -- close general circuits + build a fresh one,
-    blocking until BUILT. The reliable primary.
-  * ``restart_lane`` -- bounce tor.exe.
-  * ``regenerate_lane`` -- wipe DataDirectory (fresh guards + consensus),
-    optionally onto a new exit country. The heavy artillery, 30-90s.
+"""Tor egress lanes: N tor.exe processes pinned to distinct exit countries
+(StrictNodes + ExitNodes {cc}), each a local SOCKS5 on 127.0.0.1:52001+.
+Missing stem/tor degrades to "Tor unavailable"; tor.exe children join a
+kill-on-close Windows Job Object so they never outlive this process.
+Heal ladder: NEWNYM -> rebuild_circuits -> restart_lane -> regenerate_lane.
 """
 
 from __future__ import annotations
@@ -62,11 +48,11 @@ class Lane:
     process: Optional[subprocess.Popen] = None
     exit_ip: str = ""
     boot_ok: bool = False
-    #: Health daemon's latest verdict. None = not probed yet.
+    #: Health daemon's latest verdict; None = not probed yet.
     healthy: Optional[bool] = None
     #: True while the daemon is restarting/regenerating this lane.
     healing: bool = False
-    #: Consecutive failed health cycles -- fast-fail input.
+    #: Consecutive failed health cycles (fast-fail input).
     unhealthy_cycles: int = 0
     #: Consecutive probes that came back 429 (destination burn).
     burned_cycles: int = 0
@@ -102,8 +88,7 @@ class TorManager:
         count: int = 5,
         exit_countries: Optional[List[str]] = None,
         socks_base: int = 52001,
-        # Not 52101: Windows administratively excludes that block
-        # (Hyper-V/WSL reserves 52093-52192 on many machines).
+        # Not 52101: Hyper-V/WSL excludes 52093-52192 on many Windows machines.
         control_base: int = 52301,
         tor_exe: str = "",
         boot_timeout: int = 120,
@@ -135,14 +120,10 @@ class TorManager:
         self._load_existing()
 
     def _fresh_lanes_dir(self) -> None:
-        """Every launch cooks lanes with a fresh identity -- new keys, new
-        guards, new circuit state -- but keeps tor's cached network
-        directory (``cached-*``). Those files are public consensus data,
-        not identity; wiping them forced a full multi-minute bootstrap on
-        every single launch. First put down any orphaned tor.exe a crashed
-        run left holding our ports (the Job Object covers clean exits; this
-        covers kill -9), and remove stale lock files so the new tor never
-        refuses to start."""
+        """Fresh identity each launch (wipe keys/state/cookie) but keep tor's
+        ``cached-*`` consensus files -- wiping them forces a multi-minute
+        bootstrap. Also kill orphaned tor.exe left by kill -9 (the Job Object
+        only covers clean exits) and remove stale lock files."""
         identity_files = ("lock", "state", "control_auth_cookie")
         if self.lanes_dir.exists():
             for torrc in self.lanes_dir.glob("tor-*/torrc"):
@@ -169,8 +150,8 @@ class TorManager:
 
     # -- setup --------------------------------------------------------------
     def _load_existing(self) -> None:
-        """Re-read ports + country from a previous run's torrcs so a restart
-        keeps the same lane layout; unbindable ports are healed up front."""
+        """Re-read ports + country from previous torrcs so a restart keeps
+        the same lane layout; heal unbindable ports up front."""
         seen_socks: set[int] = set()
         seen_control: set[int] = set()
         for i in range(self.count):
@@ -317,8 +298,7 @@ class TorManager:
             "RunAsDaemon": "0",
             "Log": f"notice file {lane.data_dir / 'tor.log'}",
         }
-        # Country pin only when geoip is present -- without it a StrictNodes
-        # pin would leave the lane unable to build any circuit.
+        # Pin country only with geoip present, else StrictNodes can't build circuits.
         geoip = self._geoip_path()
         if geoip is not None:
             cfg["GeoIPFile"] = str(geoip)
@@ -351,11 +331,7 @@ class TorManager:
 
     def start_lanes(self, lanes: List[Lane],
                     on_lane: Optional[Callable[[Lane, str], None]] = None) -> None:
-        """Launch the given lanes in parallel (serial launch costs N x boot).
-
-        ``on_lane(lane, "started"|"already_running"|"failed")`` fires per lane
-        as it resolves so the CLI spinner / proof log can show real progress.
-        """
+        """Launch lanes in parallel (serial costs N x boot); never raises."""
         if _stem() is None or not self.tools_ready() or not lanes:
             return
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -373,8 +349,7 @@ class TorManager:
                     on_lane(lane, status)
 
     def _launch_lane(self, lane: Lane) -> str:
-        """Launch one tor.exe via stem under our own watchdog. Returns a
-        status string; never raises (the batch must survive one bad lane)."""
+        """Launch one tor.exe; returns a status string, never raises."""
         if lane.running():
             return "already_running"
         if self._stopping:
@@ -435,9 +410,8 @@ class TorManager:
 
     def _launch_tor_process(self, stem: Any, lane: Lane,
                             config: Dict[str, str], msg_handler) -> Any:
-        """stem's own timeout uses SIGALRM (POSIX main-thread only), so we
-        race its launcher thread against ``boot_timeout`` ourselves and kill
-        the booting tor.exe by port if the watchdog wins."""
+        """stem's timeout uses SIGALRM (POSIX only), so we race its launcher
+        thread against ``boot_timeout`` ourselves."""
         result_q: "queue.Queue" = queue.Queue()
 
         def _do_launch() -> None:
@@ -459,8 +433,8 @@ class TorManager:
             kind, payload = result_q.get(timeout=self.boot_timeout)
         except queue.Empty:
             kind = None
-            # SOCKS up but stem lagging on the notice: give it a moment,
-            # otherwise kill the wedged tor so stem's stdout read returns.
+            # SOCKS up but stem lagging: give it a moment, else kill the
+            # wedged tor so stem's stdout read returns.
             if netutil.port_is_open("127.0.0.1", lane.socks_port, timeout=0.2):
                 try:
                     kind, payload = result_q.get(timeout=10)
@@ -605,9 +579,8 @@ class TorManager:
 
     # -- burn rotation --------------------------------------------------------
     def rotate_exit_country(self, lane: Lane) -> Optional[str]:
-        """Move a lane to a different exit country (destination-side burns
-        throttle the whole country persona, not one IP). Returns the new
-        country or None when there is nowhere to rotate to."""
+        """Move a lane to another exit country (burns throttle the whole
+        country persona, not one IP). Returns the new country or None."""
         in_use = {l.exit_country for l in self.lanes
                   if l is not lane and not l.sidelined}
         candidates = [c for c in self._rotation_countries
