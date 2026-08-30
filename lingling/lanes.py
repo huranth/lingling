@@ -135,11 +135,15 @@ class TorManager:
         self._load_existing()
 
     def _fresh_lanes_dir(self) -> None:
-        """Every launch cooks brand-new lanes -- no reused keys, guards or
-        exit identities from a previous day. First put down any orphaned
-        tor.exe a crashed run left holding our ports (the Job Object covers
-        clean exits; this covers kill -9), then wipe the whole lanes dir so
-        no stale lock file can make the new tor refuse to start."""
+        """Every launch cooks lanes with a fresh identity -- new keys, new
+        guards, new circuit state -- but keeps tor's cached network
+        directory (``cached-*``). Those files are public consensus data,
+        not identity; wiping them forced a full multi-minute bootstrap on
+        every single launch. First put down any orphaned tor.exe a crashed
+        run left holding our ports (the Job Object covers clean exits; this
+        covers kill -9), and remove stale lock files so the new tor never
+        refuses to start."""
+        identity_files = ("lock", "state", "control_auth_cookie")
         if self.lanes_dir.exists():
             for torrc in self.lanes_dir.glob("tor-*/torrc"):
                 for line in torrc.read_text().splitlines():
@@ -152,7 +156,15 @@ class TorManager:
                         pid = netutil.pid_on_port(port)
                         if pid:
                             netutil.kill_pid(pid)
-            shutil.rmtree(self.lanes_dir, ignore_errors=True)
+            for lane_dir in self.lanes_dir.glob("tor-*"):
+                if not lane_dir.is_dir():
+                    continue
+                for name in identity_files:
+                    try:
+                        (lane_dir / name).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                shutil.rmtree(lane_dir / "keys", ignore_errors=True)
         self.lanes_dir.mkdir(parents=True, exist_ok=True)
 
     # -- setup --------------------------------------------------------------
