@@ -160,14 +160,16 @@ def socks5_connect(proxy_port: int, host: str, port: int,
             pass
 
 
-def https_get_via_socks(proxy_port: int, host: str, path: str,
-                        user_agent: str, timeout: float = 15.0
-                        ) -> Tuple[int, bytes]:
-    """HTTPS GET through a Tor lane's SOCKS5 port.
+def https_via_socks(proxy_port: int, host: str, method: str, path: str,
+                    user_agent: str, body: bytes = b"",
+                    extra_headers: Optional[dict] = None,
+                    timeout: float = 15.0,
+                    max_body: int = 8 * 1024 * 1024) -> Tuple[int, bytes]:
+    """HTTPS request through a Tor lane's SOCKS5 port.
 
-    Returns ``(status_code, body_prefix)``. Raises on transport failure --
-    callers treat "raised" as lane-dead and ``status == 429`` as lane-burned,
-    which are different problems with different heals.
+    Returns ``(status_code, body)``. Raises on transport failure -- callers
+    treat "raised" as lane-dead and ``status == 429`` as lane-burned, which
+    are different problems with different heals.
     """
     sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=timeout)
     try:
@@ -177,12 +179,20 @@ def https_get_via_socks(proxy_port: int, host: str, path: str,
         ctx = ssl.create_default_context()
         tls = ctx.wrap_socket(sock, server_hostname=host)
         try:
-            req = (
-                f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
-                f"User-Agent: {user_agent}\r\nAccept: */*\r\n"
-                f"Connection: close\r\n\r\n"
-            ).encode("ascii")
-            tls.sendall(req)
+            headers = {
+                "Host": host,
+                "User-Agent": user_agent,
+                "Accept": "*/*",
+                "Connection": "close",
+            }
+            if body:
+                headers["Content-Type"] = "application/json"
+                headers["Content-Length"] = str(len(body))
+            if extra_headers:
+                headers.update(extra_headers)
+            head = f"{method} {path} HTTP/1.1\r\n" + "".join(
+                f"{k}: {v}\r\n" for k, v in headers.items()) + "\r\n"
+            tls.sendall(head.encode("ascii") + body)
             tls.settimeout(timeout)
             buf = b""
             while b"\r\n\r\n" not in buf and len(buf) < 65536:
@@ -190,20 +200,21 @@ def https_get_via_socks(proxy_port: int, host: str, path: str,
                 if not chunk:
                     break
                 buf += chunk
-            head, _, body = buf.partition(b"\r\n\r\n")
-            status_line = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
+            raw_head, _, body = buf.partition(b"\r\n\r\n")
+            status_line = raw_head.split(b"\r\n", 1)[0].decode("latin1", "replace")
             code = int(status_line.split(" ")[1]) if " " in status_line else 0
-            # Read a little more body when the first segment was tiny --
-            # callers only need a prefix (exit-IP JSON) not the whole page.
+            chunked = b"transfer-encoding: chunked" in raw_head.lower()
             end = time.time() + timeout
-            while len(body) < 4096 and time.time() < end:
+            while len(body) < max_body and time.time() < end:
                 try:
-                    chunk = tls.recv(8192)
+                    chunk = tls.recv(65536)
                 except (socket.timeout, ssl.SSLError):
                     break
                 if not chunk:
                     break
                 body += chunk
+            if chunked:
+                body = _decode_chunked(body)
             return code, body
         finally:
             try:
@@ -215,3 +226,31 @@ def https_get_via_socks(proxy_port: int, host: str, path: str,
             sock.close()
         except OSError:
             pass
+
+
+def _decode_chunked(body: bytes) -> bytes:
+    """Minimal HTTP chunked decoder; returns what it can on truncation."""
+    out = bytearray()
+    i = 0
+    while True:
+        j = body.find(b"\r\n", i)
+        if j < 0:
+            break
+        try:
+            size = int(body[i:j].split(b";")[0].strip(), 16)
+        except ValueError:
+            break
+        if size == 0:
+            break
+        i = j + 2
+        out += body[i:i + size]
+        i += size + 2
+    return bytes(out)
+
+
+def https_get_via_socks(proxy_port: int, host: str, path: str,
+                        user_agent: str, timeout: float = 15.0
+                        ) -> Tuple[int, bytes]:
+    """HTTPS GET through a Tor lane's SOCKS5 port (health-probe path)."""
+    return https_via_socks(proxy_port, host, "GET", path, user_agent,
+                           timeout=timeout, max_body=65536)

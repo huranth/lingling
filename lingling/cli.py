@@ -104,6 +104,7 @@ def _parse_args(argv: list[str]) -> dict:
         "no_tor": False,
         "no_proof": False,
         "proof_tail": None,
+        "demo": False,
         "passthrough": [],
     }
     it = iter(range(len(argv)))
@@ -115,9 +116,12 @@ def _parse_args(argv: list[str]) -> dict:
         if a == "--proof":
             opts["proof_tail"] = argv[i + 1] if i + 1 < len(argv) else ""
             skip = True
+        elif a == "--demo":
+            opts["demo"] = True
         elif a == "--lanes":
             try:
                 opts["lanes"] = max(1, int(argv[i + 1]))
+                opts["lanes_explicit"] = True
             except (IndexError, ValueError):
                 pass
             skip = True
@@ -135,6 +139,14 @@ def main(argv: list[str]) -> int:
 
     if opts["proof_tail"] is not None:
         return proof.tail(Path(opts["proof_tail"] or str(PROOF_LOG)))
+
+    if opts["demo"]:
+        from .demo import run_demo
+        question = " ".join(opts["passthrough"]).strip() or (
+            "In one sentence: who are you, and what exit node do you think "
+            "this request came from?")
+        lanes = opts["lanes"] if opts.get("lanes_explicit") else 2
+        return run_demo(question, lanes=lanes)
 
     if "--version" in opts["passthrough"] or "-v" in opts["passthrough"]:
         print(f"lingling {__version__} (wraps opencode)")
