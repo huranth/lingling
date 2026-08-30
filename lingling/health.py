@@ -182,7 +182,11 @@ class HealthDaemon:
             if lane.unhealthy_cycles <= _ESCALATE_AFTER:
                 self._emit_lane(lane, "heal",
                                 f"lane {lane.index} dropped -- poking it")
-                self.tor.restart_lane(lane)
+                if not self.tor.restart_lane(lane):
+                    self._emit_lane(
+                        lane, "fail",
+                        f"lane {lane.index} would not restart -- will "
+                        f"re-cook it from scratch if it stays down")
                 return
             cooldown_left = (_REGEN_COOLDOWN_S
                              - (time.time() - lane.last_regenerate_at))
@@ -192,7 +196,9 @@ class HealthDaemon:
             self._emit_lane(lane, "heal",
                             f"lane {lane.index} stayed down -- re-cooking "
                             f"from scratch")
-            self.tor.regenerate_lane(lane)
+            if not self.tor.regenerate_lane(lane):
+                self._emit_lane(lane, "fail",
+                                f"lane {lane.index} refused to re-cook")
         finally:
             lane.healing = False
 
