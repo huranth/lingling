@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import os
 import struct
 import threading
 import time
@@ -55,6 +56,8 @@ class Relay:
         self._ready = threading.Event()
         self._seq = itertools.count(1)
         self._rr = itertools.count()
+        #: Set by CLI when the local CA is ready; None = blind tunnels only.
+        self.cert_shop = None  # lingling.mitm.CertShop
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> int:
@@ -67,6 +70,13 @@ class Relay:
         return self.port
 
     def _run(self) -> None:
+        # Selector loop, not Proactor: Proactor keeps an overlapped recv
+        # pending at all times, which eats the client's TLS ClientHello
+        # before our MITM thread's dup'd socket can see it (and aborts the
+        # connection on close). The selector loop only reads when asked.
+        if os.name == "nt":
+            asyncio.set_event_loop_policy(
+                asyncio.WindowsSelectorEventLoopPolicy())
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._loop.run_until_complete(self._serve())
@@ -90,6 +100,47 @@ class Relay:
             self._server.close()
         # Drop the loop on the next tick so close() can land first.
         self._loop.call_later(0.2, self._loop.stop)
+
+    # -- MITM interception ---------------------------------------------------
+    def _should_mitm(self, host: str) -> bool:
+        if self.cert_shop is None:
+            return False
+        from . import mitm
+        return any(host == h or host.endswith("." + h) for h in
+                   mitm.MITM_HOSTS)
+
+    async def _handle_mitm(self, host: str, port: int, seq: int,
+                           reader: asyncio.StreamReader,
+                           writer: asyncio.StreamWriter) -> None:
+        """Hand the accepted socket to a blocking MITM thread. We answer
+        200 first, dup the socket (the transport owns its fd), then close
+        the asyncio side -- the dup keeps the TCP connection alive for the
+        thread that now terminates TLS and logs each request."""
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await writer.drain()
+        transport_sock = writer.get_extra_info("socket")
+        if transport_sock is None:
+            writer.close()
+            return
+        # Stop the event loop from consuming TLS bytes before the MITM
+        # thread's dup'd socket can read them. The client can't have sent
+        # anything yet -- it was waiting for our 200.
+        transport = writer.transport
+        try:
+            transport.pause_reading()
+        except (AttributeError, NotImplementedError):
+            pass
+        raw = transport_sock.dup()
+        try:
+            writer.close()
+        except Exception:  # noqa: BLE001
+            pass
+        from . import mitm
+        threading.Thread(
+            target=mitm.handle_conn,
+            args=(raw, host, port, seq, self.cert_shop, self.tor,
+                  self._emit, self),
+            name=f"mitm-{seq}", daemon=True).start()
 
     # -- lane picking --------------------------------------------------------
     def pick_lane(self, exclude: Optional[set] = None) -> Optional[Lane]:
@@ -145,6 +196,10 @@ class Relay:
                     break
         except asyncio.TimeoutError:
             writer.close()
+            return
+
+        if self._should_mitm(host):
+            await self._handle_mitm(host, port, seq, reader, writer)
             return
 
         lane: Optional[Lane] = None

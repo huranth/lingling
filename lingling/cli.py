@@ -217,6 +217,18 @@ def main(argv: list[str]) -> int:
         relay = Relay(manager, event=emit)
         port = relay.start()
 
+        # Per-request proof: terminate TLS locally for opencode.ai so each
+        # model call shows up with its lane. Best-effort -- if the CA can't
+        # be built we silently fall back to blind tunnels.
+        ca_pem = None
+        if os.environ.get("LINGLING_NO_MITM", "").lower() not in ("1", "true"):
+            try:
+                from . import mitm
+                relay.cert_shop = mitm.CertShop(DATA_DIR / "mitm")
+                ca_pem = relay.cert_shop.ca_pem_path
+            except Exception:  # noqa: BLE001
+                pass
+
         loader.stop(_c(" served! lanes are hot -- proof is in the other "
                        "window.", "1;32"))
         if not opts["no_proof"]:
@@ -243,6 +255,9 @@ def main(argv: list[str]) -> int:
         for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
             env[var] = f"http://127.0.0.1:{port}"
         env["NO_PROXY"] = env["no_proxy"] = "localhost,127.0.0.1"
+        if ca_pem:
+            # Let opencode trust our local CA so we can log each model call.
+            env["NODE_EXTRA_CA_CERTS"] = str(ca_pem)
         return _run_opencode(opencode, opts["passthrough"], env)
     finally:
         if daemon:

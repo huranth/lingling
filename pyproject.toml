@@ -7,7 +7,7 @@ name = "lingling"
 version = "2.0.0"
 description = "Official OpenCode, but your requests ride rotating Tor exit lanes."
 requires-python = ">=3.11"
-dependencies = ["stem==1.8.2"]
+dependencies = ["stem==1.8.2", "cryptography>=41"]
 
 [project.scripts]
 lingling = "lingling.cli:entry"

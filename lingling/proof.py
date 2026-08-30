@@ -61,6 +61,34 @@ def _render(ev: Dict) -> str:
         return (f"{_c(ts, '90')}  {_c('#' + str(n), '36')}  "
                 f"{_c('no lane free', '31')}  ->  {target} "
                 f"{_c('(' + ev.get('note', '') + ')', '90')}")
+    if ev.get("type") == "call":
+        # One intercepted model/API request -- the headline proof line.
+        n = ev.get("n", 0)
+        c = ev.get("c", 0)
+        lane = ev.get("lane", 0)
+        cc = ev.get("cc") or "??"
+        ip = ev.get("ip") or "..."
+        model = ev.get("model") or ""
+        what = _c(model, "1;35") if model else _c(
+            f"{ev.get('method', '')} {ev.get('path', '')}", "37")
+        return (f"{_c(ts, '90')}  {_c('#' + str(n) + '.' + str(c), '36')}  "
+                f"{_c(f'lane {lane} {{{cc}}}', '32')} {_c(ip, '90')}  "
+                f"->  {what}")
+    if ev.get("type") == "callend":
+        n = ev.get("n", 0)
+        c = ev.get("c", 0)
+        status = ev.get("status", 0)
+        kb = ev.get("kb", 0)
+        secs = ev.get("secs", 0)
+        err = ev.get("err") or ""
+        if err:
+            verdict = _c(f"failed ({err})", "31")
+        else:
+            color = "32" if 200 <= status < 300 else "31"
+            verdict = _c(str(status), color)
+        return (f"{_c(ts, '90')}    {_c('|', '90')} "
+                f"{_c(f'#{n}.{c}', '90')} {verdict} "
+                f"{_c(f'{kb} KB in {secs}s', '90')}")
     if ev.get("type") == "flow":
         # A long-lived tunnel is still moving bytes -- TLS keeps individual
         # requests invisible, so this heartbeat is the proof of activity.
