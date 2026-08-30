@@ -61,6 +61,26 @@ def _render(ev: Dict) -> str:
         return (f"{_c(ts, '90')}  {_c('#' + str(n), '36')}  "
                 f"{_c('no lane free', '31')}  ->  {target} "
                 f"{_c('(' + ev.get('note', '') + ')', '90')}")
+    if ev.get("type") == "flow":
+        # A long-lived tunnel is still moving bytes -- TLS keeps individual
+        # requests invisible, so this heartbeat is the proof of activity.
+        n = ev.get("n", 0)
+        lane = ev.get("lane", 0)
+        cc = ev.get("cc") or "??"
+        kb = ev.get("kb", 0)
+        return (f"{_c(ts, '90')}  {_c('#' + str(n), '36')}  "
+                f"{_c(f'lane {lane} {{{cc}}}', '32')}  "
+                f"{_c(f'... {kb} KB through this tunnel', '90')}")
+    if ev.get("type") == "reqend":
+        n = ev.get("n", 0)
+        lane = ev.get("lane", 0)
+        cc = ev.get("cc") or "??"
+        kb = ev.get("kb", 0)
+        secs = ev.get("secs", 0)
+        span = f"{secs:.0f}s" if secs < 90 else f"{secs / 60:.1f}m"
+        return (f"{_c(ts, '90')}  {_c('#' + str(n), '36')}  "
+                f"{_c(f'lane {lane} {{{cc}}}', '32')}  "
+                f"{_c(f'tunnel closed -- {kb} KB over {span}', '90')}")
     if ev.get("type") == "lane":
         kind = ev.get("kind", "")
         color = {"up": "32", "burn": "33", "rotate": "35", "heal": "33",

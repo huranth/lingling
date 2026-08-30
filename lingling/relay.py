@@ -214,7 +214,8 @@ class Relay:
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
         try:
-            await self._pipe(reader, writer, upstream_r, upstream_w)
+            await self._pipe(seq, lane, reader, writer,
+                             upstream_r, upstream_w)
         finally:
             with lane.lock:
                 lane.active -= 1
@@ -268,17 +269,31 @@ class Relay:
             raise
         return reader, writer
 
-    async def _pipe(self, client_reader: asyncio.StreamReader,
+    async def _pipe(self, seq: int, lane: Lane,
+                    client_reader: asyncio.StreamReader,
                     client_writer: asyncio.StreamWriter,
                     upstream_reader: asyncio.StreamReader,
                     upstream_writer: asyncio.StreamWriter) -> None:
-        """Shuttle bytes both ways until either side closes."""
-        async def pump(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
+        """Shuttle bytes both ways until either side closes.
+
+        The tunnel is end-to-end TLS, so individual HTTP requests inside it
+        are invisible -- but their bytes are not. We count both directions
+        and emit a periodic "still flowing" event while traffic moves (so
+        the proof pane keeps breathing during a long opencode conversation,
+        which typically reuses one CONNECT for dozens of turns), plus a
+        close event with the totals when the tunnel dies.
+        """
+        stats = {"up": 0, "down": 0}
+        started = time.time()
+
+        async def pump(r: asyncio.StreamReader, w: asyncio.StreamWriter,
+                       key: str) -> None:
             try:
                 while True:
                     data = await r.read(65536)
                     if not data:
                         break
+                    stats[key] += len(data)
                     w.write(data)
                     await w.drain()
             except (ConnectionError, asyncio.IncompleteReadError):
@@ -289,8 +304,32 @@ class Relay:
                 except Exception:  # noqa: BLE001
                     pass
 
-        await asyncio.gather(
-            pump(client_reader, upstream_writer),
-            pump(upstream_reader, client_writer),
-            return_exceptions=True,
-        )
+        async def ticker() -> None:
+            last = 0
+            while True:
+                await asyncio.sleep(20)
+                total = stats["up"] + stats["down"]
+                if total == last:
+                    continue
+                last = total
+                self._emit({
+                    "type": "flow", "t": time.time(), "n": seq,
+                    "lane": lane.index, "cc": lane.exit_country,
+                    "kb": round(total / 1024, 1),
+                })
+
+        beat = asyncio.create_task(ticker())
+        try:
+            await asyncio.gather(
+                pump(client_reader, upstream_writer, "up"),
+                pump(upstream_reader, client_writer, "down"),
+                return_exceptions=True,
+            )
+        finally:
+            beat.cancel()
+            self._emit({
+                "type": "reqend", "t": time.time(), "n": seq,
+                "lane": lane.index, "cc": lane.exit_country,
+                "kb": round((stats["up"] + stats["down"]) / 1024, 1),
+                "secs": round(time.time() - started, 1),
+            })
