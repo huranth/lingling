@@ -11,8 +11,7 @@ on whichever lane is hot. One exit gets throttled? Cute. Your traffic is
 already on another one. You never see the limit. You just keep typing.
 
 ```
-pip install git+https://github.com/huranth/lingling.git
-# (PyPI landing soon -- `pip install lingling` once it's up)
+pip install lingling
 
 lingling               # = opencode, but the requests ride Tor
 lingling --help        # anything after `lingling` goes to opencode untouched
