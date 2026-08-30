@@ -1,14 +1,9 @@
 # ---------------------------------------------------------------------------
 # Secrets and local state — never commit these.
 # ---------------------------------------------------------------------------
-# OpenCode account keys. Copy accounts.example.json and fill it in locally, or
-# use LINGLING_OPENCODE_KEYS instead so no secret ever touches the disk.
-backend/accounts.json
-# Egress proxy list may embed proxy credentials (scheme://user:pass@host).
-backend/proxies.json
-# Usage database, Tor lane state (each lane's keys/ directory holds private key
-# material), downloaded binaries.
-backend/data/
+# Tor lane state (private key material), the downloaded Tor Expert
+# Bundle, and the live proof log.
+data/
 .env
 .env.*
 !.env.example

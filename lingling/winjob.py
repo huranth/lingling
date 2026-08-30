@@ -1,15 +1,13 @@
-"""Windows Job Object: egress children (tor.exe) die with the gateway.
+"""Windows Job Object: tor.exe children die with this process.
 
-Closing the backend kills Python but on Windows nothing kills the long-lived
+Closing the terminal kills Python but on Windows nothing kills the long-lived
 ``tor.exe`` children -- they survive as orphans holding their ports. A Job
-Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` fixes it at the OS level: when
-the last handle to the job closes (our process exits by any path), Windows
-terminates every process in the job. Children spawned after we join inherit
-membership, so the common path needs no per-child bookkeeping. No-op on POSIX.
+Object with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` fixes it at the OS level:
+when the last handle to the job closes (our process exits by any path),
+Windows terminates every process in the job. No-op on POSIX.
 
-Gotcha: kernel32 returns 64-bit HANDLEs, and ``ctypes.windll``'s default 32-bit
-return type truncates them -- the first version did that, so every
-``AssignProcessToJobObject`` silently failed. ``_kernel()`` sets explicit
+Gotcha: kernel32 returns 64-bit HANDLEs, and ``ctypes.windll``'s default
+32-bit return type truncates them -- ``_kernel()`` sets explicit
 restypes/argtypes so handles round-trip intact.
 """
 
@@ -21,12 +19,10 @@ from ctypes import wintypes
 
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
-# AssignProcessToJobObject requires PROCESS_SET_QUOTA | PROCESS_TERMINATE.
 _PROCESS_SET_QUOTA = 0x0100
 _PROCESS_TERMINATE = 0x0001
 
-_job: int = 0  # kernel handle; module-global so it outlives every call site
-
+_job: int = 0
 _kernel32 = None
 
 
@@ -50,8 +46,8 @@ class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
         ("MaximumWorkingSetSize", ctypes.c_size_t),
         ("ActiveProcessLimit", wintypes.DWORD),
         ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", wintypes.DWORD),
-        ("SchedulingClass", wintypes.DWORD),
+        ("PriorityClass", ctypes.c_size_t),
+        ("SchedulingClass", ctypes.c_size_t),
     ]
 
 
@@ -64,10 +60,6 @@ class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
         ("PeakProcessMemoryUsed", ctypes.c_size_t),
         ("PeakJobMemoryUsed", ctypes.c_size_t),
     ]
-
-
-def _on_windows() -> bool:
-    return os.name == "nt"
 
 
 def _kernel():
@@ -92,7 +84,6 @@ def _kernel():
 
 
 def _assign(pid: int) -> bool:
-    """Put an already-running process into the kill job. False if it cannot."""
     if not _job:
         return False
     k = _kernel()
@@ -106,21 +97,11 @@ def _assign(pid: int) -> bool:
 
 
 def ensure_kill_job() -> bool:
-    """Create the kill-on-close job and join it with the current process.
-
-    Idempotent: only the first call creates anything; later calls return True
-    once armed. Returns True if a kill-on-close job is active (children spawned
-    from here now die with this process), False otherwise.
-
-    Children spawned after our process joined the job inherit membership,
-    which is what makes the common path zero-touch; ``assign()`` exists as the
-    fallback when joining here fails (e.g. our process was already inside a
-    foreign job).
-    """
+    """Create the kill-on-close job and join it. Idempotent."""
     global _job
     if _job:
         return True
-    if not _on_windows():
+    if os.name != "nt":
         return False
     k = _kernel()
     job = k.CreateJobObjectW(None, None)
@@ -142,11 +123,6 @@ def ensure_kill_job() -> bool:
 
 def assign(pid: int) -> bool:
     """Put an already-spawned child into the kill job. True on success."""
-    if not _on_windows():
+    if os.name != "nt":
         return False
     return _assign(pid)
-
-
-def job_active() -> bool:
-    """True once a kill-on-close job is armed (used by tests)."""
-    return bool(_job)
