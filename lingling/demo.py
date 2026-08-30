@@ -11,7 +11,6 @@ a Tor lane's SOCKS port so the exit IP is the lane's.
 from __future__ import annotations
 
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -111,8 +110,8 @@ def run_demo(question: str, lanes: int = 2) -> int:
     dt = time.time() - t0
 
     if code == 429:
-        _say(f" !! 429 from upstream -- the lane would now be re-cooked "
-             f"(that's the rotation working)")
+        _say(" !! 429 from upstream -- the lane would now be re-cooked "
+             "(that's the rotation working)")
         manager.stop_all()
         return 1
     if code != 200:

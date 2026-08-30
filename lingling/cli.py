@@ -21,7 +21,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import __version__, netutil, proof
+from . import __version__, proof
 from .health import HealthDaemon
 from .lanes import TorManager
 from .relay import Relay
@@ -104,7 +104,6 @@ def _parse_args(argv: list[str]) -> dict:
         "demo": False,
         "passthrough": [],
     }
-    it = iter(range(len(argv)))
     skip = False
     for i, a in enumerate(argv):
         if skip:

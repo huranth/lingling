@@ -55,7 +55,6 @@ class Relay:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._ready = threading.Event()
         self._seq = itertools.count(1)
-        self._rr = itertools.count()
         #: Set by CLI when the local CA is ready; None = blind tunnels only.
         self.cert_shop = None  # lingling.mitm.CertShop
 
