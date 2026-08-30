@@ -8,8 +8,11 @@ SOCKS port, plus an IsTor probe that fingerprints the lane's real exit IP.
 
 Verdicts:
   * probe raises / port dead      -> lane dead: restart, then regenerate
-  * probe returns 429             -> destination burn: NEWNYM, then rebuild,
-                                     then rotate country + regenerate
+  * probe returns 429             -> destination burn: the lane leaves
+                                     rotation instantly (traffic moves to
+                                     other lanes) and is re-cooked from
+                                     scratch; repeat burns also rotate its
+                                     exit country
   * 2xx (or any non-429 status)   -> healthy; lane serves traffic
 
 A burned or dead lane leaves rotation *before* your next request would have
@@ -157,33 +160,43 @@ class HealthDaemon:
 
     # ------------------------------------------------------------------
     def _heal_burn(self, lane: Lane) -> None:
-        """429 from the destination. Cheap circuit heals first; a persistent
-        burn means the whole country persona is throttled, so rotate."""
+        """429 from the destination. User experience first: the lane is
+        already out of rotation (``healthy=False`` was set by the caller
+        before we ran), so traffic flows to the other lanes immediately.
+        Then the burned lane is dropped and re-cooked from scratch -- fresh
+        DataDirectory, fresh guards, fresh exit IP. No half-measures like
+        NEWNYM: a throttled persona goes in the bin, not in the recycle bin.
+
+        A burn that persists across regenerates means the whole country
+        persona is throttled, so on the third strike we also rotate the
+        lane's exit country before re-cooking. A regenerate cooldown keeps a
+        stubborn block from re-burning Tor's slow bootstrap every cycle; a
+        lane waiting out the cooldown simply stays out of rotation.
+        """
         lane.healing = True
         try:
-            if lane.burned_cycles < _BURN_ESCALATE_AFTER:
-                self._emit_lane(lane, "burn",
-                                f"lane {lane.index} hit a hidden limit -- "
-                                f"fresh circuits cooking")
-                if self.tor.renew(lane):
-                    return
-                self.tor.rebuild_circuits(lane)
-                return
             cooldown_left = (_REGEN_COOLDOWN_S
                              - (time.time() - lane.last_regenerate_at))
             if lane.last_regenerate_at and cooldown_left > 0:
+                if lane.burned_cycles <= 1:
+                    self._emit_lane(
+                        lane, "burn",
+                        f"lane {lane.index} hit a hidden limit -- parked "
+                        f"while it cools, other lanes have your traffic")
                 return
-            new_cc = self.tor.rotate_exit_country(lane)
+            self._emit_lane(
+                lane, "burn",
+                f"lane {lane.index} hit a hidden limit -- your traffic moved "
+                f"to a fresh lane; re-cooking this one from scratch")
+            if lane.burned_cycles >= _BURN_ESCALATE_AFTER:
+                new_cc = self.tor.rotate_exit_country(lane)
+                if new_cc:
+                    self._emit_lane(
+                        lane, "rotate",
+                        f"lane {lane.index} keeps burning -- re-cooking on a "
+                        f"new country {{{new_cc}}}")
             lane.last_regenerate_at = time.time()
             lane.burned_cycles = 0
-            if new_cc:
-                self._emit_lane(lane, "rotate",
-                                f"lane {lane.index} burned through "
-                                f"-- re-cooking on {{{new_cc}}}")
-            else:
-                self._emit_lane(lane, "rotate",
-                                f"lane {lane.index} burned through -- "
-                                f"re-cooking from scratch")
             self.tor.regenerate_lane(lane)
         finally:
             lane.healing = False

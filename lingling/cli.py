@@ -37,32 +37,23 @@ _KITCHEN_LINES = [
     "preheating the relays", "tasting the traffic",
 ]
 
-_BAR_WIDTH = 22
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 class _Loader:
-    """Single self-rewriting status line: spinner + rectangular bar + a
-    message that rotates through the kitchen lines."""
+    """Single self-rewriting status line: spinner + a message that rotates
+    through the kitchen lines. Deliberately no counts and no progress bar --
+    the user doesn't know how many lanes there are, so nothing to wait on."""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._msg_idx = itertools.count()
         self._detail = ""
-        self._done = 0
-        self._total = 1
         self._lock = threading.Lock()
 
-    def set(self, detail: str = "", done: int | None = None,
-            total: int | None = None) -> None:
+    def set(self, detail: str = "") -> None:
         with self._lock:
-            if detail:
-                self._detail = detail
-            if done is not None:
-                self._done = done
-            if total is not None:
-                self._total = max(1, total)
+            self._detail = detail
 
     def start(self) -> None:
         if not sys.stdout.isatty():
@@ -74,14 +65,12 @@ class _Loader:
         tick = itertools.count()
         while not self._stop.is_set():
             with self._lock:
-                done, total, detail = self._done, self._total, self._detail
+                detail = self._detail
             t = next(tick)
             spin = _SPIN[t % len(_SPIN)]
             msg = _KITCHEN_LINES[(t // 24) % len(_KITCHEN_LINES)]
-            filled = round(_BAR_WIDTH * done / total)
-            bar = "▓" * filled + "░" * (_BAR_WIDTH - filled)
             suffix = f"  {detail}" if detail else ""
-            sys.stdout.write(f"\r\x1b[K {spin} {msg} [{bar}] {done}/{total}{suffix}")
+            sys.stdout.write(f"\r\x1b[K {spin} {msg}{suffix}")
             sys.stdout.flush()
             time.sleep(0.09)
 
@@ -173,7 +162,7 @@ def main(argv: list[str]) -> int:
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
             )
-            loader.set(detail="checking the tor kit", done=0, total=1)
+            loader.set(detail="checking the tor kit")
             err = manager.setup_lanes()
             if err:
                 loader.stop(f" !! tor unavailable ({err}) -- going direct")
@@ -187,8 +176,7 @@ def main(argv: list[str]) -> int:
                 # the background once the user is already inside opencode.
                 first = manager.lanes[0]
                 loader.set(detail=f"lane {first.index} "
-                                  f"{{{first.exit_country}}} booting",
-                           done=0, total=1)
+                                  f"{{{first.exit_country}}} booting")
                 manager.start_lanes([first], on_lane=lambda l, s: loader.set(
                     detail=f"lane {l.index} {{{l.exit_country}}} {s}"))
 
@@ -208,9 +196,7 @@ def main(argv: list[str]) -> int:
                     loader.set(detail=f"verifying lane {first.index} "
                                       f"({verdict})")
                     time.sleep(2)
-                if first.healthy is True:
-                    loader.set(done=1)
-                else:
+                if first.healthy is not True:
                     loader.stop(" !! lane 1 wouldn't cook -- going direct")
                     direct = True
                     manager.stop_all()
