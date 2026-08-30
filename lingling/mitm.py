@@ -208,7 +208,7 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
         held = b""
         tried = set()
         while True:
-            lane = relay.pick_lane(exclude=tried)
+            lane = relay.pick_lane(exclude=tried, ignore_busy=True)
             if lane is None:
                 # Every lane just 429'd us: hand back the last one verbatim.
                 if held:

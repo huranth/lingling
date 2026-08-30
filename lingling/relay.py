@@ -126,16 +126,19 @@ class Relay:
             name=f"mitm-{seq}", daemon=True).start()
 
     # -- lane picking --------------------------------------------------------
-    def pick_lane(self, exclude: Optional[set] = None) -> Optional[Lane]:
+    def pick_lane(self, exclude: Optional[set] = None,
+                  ignore_busy: bool = False) -> Optional[Lane]:
         candidates: List[Lane] = [
             l for l in self.tor.healthy_lanes()
             if not exclude or l.index not in exclude
         ]
         if not candidates:
             return None
-        # Least busy first, then least recently used -- sequential calls
-        # rotate lanes instead of pinning the first one forever.
-        lane = min(candidates, key=lambda l: (l.active, l.last_used_at))
+        # Blind tunnels hold active for minutes, so MITM calls ignore it and
+        # round-robin purely by least-recently-used; tunnels stay busy-aware.
+        key = (lambda l: l.last_used_at) if ignore_busy else (
+            lambda l: (l.active, l.last_used_at))
+        lane = min(candidates, key=key)
         lane.last_used_at = time.perf_counter_ns()
         return lane
 
