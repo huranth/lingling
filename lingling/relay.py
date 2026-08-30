@@ -44,6 +44,11 @@ class Relay:
         self.port = port  # 0 = ask the OS; read .port after start()
         self._emit = event or (lambda e: None)
         self.dial_timeout = dial_timeout
+        #: How long a request waits for a lane to become usable before we
+        #: admit defeat with a 502. OpenCode retries a failed connect loudly
+        #: ("Cannot connect to API"); a quiet hold is invisible to the user.
+        self.wait_budget = float(
+            __import__("os").environ.get("LINGLING_LANE_WAIT", "60"))
         self._server: Optional[asyncio.AbstractServer] = None
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -147,26 +152,46 @@ class Relay:
         upstream_w: Optional[asyncio.StreamWriter] = None
         tried: set = set()
         err_note = ""
-        for _ in range(max(1, len(self.tor.lanes))):
-            lane = self.pick_lane(exclude=tried)
-            if lane is None:
+        deadline = time.time() + self.wait_budget
+        held = False
+        while True:
+            for _ in range(max(1, len(self.tor.lanes))):
+                lane = self.pick_lane(exclude=tried)
+                if lane is None:
+                    break
+                tried.add(lane.index)
+                try:
+                    upstream_r, upstream_w = await self._dial(lane, host, port)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    err_note = str(exc)
+                    self._emit({
+                        "type": "lane", "kind": "fail", "t": time.time(),
+                        "lane": lane.index, "cc": lane.exit_country,
+                        "ip": lane.exit_ip,
+                        "msg": f"lane {lane.index} couldn't reach {host} "
+                               f"({err_note}) -- switching lanes",
+                    })
+                    # A dial failure is a live signal the daemon hasn't seen.
+                    lane.healthy = False
+                    lane = None
+            if lane is not None:
                 break
-            tried.add(lane.index)
-            try:
-                upstream_r, upstream_w = await self._dial(lane, host, port)
+            # No lane usable right now (still cooking, or all burned at
+            # once). Hold the connection quietly and re-check -- far better
+            # than an instant 502 that surfaces as "Cannot connect to API".
+            if time.time() >= deadline:
                 break
-            except Exception as exc:  # noqa: BLE001
-                err_note = str(exc)
+            if not held:
+                held = True
                 self._emit({
-                    "type": "lane", "kind": "fail", "t": time.time(),
-                    "lane": lane.index, "cc": lane.exit_country,
-                    "ip": lane.exit_ip,
-                    "msg": f"lane {lane.index} couldn't reach {host} "
-                           f"({err_note}) -- switching lanes",
+                    "type": "lane", "kind": "heal", "t": time.time(),
+                    "lane": 0, "cc": "", "ip": "",
+                    "msg": f"holding a request for {host} while a lane "
+                           f"finishes cooking ...",
                 })
-                # A dial failure is a live signal the daemon hasn't seen yet.
-                lane.healthy = False
-                lane = None
+            tried.clear()
+            await asyncio.sleep(0.5)
         if lane is None or upstream_w is None or upstream_r is None:
             writer.write(b"HTTP/1.1 502 Bad Gateway\r\n"
                          b"Content-Length: 0\r\n\r\n")

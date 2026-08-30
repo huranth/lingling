@@ -310,19 +310,22 @@ class TorManager:
 
     # -- lifecycle -----------------------------------------------------------
     def start_all(self, on_lane: Optional[Callable[[Lane, str], None]] = None) -> None:
-        """Launch every lane in parallel (serial launch would cost N x boot).
+        self.start_lanes(self.lanes, on_lane=on_lane)
+
+    def start_lanes(self, lanes: List[Lane],
+                    on_lane: Optional[Callable[[Lane, str], None]] = None) -> None:
+        """Launch the given lanes in parallel (serial launch costs N x boot).
 
         ``on_lane(lane, "started"|"already_running"|"failed")`` fires per lane
-        as it resolves so the CLI spinner can show real progress.
+        as it resolves so the CLI spinner / proof log can show real progress.
         """
-        self._stopping = False
-        if _stem() is None or not self.tools_ready():
+        if _stem() is None or not self.tools_ready() or not lanes:
             return
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        with ThreadPoolExecutor(max_workers=min(len(self.lanes), 5)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(lanes), 5)) as pool:
             futures = {pool.submit(self._launch_lane, lane): lane
-                       for lane in self.lanes}
+                       for lane in lanes}
             for fut in as_completed(futures):
                 lane = futures[fut]
                 try:

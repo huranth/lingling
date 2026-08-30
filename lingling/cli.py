@@ -173,48 +173,45 @@ def main(argv: list[str]) -> int:
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
             )
-            loader.set(detail="checking the tor kit", done=0,
-                       total=len(manager.lanes))
+            loader.set(detail="checking the tor kit", done=0, total=1)
             err = manager.setup_lanes()
             if err:
                 loader.stop(f" !! tor unavailable ({err}) -- going direct")
                 direct = True
             else:
-                done_n = 0
-
-                def _on_lane(lane, status):
-                    nonlocal done_n
-                    done_n += 1
-                    loader.set(detail=f"lane {lane.index} {{{lane.exit_country}}} "
-                                      f"{status}", done=done_n)
-
-                manager.start_all(on_lane=_on_lane)
-
                 emit = proof.make_emitter(PROOF_LOG)
                 daemon = HealthDaemon(manager, event=emit,
                                       log=lambda *a: None)
-                # Block until at least one lane provably carries traffic --
-                # better to cook a few extra seconds here than to hand the
-                # user a session whose first prompt dies.
+
+                # Only lane 1 cooks in the foreground; the rest register in
+                # the background once the user is already inside opencode.
+                first = manager.lanes[0]
+                loader.set(detail=f"lane {first.index} "
+                                  f"{{{first.exit_country}}} booting",
+                           done=0, total=1)
+                manager.start_lanes([first], on_lane=lambda l, s: loader.set(
+                    detail=f"lane {l.index} {{{l.exit_country}}} {s}"))
+
+                # Block until lane 1 provably carries traffic -- better to
+                # cook a few extra seconds here than to hand the user a
+                # session whose first prompt dies.
                 deadline = time.time() + 150
                 while time.time() < deadline:
-                    for lane in manager.lanes:
-                        if lane.healthy is not True and not lane.sidelined:
-                            verdict = daemon.probe_lane(lane)
-                            if verdict == "healthy":
-                                lane.healthy = True
-                                lane.unhealthy_cycles = 0
-                            elif verdict == "burned":
-                                lane.burned_cycles += 1
-                                daemon._heal_burn(lane)
-                    ready = manager.healthy_lanes()
-                    loader.set(detail=f"{len(ready)} lane(s) verified",
-                               done=len(manager.lanes))
-                    if ready:
+                    verdict = daemon.probe_lane(first)
+                    if verdict == "healthy":
+                        first.healthy = True
+                        first.unhealthy_cycles = 0
                         break
+                    if verdict == "burned":
+                        first.burned_cycles += 1
+                        daemon._heal_burn(first)
+                    loader.set(detail=f"verifying lane {first.index} "
+                                      f"({verdict})")
                     time.sleep(2)
-                if not manager.healthy_lanes():
-                    loader.stop(" !! no lane came up -- going direct")
+                if first.healthy is True:
+                    loader.set(done=1)
+                else:
+                    loader.stop(" !! lane 1 wouldn't cook -- going direct")
                     direct = True
                     manager.stop_all()
                 daemon.start()
@@ -228,10 +225,27 @@ def main(argv: list[str]) -> int:
         relay = Relay(manager, event=emit)
         port = relay.start()
 
-        loader.stop(f" ok -- {len(manager.healthy_lanes())} lane(s) cooking "
-                    f"on 127.0.0.1:{port}")
+        loader.stop(f" ok -- lane 1 cooking on 127.0.0.1:{port}; "
+                    f"the rest register in the background")
         if not opts["no_proof"]:
             proof.spawn_proof_window(PROOF_LOG)
+
+        # The other lanes cook in the background while the user works. As
+        # each finishes bootstrapping, the health daemon's probes pick it up
+        # and it joins the rotation -- visible in the proof window.
+        rest = manager.lanes[1:]
+        if rest:
+            def _cook_rest() -> None:
+                for lane in rest:
+                    emit({"type": "lane", "kind": "heal", "t": time.time(),
+                          "lane": lane.index, "cc": lane.exit_country,
+                          "ip": "",
+                          "msg": f"lane {lane.index} {{{lane.exit_country}}} "
+                                 f"registering in the background ..."})
+                manager.start_lanes(rest)
+
+            threading.Thread(target=_cook_rest, name="lane-cook",
+                             daemon=True).start()
 
         env = dict(os.environ)
         for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
