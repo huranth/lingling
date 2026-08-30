@@ -108,6 +108,7 @@ class TorManager:
         tor_exe: str = "",
         boot_timeout: int = 120,
         log: Optional[Log] = None,
+        reuse: bool = False,
     ) -> None:
         self.root = Path(root_dir)
         self.tools_dir = self.root / "tools"
@@ -127,8 +128,32 @@ class TorManager:
         self._tor_executable: Optional[Path] = None
         self._stopping = False
         self.tools_dir.mkdir(parents=True, exist_ok=True)
-        self.lanes_dir.mkdir(parents=True, exist_ok=True)
+        if reuse:
+            self.lanes_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self._fresh_lanes_dir()
         self._load_existing()
+
+    def _fresh_lanes_dir(self) -> None:
+        """Every launch cooks brand-new lanes -- no reused keys, guards or
+        exit identities from a previous day. First put down any orphaned
+        tor.exe a crashed run left holding our ports (the Job Object covers
+        clean exits; this covers kill -9), then wipe the whole lanes dir so
+        no stale lock file can make the new tor refuse to start."""
+        if self.lanes_dir.exists():
+            for torrc in self.lanes_dir.glob("tor-*/torrc"):
+                for line in torrc.read_text().splitlines():
+                    parts = line.split()
+                    if len(parts) == 2 and parts[0] in ("SocksPort", "ControlPort"):
+                        try:
+                            port = int(parts[1].rsplit(":", 1)[-1])
+                        except ValueError:
+                            continue
+                        pid = netutil.pid_on_port(port)
+                        if pid:
+                            netutil.kill_pid(pid)
+            shutil.rmtree(self.lanes_dir, ignore_errors=True)
+        self.lanes_dir.mkdir(parents=True, exist_ok=True)
 
     # -- setup --------------------------------------------------------------
     def _load_existing(self) -> None:

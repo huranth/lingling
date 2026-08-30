@@ -39,21 +39,31 @@ _KITCHEN_LINES = [
 
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
+# Warm kitchen palette: each phrase gets its own color so the single line
+# feels alive instead of terminal-grey.
+_PHRASE_COLORS = ["38;5;215", "38;5;222", "38;5;180", "38;5;173",
+                  "38;5;114", "38;5;109", "38;5;139", "38;5;175"]
+
+
+def _c(text: str, code: str) -> str:
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        return text
+    return f"\x1b[{code}m{text}\x1b[0m"
+
 
 class _Loader:
-    """Single self-rewriting status line: spinner + a message that rotates
-    through the kitchen lines. Deliberately no counts and no progress bar --
-    the user doesn't know how many lanes there are, so nothing to wait on."""
+    """Single self-rewriting status line: a colored spinner plus a message
+    that rotates through the kitchen lines. Deliberately no counts, no lane
+    chatter, no progress bar -- the user doesn't know how many lanes there
+    are, so there is nothing to report but the vibe."""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._detail = ""
-        self._lock = threading.Lock()
 
     def set(self, detail: str = "") -> None:
-        with self._lock:
-            self._detail = detail
+        # Kept for API compatibility; details are intentionally not shown.
+        pass
 
     def start(self) -> None:
         if not sys.stdout.isatty():
@@ -64,13 +74,11 @@ class _Loader:
     def _run(self) -> None:
         tick = itertools.count()
         while not self._stop.is_set():
-            with self._lock:
-                detail = self._detail
             t = next(tick)
-            spin = _SPIN[t % len(_SPIN)]
-            msg = _KITCHEN_LINES[(t // 24) % len(_KITCHEN_LINES)]
-            suffix = f"  {detail}" if detail else ""
-            sys.stdout.write(f"\r\x1b[K {spin} {msg}{suffix}")
+            spin = _c(_SPIN[t % len(_SPIN)], "1;38;5;220")
+            idx = (t // 24) % len(_KITCHEN_LINES)
+            msg = _c(_KITCHEN_LINES[idx], _PHRASE_COLORS[idx])
+            sys.stdout.write(f"\r\x1b[K {spin} {msg}")
             sys.stdout.flush()
             time.sleep(0.09)
 
@@ -162,10 +170,11 @@ def main(argv: list[str]) -> int:
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
             )
-            loader.set(detail="checking the tor kit")
+            loader.set()
             err = manager.setup_lanes()
             if err:
-                loader.stop(f" !! tor unavailable ({err}) -- going direct")
+                loader.stop(_c(f" !! tor unavailable ({err}) -- going direct",
+                               "33"))
                 direct = True
             else:
                 emit = proof.make_emitter(PROOF_LOG)
@@ -175,10 +184,7 @@ def main(argv: list[str]) -> int:
                 # Only lane 1 cooks in the foreground; the rest register in
                 # the background once the user is already inside opencode.
                 first = manager.lanes[0]
-                loader.set(detail=f"lane {first.index} "
-                                  f"{{{first.exit_country}}} booting")
-                manager.start_lanes([first], on_lane=lambda l, s: loader.set(
-                    detail=f"lane {l.index} {{{l.exit_country}}} {s}"))
+                manager.start_lanes([first])
 
                 # Block until lane 1 provably carries traffic -- better to
                 # cook a few extra seconds here than to hand the user a
@@ -193,26 +199,26 @@ def main(argv: list[str]) -> int:
                     if verdict == "burned":
                         first.burned_cycles += 1
                         daemon._heal_burn(first)
-                    loader.set(detail=f"verifying lane {first.index} "
-                                      f"({verdict})")
                     time.sleep(2)
                 if first.healthy is not True:
-                    loader.stop(" !! lane 1 wouldn't cook -- going direct")
+                    loader.stop(_c(" !! the kitchen stayed cold -- "
+                                   "going direct", "31"))
                     direct = True
                     manager.stop_all()
                 daemon.start()
 
         if direct:
             loader.stop()
-            print("lingling: no lanes -- opencode rides your own IP.\n")
+            print(_c("lingling: no lanes -- opencode rides your own IP.\n",
+                     "33"))
             return _run_opencode(opencode, opts["passthrough"], None)
 
         emit = proof.make_emitter(PROOF_LOG)
         relay = Relay(manager, event=emit)
         port = relay.start()
 
-        loader.stop(f" ok -- lane 1 cooking on 127.0.0.1:{port}; "
-                    f"the rest register in the background")
+        loader.stop(_c(" served! lanes are hot -- proof is in the other "
+                       "window.", "1;32"))
         if not opts["no_proof"]:
             proof.spawn_proof_window(PROOF_LOG)
 
