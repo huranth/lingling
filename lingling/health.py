@@ -130,11 +130,21 @@ class HealthDaemon:
                 lane.healthy = True
                 lane.unhealthy_cycles = 0
                 lane.burned_cycles = 0
-                lane.stall_cycles = 0
+                # stall_cycles is NOT forgiven here: a tiny metadata probe
+                # succeeding proves nothing about real streams. Real request
+                # success (mitm) or a heal below clears the record.
                 if was is not True:
                     self._emit_lane(lane, "up",
                                     f"lane {lane.index} {{{lane.exit_country}}} "
                                     f"is cooking -- exit {lane.exit_ip or '?'}")
+                if (lane.exit_ip
+                        and self.tor.is_bad_exit(lane.exit_country,
+                                                 lane.exit_ip)
+                        and self.tor.renew(lane)):
+                    self._emit_lane(
+                        lane, "heal",
+                        f"lane {lane.index} landed on known-bad exit "
+                        f"{lane.exit_ip} -- building a fresh circuit")
                 continue
 
             lane.healthy = False
@@ -180,7 +190,8 @@ class HealthDaemon:
                         f"new country {{{new_cc}}}")
             lane.last_regenerate_at = time.time()
             lane.burned_cycles = 0
-            self.tor.regenerate_lane(lane)
+            if self.tor.regenerate_lane(lane):
+                lane.stall_cycles = 0
         finally:
             lane.healing = False
 
@@ -197,7 +208,11 @@ class HealthDaemon:
             if lane.unhealthy_cycles <= _ESCALATE_AFTER:
                 self._emit_lane(lane, "heal",
                                 f"lane {lane.index} dropped -- poking it")
-                if not self.tor.restart_lane(lane):
+                if self.tor.restart_lane(lane):
+                    # Fresh process, fresh circuits: the old stall record
+                    # belongs to the previous exit.
+                    lane.stall_cycles = 0
+                else:
                     self._emit_lane(
                         lane, "fail",
                         f"lane {lane.index} would not restart -- will "
@@ -211,7 +226,9 @@ class HealthDaemon:
             self._emit_lane(lane, "heal",
                             f"lane {lane.index} stayed down -- re-cooking "
                             f"from scratch")
-            if not self.tor.regenerate_lane(lane):
+            if self.tor.regenerate_lane(lane):
+                lane.stall_cycles = 0
+            else:
                 self._emit_lane(lane, "fail",
                                 f"lane {lane.index} refused to re-cook")
         finally:
@@ -223,6 +240,7 @@ class HealthDaemon:
         if self.probe_lane(lane) == "healthy":
             lane.sidelined = False
             lane.unhealthy_cycles = 0
+            lane.stall_cycles = 0
             lane.healthy = True
             self._emit_lane(lane, "up",
                             f"lane {lane.index} revived -- back in the kitchen")

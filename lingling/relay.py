@@ -154,6 +154,7 @@ class Relay:
         let the health daemon re-cook it from scratch."""
         lane.healthy = False
         lane.burned_cycles += 1
+        self.tor.mark_bad_exit(lane)
         self._emit({
             "type": "lane", "kind": "burn", "t": time.time(),
             "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
@@ -169,6 +170,7 @@ class Relay:
         if lane.stall_cycles < 2 or not lane.healthy:
             return
         lane.healthy = False
+        self.tor.mark_bad_exit(lane)
         self._emit({
             "type": "lane", "kind": "heal", "t": time.time(),
             "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,

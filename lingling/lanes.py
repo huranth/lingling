@@ -123,6 +123,10 @@ class TorManager:
         self.lanes: List[Lane] = []
         self._tor_executable: Optional[Path] = None
         self._stopping = False
+        # Repeat-offender exit IPs per country: (country, ip) -> first-seen ts.
+        # A lane that lands on one of these gets a fresh circuit instead of
+        # serving traffic through an exit that already stalled or burned.
+        self._bad_exits: Dict[tuple, float] = {}
         self.tools_dir.mkdir(parents=True, exist_ok=True)
         if reuse:
             self.lanes_dir.mkdir(parents=True, exist_ok=True)
@@ -587,6 +591,23 @@ class TorManager:
                 return True
         except Exception:  # noqa: BLE001
             return False
+
+    # -- bad-exit blocklist ---------------------------------------------------
+    _BAD_EXIT_TTL_S = 6 * 3600.0
+
+    def mark_bad_exit(self, lane: Lane) -> None:
+        """Remember this lane's exit IP as a repeat offender for its country."""
+        if lane.exit_ip and lane.exit_country:
+            self._bad_exits[(lane.exit_country, lane.exit_ip)] = time.time()
+
+    def is_bad_exit(self, country: str, ip: str) -> bool:
+        ts = self._bad_exits.get((country, ip))
+        if ts is None:
+            return False
+        if time.time() - ts > self._BAD_EXIT_TTL_S:
+            del self._bad_exits[(country, ip)]
+            return False
+        return True
 
     # -- burn rotation --------------------------------------------------------
     def rotate_exit_country(self, lane: Lane) -> Optional[str]:
