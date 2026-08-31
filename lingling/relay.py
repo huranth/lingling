@@ -134,10 +134,17 @@ class Relay:
         ]
         if not candidates:
             return None
-        # Blind tunnels hold active for minutes, so MITM calls ignore it and
-        # round-robin purely by least-recently-used; tunnels stay busy-aware.
-        key = (lambda l: l.last_used_at) if ignore_busy else (
-            lambda l: (l.active, l.last_used_at))
+        # Sticky-fastest: ride the lowest measured probe RTT until it burns
+        # or stalls out, then fall to the next fastest. Unmeasured lanes
+        # (probe_ms == 0) sort last among measured ones but still get handed
+        # out round-robin via last_used_at, so early traffic calibrates.
+        def key(l: Lane):
+            unmeasured = 1 if l.probe_ms <= 0 else 0
+            if ignore_busy:
+                return (unmeasured, l.probe_ms, l.last_used_at)
+            # Tunnels live for minutes: spread by load first, speed second.
+            return (l.active, unmeasured, l.probe_ms, l.last_used_at)
+
         lane = min(candidates, key=key)
         lane.last_used_at = time.perf_counter_ns()
         return lane

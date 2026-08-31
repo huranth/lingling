@@ -58,6 +58,8 @@ class Lane:
     burned_cycles: int = 0
     #: Consecutive in-flight transport stalls (timeouts, EOFs) on real calls.
     stall_cycles: int = 0
+    #: Smoothed probe round-trip in ms; 0 = never measured.
+    probe_ms: float = 0.0
     last_regenerate_at: float = 0.0
     last_circuit_built_ts: float = 0.0
     sidelined: bool = False

@@ -78,9 +78,15 @@ class HealthDaemon:
                                     timeout=netutil.PORT_CHECK_TIMEOUT):
             return "dead"
         try:
+            t0 = time.monotonic()
             code, _ = netutil.https_get_via_socks(
                 lane.socks_port, UPSTREAM_HOST, UPSTREAM_PROBE_PATH,
                 UPSTREAM_UA, timeout=PROBE_TIMEOUT)
+            # Any completed round trip is a valid network-latency sample,
+            # even a 429 -- burn handling is separate from speed ranking.
+            ms = (time.monotonic() - t0) * 1000.0
+            lane.probe_ms = ms if lane.probe_ms <= 0 else (
+                lane.probe_ms * 0.7 + ms * 0.3)
             if code == 429:
                 return "burned"
             if code == 0:
