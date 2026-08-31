@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-__version__ = "2.0.2"
+__version__ = "2.0.3"
 
 
 def data_dir() -> Path:

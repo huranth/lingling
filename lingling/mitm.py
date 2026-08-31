@@ -227,14 +227,20 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
             with lane.lock:
                 lane.active += 1
             try:
-                err, status, held = _roundtrip(
+                err, status, held, retryable = _roundtrip(
                     client, lane, host, port, method, path, headers,
                     body, emit, seq, call_n, t0)
             finally:
                 with lane.lock:
                     lane.active -= 1
             if err:
+                relay.report_stall(lane)
+                # Nothing reached the client -> safe to re-issue elsewhere.
+                if retryable:
+                    tried.add(lane.index)
+                    continue
                 return
+            lane.stall_cycles = 0
             if status == 429:
                 relay.report_burn(lane)
                 tried.add(lane.index)
@@ -245,16 +251,17 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
 def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                method: str, path: str, headers: dict, body: bytes,
                emit, seq: int, call_n: int, t0: float
-               ) -> "tuple[str, int, bytes]":
-    """Returns (err, status, held). A 429 is fully buffered into ``held``
-    instead of forwarded, so the caller can retry on a fresh lane."""
+               ) -> "tuple[str, int, bytes, bool]":
+    """Returns (err, status, held, retryable). A 429 is fully buffered into
+    ``held`` instead of forwarded, so the caller can retry on a fresh lane;
+    ``retryable`` is True only when nothing reached the client yet."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(60)
     try:
         sock.connect(("127.0.0.1", lane.socks_port))
         err = netutil.socks5_open(sock, host, port)
         if err:
-            return err, 0, b""
+            return err, 0, b"", True
         up = ssl.create_default_context().wrap_socket(sock,
                                                       server_hostname=host)
     except (ssl.SSLError, OSError) as exc:
@@ -263,7 +270,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
               "lane": lane.index, "cc": lane.exit_country, "status": 0,
               "kb": 0, "secs": round(time.time() - t0, 1), "err": err})
-        return err, 0, b""
+        return err, 0, b"", True
 
     total = 0
     held = bytearray()
@@ -298,7 +305,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
             emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
                   "lane": lane.index, "cc": lane.exit_country, "status": 0,
                   "kb": 0, "secs": round(time.time() - t0, 1), "err": err})
-            return err, 0, b""
+            return err, 0, b"", True
         status = 0
         try:
             status = int(rhead.split(b" ", 2)[1])
@@ -355,14 +362,15 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
               "lane": lane.index, "cc": lane.exit_country, "status": status,
               "kb": round(total / 1024, 1),
               "secs": round(time.time() - t0, 1), "err": ""})
-        return "", status, bytes(held or b"")
+        return "", status, bytes(held or b""), False
     except (ssl.SSLError, OSError) as exc:
         err = f"{type(exc).__name__}"
+        retryable = held is not None or total == 0
         emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
               "lane": lane.index, "cc": lane.exit_country, "status": 0,
               "kb": round(total / 1024, 1),
               "secs": round(time.time() - t0, 1), "err": err})
-        return err, 0, b""
+        return err, 0, b"", retryable
     finally:
         try:
             up.close()

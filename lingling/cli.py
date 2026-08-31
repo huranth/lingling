@@ -25,6 +25,25 @@ PROOF_LOG = DATA_DIR / "proof.log"
 
 DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
+
+def _load_countries() -> tuple:
+    """Private override: <data dir>/countries.txt with a primary CSV list on
+    line 1 and an optional fallback pool on line 2. Never shipped."""
+    path = DATA_DIR / "countries.txt"
+    if path.exists():
+        try:
+            lines = [l.strip() for l in
+                     path.read_text(encoding="utf-8").splitlines()
+                     if l.strip()]
+            primary = [c.strip() for c in lines[0].split(",") if c.strip()]
+            fallback = ([c.strip() for c in lines[1].split(",") if c.strip()]
+                        if len(lines) > 1 else [])
+            if primary:
+                return primary, fallback
+        except OSError:
+            pass
+    return DEFAULT_COUNTRIES, []
+
 _KITCHEN_LINES = [
     "cooking the lanes", "baking it", "warming the exits",
     "glazing the tunnel", "seasoning the circuits", "proofing the dough",
@@ -152,9 +171,11 @@ def main(argv: list[str]) -> int:
 
     try:
         if not direct:
+            countries, fallback = _load_countries()
             manager = TorManager(
                 DATA_DIR, count=opts["lanes"],
-                exit_countries=DEFAULT_COUNTRIES,
+                exit_countries=countries,
+                fallback_countries=fallback,
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
             )

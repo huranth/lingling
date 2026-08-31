@@ -154,6 +154,21 @@ class Relay:
                    f"re-cooking it fresh",
         })
 
+    def report_stall(self, lane: Lane) -> None:
+        """A real request timed out or dropped through this lane. One stall
+        could be Tor being Tor; two in a row means the exit is a lemon --
+        pull it from rotation so the daemon re-cooks it."""
+        lane.stall_cycles += 1
+        if lane.stall_cycles < 2 or not lane.healthy:
+            return
+        lane.healthy = False
+        self._emit({
+            "type": "lane", "kind": "heal", "t": time.time(),
+            "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
+            "msg": f"lane {lane.index} kept stalling -- pulled from "
+                   f"rotation, re-cooking it",
+        })
+
     # -- connection handling --------------------------------------------------
     async def _handle(self, reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter) -> None:

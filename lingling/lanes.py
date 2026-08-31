@@ -56,6 +56,8 @@ class Lane:
     unhealthy_cycles: int = 0
     #: Consecutive probes that came back 429 (destination burn).
     burned_cycles: int = 0
+    #: Consecutive in-flight transport stalls (timeouts, EOFs) on real calls.
+    stall_cycles: int = 0
     last_regenerate_at: float = 0.0
     last_circuit_built_ts: float = 0.0
     sidelined: bool = False
@@ -89,6 +91,7 @@ class TorManager:
         root_dir: Path,
         count: int = 5,
         exit_countries: Optional[List[str]] = None,
+        fallback_countries: Optional[List[str]] = None,
         socks_base: int = 52001,
         # Not 52101: Hyper-V/WSL excludes 52093-52192 on many Windows machines.
         control_base: int = 52301,
@@ -105,7 +108,11 @@ class TorManager:
         if not base:
             base = ["us"]
         self.countries = [base[i % len(base)] for i in range(self.count)]
-        self._rotation_countries: List[str] = list(base)
+        # Rotation order: the quiet primary pool first, the crowded fallback
+        # pool only once every quiet country has burned for that lane.
+        self._quiet = list(base)
+        self._fallback = [c for c in (fallback_countries or [])
+                          if c not in self._quiet]
         self.socks_base = socks_base
         self.control_base = control_base
         self.tor_exe_override = tor_exe
@@ -126,7 +133,7 @@ class TorManager:
         ``cached-*`` consensus files -- wiping them forces a multi-minute
         bootstrap. Also kill orphaned tor.exe left by kill -9 (the Job Object
         only covers clean exits) and remove stale lock files."""
-        identity_files = ("lock", "state", "control_auth_cookie")
+        identity_files = ("lock", "state", "control_auth_cookie", "torrc")
         if self.lanes_dir.exists():
             for torrc in self.lanes_dir.glob("tor-*/torrc"):
                 for line in torrc.read_text().splitlines():
@@ -582,18 +589,21 @@ class TorManager:
     # -- burn rotation --------------------------------------------------------
     def rotate_exit_country(self, lane: Lane) -> Optional[str]:
         """Move a lane to another exit country (burns throttle the whole
-        country persona, not one IP). Returns the new country or None."""
+        country persona, not one IP). Quiet pool first, crowded fallback
+        pool only when the quiet one is exhausted. Returns the new country."""
         in_use = {l.exit_country for l in self.lanes
                   if l is not lane and not l.sidelined}
-        candidates = [c for c in self._rotation_countries
+        quiet_free = [c for c in self._quiet
                       if c not in in_use and c != lane.exit_country]
-        if not candidates:
-            candidates = [c for c in self._rotation_countries
-                          if c != lane.exit_country]
-        if not candidates:
-            return None
-        lane.exit_country = candidates[0]
-        return candidates[0]
+        fallback_free = [c for c in self._fallback
+                         if c not in in_use and c != lane.exit_country]
+        any_other = [c for c in self._quiet + self._fallback
+                     if c != lane.exit_country]
+        for candidates in (quiet_free, fallback_free, any_other):
+            if candidates:
+                lane.exit_country = candidates[0]
+                return candidates[0]
+        return None
 
     def healthy_lanes(self) -> List[Lane]:
         return [l for l in self.lanes

@@ -111,16 +111,20 @@ class HealthDaemon:
                 continue
 
             verdict = self.probe_lane(lane)
-            # A 429 seen by real traffic outranks the metadata probe: the
-            # models list isn't throttled the way inference is.
-            if (verdict == "healthy" and lane.healthy is False
-                    and lane.burned_cycles > 0):
-                verdict = "burned"
+            # Real-traffic failures outrank the metadata probe: the models
+            # list isn't throttled the way inference is, and a probe can
+            # succeed on an exit that stalls real streams.
+            if verdict == "healthy" and lane.healthy is False:
+                if lane.burned_cycles > 0:
+                    verdict = "burned"
+                elif lane.stall_cycles > 0:
+                    verdict = "dead"
             if verdict == "healthy":
                 was = lane.healthy
                 lane.healthy = True
                 lane.unhealthy_cycles = 0
                 lane.burned_cycles = 0
+                lane.stall_cycles = 0
                 if was is not True:
                     self._emit_lane(lane, "up",
                                     f"lane {lane.index} {{{lane.exit_country}}} "
