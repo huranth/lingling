@@ -2,11 +2,12 @@
 (StrictNodes + ExitNodes {cc}), each a local SOCKS5 on 127.0.0.1:52001+.
 Missing stem/tor degrades to "Tor unavailable"; tor.exe children join a
 kill-on-close Windows Job Object so they never outlive this process.
-Heal ladder: NEWNYM -> rebuild_circuits -> restart_lane -> regenerate_lane.
+Heal ladder: NEWNYM -> restart_lane -> regenerate_lane.
 """
 
 from __future__ import annotations
 
+import json
 import platform
 import queue
 import re
@@ -58,6 +59,8 @@ class Lane:
     burned_cycles: int = 0
     #: Consecutive in-flight transport stalls (timeouts, EOFs) on real calls.
     stall_cycles: int = 0
+    #: Timestamps of recent stalls; entries older than the window are pruned.
+    stall_times: List[float] = field(default_factory=list)
     #: Smoothed probe round-trip in ms; 0 = never measured.
     probe_ms: float = 0.0
     last_regenerate_at: float = 0.0
@@ -68,6 +71,8 @@ class Lane:
     active: int = 0
     #: Last time the picker handed this lane out (drives round-robin).
     last_used_at: float = 0.0
+    #: Consecutive NEWNYM dodges that failed to shake a known-bad exit.
+    bad_dodges: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def cookie_path(self) -> Path:
@@ -75,6 +80,24 @@ class Lane:
 
     def torrc_path(self) -> Path:
         return self.data_dir / "torrc"
+
+    # -- stall memory ----------------------------------------------------------
+    # Stalls are counted in a sliding window, not consecutively: a lemon exit
+    # that alternates stall/success/stall must still get pulled.
+    STALL_WINDOW_S = 600.0
+
+    def note_stall(self) -> int:
+        """Record a real-traffic stall; returns stalls inside the window."""
+        now = time.time()
+        self.stall_times.append(now)
+        cutoff = now - self.STALL_WINDOW_S
+        self.stall_times = [t for t in self.stall_times if t >= cutoff]
+        self.stall_cycles = len(self.stall_times)
+        return self.stall_cycles
+
+    def clear_stalls(self) -> None:
+        self.stall_times.clear()
+        self.stall_cycles = 0
 
     def running(self) -> bool:
         if self.process is not None and self.process.poll() is None:
@@ -94,6 +117,7 @@ class TorManager:
         count: int = 5,
         exit_countries: Optional[List[str]] = None,
         fallback_countries: Optional[List[str]] = None,
+        preferred_countries: Optional[List[str]] = None,
         socks_base: int = 52001,
         # Not 52101: Hyper-V/WSL excludes 52093-52192 on many Windows machines.
         control_base: int = 52301,
@@ -109,7 +133,11 @@ class TorManager:
         base = list(exit_countries) if exit_countries else ["us"]
         if not base:
             base = ["us"]
-        self.countries = [base[i % len(base)] for i in range(self.count)]
+        # Preferred pool: every lane boots here and sticks through burns;
+        # only a country that keeps dealing bad exits gets abandoned.
+        self._preferred = [c for c in (preferred_countries or []) if c]
+        boot = self._preferred or base
+        self.countries = [boot[i % len(boot)] for i in range(self.count)]
         # Rotation order: the quiet primary pool first, the crowded fallback
         # pool only once every quiet country has burned for that lane.
         self._quiet = list(base)
@@ -127,6 +155,7 @@ class TorManager:
         # A lane that lands on one of these gets a fresh circuit instead of
         # serving traffic through an exit that already stalled or burned.
         self._bad_exits: Dict[tuple, float] = {}
+        self._load_bad_exits()
         self.tools_dir.mkdir(parents=True, exist_ok=True)
         if reuse:
             self.lanes_dir.mkdir(parents=True, exist_ok=True)
@@ -527,6 +556,7 @@ class TorManager:
         lane.data_dir.mkdir(parents=True, exist_ok=True)
         lane.exit_ip = ""
         lane.last_circuit_built_ts = 0.0
+        lane.bad_dodges = 0
         lane.boot_ok = False
         try:
             taken_socks = {l.socks_port for l in self.lanes if l is not lane}
@@ -560,33 +590,6 @@ class TorManager:
                     return False
                 controller.signal(Signal.NEWNYM)
                 lane.last_circuit_built_ts = time.time()
-                return True
-        except Exception:  # noqa: BLE001
-            return False
-
-    def rebuild_circuits(self, lane: Lane) -> bool:
-        """Close general circuits + build a fresh one, blocking until BUILT."""
-        if _stem() is None:
-            return False
-        if not netutil.port_is_open("127.0.0.1", lane.control_port, timeout=0.3):
-            return False
-        try:
-            from stem.control import Controller
-            import stem.connection
-
-            with Controller.from_port(port=lane.control_port) as controller:
-                stem.connection.authenticate_cookie(
-                    controller, str(lane.cookie_path()))
-                for circ in controller.get_circuits():
-                    flags = set(circ.build_flags or ())
-                    if flags & {"INTERNAL", "ONEHOP_TUNNEL"}:
-                        continue
-                    try:
-                        controller.close_circuit(circ.id)
-                    except Exception:  # noqa: BLE001
-                        pass
-                controller.new_circuit(await_build=True)
-                lane.last_circuit_built_ts = time.time()
                 lane.exit_ip = ""  # refilled by the next health probe
                 return True
         except Exception:  # noqa: BLE001
@@ -595,10 +598,40 @@ class TorManager:
     # -- bad-exit blocklist ---------------------------------------------------
     _BAD_EXIT_TTL_S = 6 * 3600.0
 
+    def _bad_exits_path(self) -> Path:
+        return self.root / "bad-exits.json"
+
+    def _load_bad_exits(self) -> None:
+        """Blocklist survives restarts -- a lemon exit at 14:00 is still a
+        lemon at 15:00 after relaunching lingling."""
+        try:
+            data = json.loads(self._bad_exits_path().read_text())
+        except Exception:  # noqa: BLE001
+            return
+        now = time.time()
+        for key, ts in data.items():
+            try:
+                cc, ip = key.split("|", 1)
+                ts = float(ts)
+            except (ValueError, TypeError):
+                continue
+            if now - ts <= self._BAD_EXIT_TTL_S:
+                self._bad_exits[(cc, ip)] = ts
+
+    def _save_bad_exits(self) -> None:
+        try:
+            now = time.time()
+            data = {f"{cc}|{ip}": ts for (cc, ip), ts in self._bad_exits.items()
+                    if now - ts <= self._BAD_EXIT_TTL_S}
+            self._bad_exits_path().write_text(json.dumps(data))
+        except Exception:  # noqa: BLE001
+            pass
+
     def mark_bad_exit(self, lane: Lane) -> None:
         """Remember this lane's exit IP as a repeat offender for its country."""
         if lane.exit_ip and lane.exit_country:
             self._bad_exits[(lane.exit_country, lane.exit_ip)] = time.time()
+            self._save_bad_exits()
 
     def is_bad_exit(self, country: str, ip: str) -> bool:
         ts = self._bad_exits.get((country, ip))
@@ -606,23 +639,44 @@ class TorManager:
             return False
         if time.time() - ts > self._BAD_EXIT_TTL_S:
             del self._bad_exits[(country, ip)]
+            self._save_bad_exits()
             return False
         return True
 
     # -- burn rotation --------------------------------------------------------
+    #: A preferred country with this many distinct bad exits in the blocklist
+    #: window is considered exhausted -- its pool is effectively drained.
+    _PREFERRED_EXHAUST_EXITS = 4
+
+    def _country_exhausted(self, country: str) -> bool:
+        now = time.time()
+        return sum(1 for (cc, _), ts in self._bad_exits.items()
+                   if cc == country
+                   and now - ts <= self._BAD_EXIT_TTL_S) >= \
+            self._PREFERRED_EXHAUST_EXITS
+
     def rotate_exit_country(self, lane: Lane) -> Optional[str]:
         """Move a lane to another exit country (burns throttle the whole
-        country persona, not one IP). Quiet pool first, crowded fallback
-        pool only when the quiet one is exhausted. Returns the new country."""
+        country persona, not one IP). Preferred countries are sticky: the
+        lane re-cooks on the SAME country for a fresh exit unless that
+        country has exhausted its pool of good exits. Then the quiet pool,
+        then the crowded fallback pool. Returns the new country."""
+        if (lane.exit_country in self._preferred
+                and not self._country_exhausted(lane.exit_country)):
+            return lane.exit_country
         in_use = {l.exit_country for l in self.lanes
                   if l is not lane and not l.sidelined}
+        preferred_free = [c for c in self._preferred
+                          if c != lane.exit_country
+                          and not self._country_exhausted(c)]
         quiet_free = [c for c in self._quiet
                       if c not in in_use and c != lane.exit_country]
         fallback_free = [c for c in self._fallback
                          if c not in in_use and c != lane.exit_country]
-        any_other = [c for c in self._quiet + self._fallback
+        any_other = [c for c in self._preferred + self._quiet + self._fallback
                      if c != lane.exit_country]
-        for candidates in (quiet_free, fallback_free, any_other):
+        for candidates in (preferred_free, quiet_free, fallback_free,
+                           any_other):
             if candidates:
                 lane.exit_country = candidates[0]
                 return candidates[0]

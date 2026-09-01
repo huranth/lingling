@@ -21,6 +21,9 @@ UPSTREAM_PROBE_PATH = "/zen/v1/models"
 # The free tier instantly 429s requests without this UA; a probe lacking it would call every lane burned.
 UPSTREAM_UA = os.environ.get("LINGLING_UPSTREAM_USER_AGENT", "opencode/1.0")
 
+# The startup race: identical tiny prompt for every lane, so timings compare.
+_BENCH_PROMPT = "say ok"
+
 PROBE_TIMEOUT = 15.0
 # Consecutive failed cycles before a dead lane escalates from restart to regenerate.
 _ESCALATE_AFTER = 2
@@ -49,6 +52,7 @@ class HealthDaemon:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._warmup = True
+        self._benchmarked = False
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -68,9 +72,61 @@ class HealthDaemon:
         while not self._stop.is_set():
             try:
                 self.check_once()
+                if not self._benchmarked and not self._warmup:
+                    self._benchmarked = True
+                    self._benchmark_lanes()
             except Exception as exc:  # noqa: BLE001
                 self.log("health: cycle flamed out: %s", exc)
             self._stop.wait(self.check_interval)
+
+    def _benchmark_lanes(self) -> None:
+        """One identical real prompt through every healthy lane, once per
+        launch. Ranks lanes by true end-to-end speed so the sticky picker
+        starts on facts, not on metadata-probe latency."""
+        healthy = [l for l in self.tor.lanes if l.healthy]
+        if len(healthy) < 2:
+            self._benchmarked = False  # try again next cycle
+            return
+        # Any model works as long as every lane gets the SAME one; take the
+        # first id from the models list the probe already trusts.
+        try:
+            code, body = netutil.https_get_via_socks(
+                healthy[0].socks_port, UPSTREAM_HOST, UPSTREAM_PROBE_PATH,
+                UPSTREAM_UA, timeout=PROBE_TIMEOUT)
+            models = json.loads(body.decode("utf-8", "replace")).get("data", [])
+            model = str(models[0]["id"])
+        except Exception:  # noqa: BLE001
+            self._benchmarked = False
+            return
+        bench_body = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": _BENCH_PROMPT}],
+            "max_tokens": 5, "stream": False,
+        }).encode()
+        self._emit({"type": "lane", "kind": "bench", "t": time.time(),
+                    "msg": "racing the lanes with one real prompt each..."})
+        for lane in healthy:
+            if self._stop.is_set():
+                return
+            try:
+                t0 = time.monotonic()
+                code, _ = netutil.https_via_socks(
+                    lane.socks_port, UPSTREAM_HOST,
+                    "POST", "/zen/v1/chat/completions", UPSTREAM_UA,
+                    body=bench_body, timeout=45.0, max_body=65536)
+                ms = (time.monotonic() - t0) * 1000.0
+                if code == 200:
+                    lane.probe_ms = ms
+                    self._emit({
+                        "type": "lane", "kind": "bench", "t": time.time(),
+                        "lane": lane.index, "cc": lane.exit_country,
+                        "msg": f"lane {lane.index} {{{lane.exit_country}}} "
+                               f"answered in {ms / 1000:.1f}s"})
+                elif code == 429:
+                    lane.healthy = False
+                    lane.burned_cycles += 1
+            except Exception:  # noqa: BLE001
+                pass
 
     def probe_lane(self, lane: Lane) -> str:
         """One probe round. Returns "healthy" | "burned" | "dead"."""
@@ -139,12 +195,32 @@ class HealthDaemon:
                                     f"is cooking -- exit {lane.exit_ip or '?'}")
                 if (lane.exit_ip
                         and self.tor.is_bad_exit(lane.exit_country,
-                                                 lane.exit_ip)
-                        and self.tor.renew(lane)):
-                    self._emit_lane(
-                        lane, "heal",
-                        f"lane {lane.index} landed on known-bad exit "
-                        f"{lane.exit_ip} -- building a fresh circuit")
+                                                 lane.exit_ip)):
+                    bad_ip = lane.exit_ip
+                    if lane.bad_dodges >= 2:
+                        # NEWNYM keeps re-dealing the same exit (small country
+                        # pool) -- if the country is drained, leave it; then
+                        # re-cook from scratch either way.
+                        self.tor.rotate_exit_country(lane)
+                        self._emit_lane(
+                            lane, "heal",
+                            f"lane {lane.index} can't shake bad exit "
+                            f"{bad_ip} -- re-cooking on {{{lane.exit_country}}}")
+                        lane.healthy = False
+                        lane.bad_dodges = 0
+                        lane.healing = True
+                        try:
+                            self.tor.regenerate_lane(lane)
+                        finally:
+                            lane.healing = False
+                    elif self.tor.renew(lane):
+                        lane.bad_dodges += 1
+                        self._emit_lane(
+                            lane, "heal",
+                            f"lane {lane.index} landed on known-bad exit "
+                            f"{bad_ip} -- building a fresh circuit")
+                else:
+                    lane.bad_dodges = 0
                 continue
 
             lane.healthy = False
@@ -182,16 +258,22 @@ class HealthDaemon:
                 f"lane {lane.index} hit a hidden limit -- your traffic moved "
                 f"to a fresh lane; re-cooking this one from scratch")
             if lane.burned_cycles >= _BURN_ESCALATE_AFTER:
+                old_cc = lane.exit_country
                 new_cc = self.tor.rotate_exit_country(lane)
-                if new_cc:
+                if new_cc and new_cc != old_cc:
                     self._emit_lane(
                         lane, "rotate",
                         f"lane {lane.index} keeps burning -- re-cooking on a "
                         f"new country {{{new_cc}}}")
+                elif new_cc:
+                    self._emit_lane(
+                        lane, "rotate",
+                        f"lane {lane.index} keeps burning -- re-cooking on a "
+                        f"fresh {{{new_cc}}} exit")
             lane.last_regenerate_at = time.time()
             lane.burned_cycles = 0
             if self.tor.regenerate_lane(lane):
-                lane.stall_cycles = 0
+                lane.clear_stalls()
         finally:
             lane.healing = False
 
@@ -211,7 +293,7 @@ class HealthDaemon:
                 if self.tor.restart_lane(lane):
                     # Fresh process, fresh circuits: the old stall record
                     # belongs to the previous exit.
-                    lane.stall_cycles = 0
+                    lane.clear_stalls()
                 else:
                     self._emit_lane(
                         lane, "fail",
@@ -227,7 +309,7 @@ class HealthDaemon:
                             f"lane {lane.index} stayed down -- re-cooking "
                             f"from scratch")
             if self.tor.regenerate_lane(lane):
-                lane.stall_cycles = 0
+                lane.clear_stalls()
             else:
                 self._emit_lane(lane, "fail",
                                 f"lane {lane.index} refused to re-cook")
@@ -240,7 +322,7 @@ class HealthDaemon:
         if self.probe_lane(lane) == "healthy":
             lane.sidelined = False
             lane.unhealthy_cycles = 0
-            lane.stall_cycles = 0
+            lane.clear_stalls()
             lane.healthy = True
             self._emit_lane(lane, "up",
                             f"lane {lane.index} revived -- back in the kitchen")

@@ -160,6 +160,10 @@ def handle_conn(raw: socket.socket, host: str, port: int, seq: int,
         return
     try:
         _serve(client, host, port, seq, manager, emit, relay)
+    except (OSError, ssl.SSLError, TimeoutError):
+        # Idle keep-alive ceiling or a client that vanished mid-request --
+        # the connection is over either way, nothing to report.
+        pass
     finally:
         try:
             client.close()
@@ -240,7 +244,6 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                     tried.add(lane.index)
                     continue
                 return
-            lane.stall_cycles = 0
             if status == 429:
                 relay.report_burn(lane)
                 tried.add(lane.index)
@@ -256,7 +259,9 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
     ``held`` instead of forwarded, so the caller can retry on a fresh lane;
     ``retryable`` is True only when nothing reached the client yet."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(60)
+    # Per-read ceiling. A healthy exit answers within seconds; 30s of silence
+    # means the circuit is dead, so fail over instead of staring at a hang.
+    sock.settimeout(30)
     try:
         sock.connect(("127.0.0.1", lane.socks_port))
         err = netutil.socks5_open(sock, host, port)

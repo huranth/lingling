@@ -28,7 +28,9 @@ DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
 def _load_countries() -> tuple:
     """Private override: <data dir>/countries.txt with a primary CSV list on
-    line 1 and an optional fallback pool on line 2. Never shipped."""
+    line 1, an optional fallback pool on line 2, and an optional preferred
+    pool on line 3 (lanes stick to preferred countries until those countries
+    accumulate too many bad exits). Never shipped."""
     path = DATA_DIR / "countries.txt"
     if path.exists():
         try:
@@ -38,11 +40,13 @@ def _load_countries() -> tuple:
             primary = [c.strip() for c in lines[0].split(",") if c.strip()]
             fallback = ([c.strip() for c in lines[1].split(",") if c.strip()]
                         if len(lines) > 1 else [])
+            preferred = ([c.strip() for c in lines[2].split(",") if c.strip()]
+                         if len(lines) > 2 else [])
             if primary:
-                return primary, fallback
+                return primary, fallback, preferred
         except OSError:
             pass
-    return DEFAULT_COUNTRIES, []
+    return DEFAULT_COUNTRIES, [], []
 
 _KITCHEN_LINES = [
     "cooking the lanes", "baking it", "warming the exits",
@@ -171,11 +175,12 @@ def main(argv: list[str]) -> int:
 
     try:
         if not direct:
-            countries, fallback = _load_countries()
+            countries, fallback, preferred = _load_countries()
             manager = TorManager(
                 DATA_DIR, count=opts["lanes"],
                 exit_countries=countries,
                 fallback_countries=fallback,
+                preferred_countries=preferred,
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
             )

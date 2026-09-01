@@ -163,11 +163,10 @@ class Relay:
         })
 
     def report_stall(self, lane: Lane) -> None:
-        """A real request timed out or dropped through this lane. One stall
-        could be Tor being Tor; two in a row means the exit is a lemon --
-        pull it from rotation so the daemon re-cooks it."""
-        lane.stall_cycles += 1
-        if lane.stall_cycles < 2 or not lane.healthy:
+        """A real request timed out or dropped through this lane. Stalls are
+        counted in a sliding window -- a lemon exit that alternates
+        stall/success/stall still gets pulled, and remembered."""
+        if lane.note_stall() < 2 or not lane.healthy:
             return
         lane.healthy = False
         self.tor.mark_bad_exit(lane)
