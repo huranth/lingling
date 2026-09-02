@@ -34,14 +34,14 @@ def _load_countries() -> tuple:
     path = DATA_DIR / "countries.txt"
     if path.exists():
         try:
-            lines = [l.strip() for l in
-                     path.read_text(encoding="utf-8").splitlines()
-                     if l.strip()]
-            primary = [c.strip() for c in lines[0].split(",") if c.strip()]
-            fallback = ([c.strip() for c in lines[1].split(",") if c.strip()]
-                        if len(lines) > 1 else [])
-            preferred = ([c.strip() for c in lines[2].split(",") if c.strip()]
-                         if len(lines) > 2 else [])
+            # Physical line positions matter: line 1 primary, line 2
+            # fallback, line 3 preferred. Blank lines stay blank so a
+            # skipped pool can't shift the lines below it.
+            raw = path.read_text(encoding="utf-8").splitlines()
+            raw += [""] * (3 - len(raw))
+            pools = [[c.strip() for c in raw[i].split(",") if c.strip()]
+                     for i in range(3)]
+            primary, fallback, preferred = pools
             if primary:
                 return primary, fallback, preferred
         except OSError:
