@@ -597,9 +597,16 @@ class TorManager:
 
     # -- bad-exit blocklist ---------------------------------------------------
     _BAD_EXIT_TTL_S = 6 * 3600.0
+    _BAD_EXIT_TTL_MAX_S = 7 * 24 * 3600.0
 
     def _bad_exits_path(self) -> Path:
         return self.root / "bad-exits.json"
+
+    @staticmethod
+    def _exit_ttl(strikes: int) -> float:
+        """Repeat offenders earn longer bans: 6h, 12h, 24h, ... up to 7d."""
+        return min(TorManager._BAD_EXIT_TTL_S * (2 ** max(0, strikes - 1)),
+                   TorManager._BAD_EXIT_TTL_MAX_S)
 
     def _load_bad_exits(self) -> None:
         """Blocklist survives restarts -- a lemon exit at 14:00 is still a
@@ -609,35 +616,42 @@ class TorManager:
         except Exception:  # noqa: BLE001
             return
         now = time.time()
-        for key, ts in data.items():
+        for key, val in data.items():
             try:
                 cc, ip = key.split("|", 1)
-                ts = float(ts)
+                ts, strikes = (val if isinstance(val, list)
+                               else (float(val), 1))
+                ts, strikes = float(ts), int(strikes)
             except (ValueError, TypeError):
                 continue
-            if now - ts <= self._BAD_EXIT_TTL_S:
-                self._bad_exits[(cc, ip)] = ts
+            if now - ts <= self._exit_ttl(strikes):
+                self._bad_exits[(cc, ip)] = [ts, strikes]
 
     def _save_bad_exits(self) -> None:
         try:
             now = time.time()
-            data = {f"{cc}|{ip}": ts for (cc, ip), ts in self._bad_exits.items()
-                    if now - ts <= self._BAD_EXIT_TTL_S}
+            data = {f"{cc}|{ip}": [ts, strikes]
+                    for (cc, ip), (ts, strikes) in self._bad_exits.items()
+                    if now - ts <= self._exit_ttl(strikes)}
             self._bad_exits_path().write_text(json.dumps(data))
         except Exception:  # noqa: BLE001
             pass
 
     def mark_bad_exit(self, lane: Lane) -> None:
-        """Remember this lane's exit IP as a repeat offender for its country."""
+        """Remember this lane's exit IP as a repeat offender for its country.
+        Each fresh offense renews the timestamp and doubles the ban."""
         if lane.exit_ip and lane.exit_country:
-            self._bad_exits[(lane.exit_country, lane.exit_ip)] = time.time()
+            key = (lane.exit_country, lane.exit_ip)
+            _, strikes = self._bad_exits.get(key, [0.0, 0])
+            self._bad_exits[key] = [time.time(), strikes + 1]
             self._save_bad_exits()
 
     def is_bad_exit(self, country: str, ip: str) -> bool:
-        ts = self._bad_exits.get((country, ip))
-        if ts is None:
+        entry = self._bad_exits.get((country, ip))
+        if entry is None:
             return False
-        if time.time() - ts > self._BAD_EXIT_TTL_S:
+        ts, strikes = entry
+        if time.time() - ts > self._exit_ttl(strikes):
             del self._bad_exits[(country, ip)]
             self._save_bad_exits()
             return False
@@ -650,9 +664,9 @@ class TorManager:
 
     def _country_exhausted(self, country: str) -> bool:
         now = time.time()
-        return sum(1 for (cc, _), ts in self._bad_exits.items()
+        return sum(1 for (cc, _), (ts, strikes) in self._bad_exits.items()
                    if cc == country
-                   and now - ts <= self._BAD_EXIT_TTL_S) >= \
+                   and now - ts <= self._exit_ttl(strikes)) >= \
             self._PREFERRED_EXHAUST_EXITS
 
     def rotate_exit_country(self, lane: Lane) -> Optional[str]:

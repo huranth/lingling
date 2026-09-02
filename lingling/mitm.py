@@ -238,8 +238,9 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                 with lane.lock:
                     lane.active -= 1
             if err:
-                relay.report_stall(lane)
-                # Nothing reached the client -> safe to re-issue elsewhere.
+                # retryable == nothing reached the client: dead exit, free
+                # retry, so it counts as a hard stall (instant pull).
+                relay.report_stall(lane, hard=retryable)
                 if retryable:
                     tried.add(lane.index)
                     continue

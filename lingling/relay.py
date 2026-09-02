@@ -162,18 +162,22 @@ class Relay:
                    f"re-cooking it fresh",
         })
 
-    def report_stall(self, lane: Lane) -> None:
+    def report_stall(self, lane: Lane, hard: bool = False) -> None:
         """A real request timed out or dropped through this lane. Stalls are
         counted in a sliding window -- a lemon exit that alternates
-        stall/success/stall still gets pulled, and remembered."""
-        if lane.note_stall() < 2 or not lane.healthy:
+        stall/success/stall still gets pulled, and remembered. A ``hard``
+        stall (zero bytes delivered: dead exit, free retry) pulls at once."""
+        if lane.note_stall() < 2 and not hard:
+            return
+        if not lane.healthy:
             return
         lane.healthy = False
         self.tor.mark_bad_exit(lane)
+        why = "dead exit gave nothing" if hard else "kept stalling"
         self._emit({
             "type": "lane", "kind": "heal", "t": time.time(),
             "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
-            "msg": f"lane {lane.index} kept stalling -- pulled from "
+            "msg": f"lane {lane.index} {why} -- pulled from "
                    f"rotation, re-cooking it",
         })
 
