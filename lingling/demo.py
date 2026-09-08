@@ -10,7 +10,7 @@ import json
 import time
 
 from . import data_dir, netutil
-from .cli import _load_countries
+from .cli import load_countries
 from .health import UPSTREAM_HOST, UPSTREAM_UA, HealthDaemon
 from .lanes import TorManager
 
@@ -40,7 +40,7 @@ def _extract_text(obj: dict) -> str:
 
 
 def run_demo(question: str, lanes: int = 2) -> int:
-    countries, fallback, preferred = _load_countries()
+    countries, fallback, preferred = load_countries()
     manager = TorManager(DATA_DIR, count=lanes,
                          exit_countries=countries,
                          fallback_countries=fallback,

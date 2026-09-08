@@ -57,12 +57,13 @@ out. The moment a lane comes back throttled:
 2. the throttled lane is taken out back and re-cooked from scratch: fresh
    tor process, fresh keys, fresh guards, fresh exit IP. We don't negotiate
    with rate limits;
-3. if the same lane keeps getting burned, it gets a new country too
-   (`us → de → nl → fr → ro → …`). A new personality, basically.
+3. if the same lane keeps getting burned, it gets a new country too. A new
+   personality, basically.
 
-Lanes that just fall over get poked, restarted, re-cooked, and — if they're
-truly hopeless — benched with a note in the proof window. You'll see the whole
-drama live, which is honestly half the fun.
+No cooldowns, no waiting: the moment a lane looks limited, it's dropped and
+a fresh one takes its place. Lanes that just fall over get poked, restarted,
+re-cooked, and — if they're truly hopeless — benched with a note in the proof
+window. You'll see the whole drama live, which is honestly half the fun.
 
 ### "Wait, how can it see each request? Isn't TLS encrypted?"
 
@@ -80,11 +81,30 @@ per-tunnel proof instead of per-request).
 
 ### Fresh every time
 
-Every launch wipes lane keys, guards, and circuit state — yesterday's exits
-are dead to us. The only thing kept is tor's cached copy of the public relay
-directory, because re-downloading that every launch is how you turn a
+Every launch re-rolls lane keys, guards, and circuit state — yesterday's
+exits are dead to us. The only thing kept is tor's cached copy of the public
+relay directory, because re-downloading that every launch is how you turn a
 five-second boot into a two-minute boot. Orphaned `tor.exe` processes from a
 crashed run are swept up before new lanes take their ports.
+
+### Pick your own countries
+
+By default lanes rotate through a generic pool (us, de, nl, fr, ro, gb, ca,
+se, pl, ch). Want different exits? Drop a `countries.txt` into Lingling's
+data directory (`%LOCALAPPDATA%\lingling` on Windows, `~/.local/share/lingling`
+on Linux, `~/Library/Application Support/lingling` on macOS):
+
+```
+de,fr,nl,se,pl,ch,at,be,dk,fi,no,ie
+es,pt,it,gr,hu,cz,ro
+de,fr,nl
+```
+
+Line 1 is the primary pool lanes boot and rotate through, line 2 is the
+fallback pool used once every primary country has burned, and line 3 is an
+optional preferred pool lanes stick to first. Two-letter country codes,
+comma-separated, one pool per line. Leave a line blank to skip it. No file,
+no problem — the defaults are fine.
 
 ### Flags Lingling keeps for itself
 

@@ -26,9 +26,9 @@ PROOF_LOG = DATA_DIR / "proof.log"
 DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
 
-def _load_countries() -> tuple:
-    """Private override: <data dir>/countries.txt, line 1 primary, line 2
-    fallback, line 3 preferred. Never shipped."""
+def load_countries() -> tuple:
+    """Country override: <data dir>/countries.txt, line 1 primary, line 2
+    fallback, line 3 preferred. Falls back to DEFAULT_COUNTRIES."""
     path = DATA_DIR / "countries.txt"
     if path.exists():
         try:
@@ -36,7 +36,8 @@ def _load_countries() -> tuple:
             # skipped pool can't shift the lines below it.
             raw = path.read_text(encoding="utf-8").splitlines()
             raw += [""] * (3 - len(raw))
-            pools = [[c.strip() for c in raw[i].split(",") if c.strip()]
+            pools = [[c.strip().lower() for c in raw[i].split(",")
+                      if len(c.strip()) == 2 and c.strip().isalpha()]
                      for i in range(3)]
             primary, fallback, preferred = pools
             if primary:
@@ -179,7 +180,7 @@ def main(argv: list[str]) -> int:
 
     try:
         if not direct:
-            countries, fallback, preferred = _load_countries()
+            countries, fallback, preferred = load_countries()
             manager = TorManager(
                 DATA_DIR, count=opts["lanes"],
                 exit_countries=countries,
