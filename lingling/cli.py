@@ -27,15 +27,12 @@ DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
 
 def _load_countries() -> tuple:
-    """Private override: <data dir>/countries.txt with a primary CSV list on
-    line 1, an optional fallback pool on line 2, and an optional preferred
-    pool on line 3 (lanes stick to preferred countries until those countries
-    accumulate too many bad exits). Never shipped."""
+    """Private override: <data dir>/countries.txt, line 1 primary, line 2
+    fallback, line 3 preferred. Never shipped."""
     path = DATA_DIR / "countries.txt"
     if path.exists():
         try:
-            # Physical line positions matter: line 1 primary, line 2
-            # fallback, line 3 preferred. Blank lines stay blank so a
+            # Physical line positions matter: blank lines stay blank so a
             # skipped pool can't shift the lines below it.
             raw = path.read_text(encoding="utf-8").splitlines()
             raw += [""] * (3 - len(raw))
@@ -67,9 +64,7 @@ def _c(text: str, code: str) -> str:
 
 
 class _Loader:
-    """Self-rewriting status line. Shows a kitchen phrase by default; when
-    the boot gate has real news (bootstrap %, escalation), it shows that
-    instead so a user never kills a boot that is merely slow."""
+    """Self-rewriting status line: kitchen phrase, or real boot news when set."""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
@@ -78,7 +73,6 @@ class _Loader:
         self._lock = threading.Lock()
 
     def set(self, detail: str = "") -> None:
-        # Kept for API compatibility; details are intentionally not shown.
         with self._lock:
             self._detail = detail
 
@@ -209,20 +203,12 @@ def main(argv: list[str]) -> int:
                 first = manager.lanes[0]
                 manager.start_lanes([first])
 
-                # Block until lane 1 provably carries traffic, else the user's first prompt dies.
-                # A slow boot is NOT a dead boot: the directory network can
-                # stall for minutes (missing exit microdescriptors) and then
-                # recover on its own. So the gate tracks *progress* -- a
-                # lane that keeps advancing gets all the time it needs (hard
-                # cap 10 min); a lane that stops advancing gets poked:
-                # restart (same guards), then unpin the country (a pinned
-                # exit needs exactly the descriptors that are missing),
-                # then a full re-cook. Only a lane that still cannot carry
-                # traffic after all that fails over to direct.
+                # Gate: wait until lane 1 provably carries traffic. A slow
+                # boot is NOT a dead boot -- track progress, poke on stall.
                 deadline = time.time() + 600
                 last_pct = -1
                 last_pct_at = time.time()
-                poked = set()
+                pokes = 0
                 while time.time() < deadline:
                     verdict = daemon.probe_lane(first)
                     if verdict == "healthy":
@@ -234,17 +220,26 @@ def main(argv: list[str]) -> int:
                         last_pct = pct
                         last_pct_at = time.time()
                         loader.set(f"tor {pct}%")
-                    if (pct == last_pct
-                            and time.time() - last_pct_at > 90
-                            and pct not in poked):
-                        poked.add(pct)
-                        if pct == -1:
+                    # Stuck signatures: 0-10% (never reached the network)
+                    # pokes at 30s; >10% (no path through the pinned country)
+                    # pokes at 90s. Ladder: restart, unpin, re-cook; a second
+                    # unpin is a no-op so >10% re-cooks on poke 2.
+                    stall = time.time() - last_pct_at
+                    limit = 30 if pct <= 10 else 90
+                    if pct == last_pct and stall > limit and pokes < 3:
+                        pokes += 1
+                        if pokes == 1 and pct <= 10:
                             loader.set("tor not responding -- restarting")
                             manager.restart_lane(first)
-                        elif pct < 100:
+                        elif pokes <= 2 and (pct <= 10 or pokes == 1):
                             loader.set(f"tor stuck at {pct}% -- "
                                        "unpinning country")
                             manager.unpin_lane(first)
+                        else:
+                            loader.set("tor stuck -- re-cooking lane")
+                            manager.regenerate_lane(first)
+                        last_pct = -1
+                        last_pct_at = time.time()
                     if verdict == "burned":
                         first.burned_cycles += 1
                         daemon._heal_burn(first)

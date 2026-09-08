@@ -10,10 +10,9 @@ import json
 import time
 
 from . import data_dir, netutil
+from .cli import _load_countries
 from .health import UPSTREAM_HOST, UPSTREAM_UA, HealthDaemon
 from .lanes import TorManager
-
-DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
 MODEL = "muse-spark-1.2-contributor-free"
 DATA_DIR = data_dir()
@@ -41,8 +40,12 @@ def _extract_text(obj: dict) -> str:
 
 
 def run_demo(question: str, lanes: int = 2) -> int:
+    countries, fallback, preferred = _load_countries()
     manager = TorManager(DATA_DIR, count=lanes,
-                         exit_countries=DEFAULT_COUNTRIES, log=lambda *a: None)
+                         exit_countries=countries,
+                         fallback_countries=fallback,
+                         preferred_countries=preferred,
+                         log=lambda *a: None)
 
     _say("== cooking the lanes (first run downloads tor, ~1-2 min) ==")
     err = manager.setup_lanes()

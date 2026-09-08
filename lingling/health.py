@@ -18,21 +18,20 @@ from .lanes import Lane, TorManager
 
 UPSTREAM_HOST = "opencode.ai"
 UPSTREAM_PROBE_PATH = "/zen/v1/models"
-# The free tier instantly 429s requests without this UA; a probe lacking it would call every lane burned.
+# The free tier instantly 429s requests without this UA.
 UPSTREAM_UA = os.environ.get("LINGLING_UPSTREAM_USER_AGENT", "opencode/1.0")
 
 # The startup race: identical tiny prompt for every lane, so timings compare.
 _BENCH_PROMPT = "say ok"
 
 PROBE_TIMEOUT = 15.0
-# Consecutive failed cycles before a dead lane escalates from restart to regenerate.
+# Dead cycles before restart gives way to regenerate.
 _ESCALATE_AFTER = 2
-# Consecutive 429 probes before cheap heals give way to rotating the exit country + regenerating.
+# Burns before the exit country rotates.
 _BURN_ESCALATE_AFTER = 3
-# Min gap between regenerates; Tor bootstrap is 30-90s and re-rolling faster just keeps the lane booting.
-_REGEN_COOLDOWN_S = 1200.0
-# A sidelined lane gets one re-probe after this long; blocks do lift.
-_SIDELINE_RECHECK_S = 3600.0
+# Re-probe sidelined lanes after this long; blocks lift.
+_SIDELINE_RECHECK_S = 60.0
+# Dead cycles before a lane is sidelined.
 _FAST_FAIL_CYCLES = 4
 
 
@@ -173,9 +172,8 @@ class HealthDaemon:
                 continue
 
             verdict = self.probe_lane(lane)
-            # Real-traffic failures outrank the metadata probe: the models
-            # list isn't throttled the way inference is, and a probe can
-            # succeed on an exit that stalls real streams.
+            # Real-traffic failures outrank the metadata probe: a probe
+            # can succeed on an exit that stalls real streams.
             if verdict == "healthy" and lane.healthy is False:
                 if lane.burned_cycles > 0:
                     verdict = "burned"
@@ -186,49 +184,18 @@ class HealthDaemon:
                 lane.healthy = True
                 lane.unhealthy_cycles = 0
                 lane.burned_cycles = 0
-                # stall_cycles is NOT forgiven here: a tiny metadata probe
-                # succeeding proves nothing about real streams. Real request
-                # success (mitm) or a heal below clears the record.
+                # A metadata probe proves nothing about real streams.
                 if was is not True:
                     self._emit_lane(lane, "up",
                                     f"lane {lane.index} {{{lane.exit_country}}} "
                                     f"is cooking -- exit {lane.exit_ip or '?'}")
-                if (lane.exit_ip
-                        and self.tor.is_bad_exit(lane.exit_country,
-                                                 lane.exit_ip)):
-                    bad_ip = lane.exit_ip
-                    if lane.bad_dodges >= 2:
-                        # NEWNYM keeps re-dealing the same exit (small country
-                        # pool) -- if the country is drained, leave it; then
-                        # re-cook from scratch either way.
-                        self.tor.rotate_exit_country(lane)
-                        self._emit_lane(
-                            lane, "heal",
-                            f"lane {lane.index} can't shake bad exit "
-                            f"{bad_ip} -- re-cooking on {{{lane.exit_country}}}")
-                        lane.healthy = False
-                        lane.bad_dodges = 0
-                        lane.healing = True
-                        try:
-                            self.tor.regenerate_lane(lane)
-                        finally:
-                            lane.healing = False
-                    elif self.tor.renew(lane):
-                        lane.bad_dodges += 1
-                        self._emit_lane(
-                            lane, "heal",
-                            f"lane {lane.index} landed on known-bad exit "
-                            f"{bad_ip} -- building a fresh circuit")
-                else:
-                    lane.bad_dodges = 0
                 continue
 
             lane.healthy = False
-            # Warmup grace: first failed probe on a live port means the first circuit is still building.
+            # Warmup grace: first failed probe on a live port is just a slow first circuit.
             if self._warmup and netutil.port_is_open(
                     "127.0.0.1", lane.socks_port, timeout=netutil.PORT_CHECK_TIMEOUT):
                 continue
-
             if verdict == "burned":
                 lane.unhealthy_cycles = 0
                 lane.burned_cycles += 1
@@ -240,19 +207,9 @@ class HealthDaemon:
         self._warmup = False
 
     def _heal_burn(self, lane: Lane) -> None:
-        """429 from upstream: lane is already out of rotation (caller set
-        healthy=False); re-cook from scratch, rotating exit country on repeat burns."""
+        """429 from upstream: re-cook from scratch, rotating country on repeat burns."""
         lane.healing = True
         try:
-            cooldown_left = (_REGEN_COOLDOWN_S
-                             - (time.time() - lane.last_regenerate_at))
-            if lane.last_regenerate_at and cooldown_left > 0:
-                if lane.burned_cycles <= 1:
-                    self._emit_lane(
-                        lane, "burn",
-                        f"lane {lane.index} hit a hidden limit -- parked "
-                        f"while it cools, other lanes have your traffic")
-                return
             self._emit_lane(
                 lane, "burn",
                 f"lane {lane.index} hit a hidden limit -- your traffic moved "
@@ -271,7 +228,6 @@ class HealthDaemon:
                         f"lane {lane.index} keeps burning -- re-cooking on a "
                         f"fresh {{{new_cc}}} exit")
             lane.last_regenerate_at = time.time()
-            lane.burned_cycles = 0
             if self.tor.regenerate_lane(lane):
                 lane.clear_stalls()
         finally:
@@ -300,14 +256,12 @@ class HealthDaemon:
                         f"lane {lane.index} would not restart -- will "
                         f"re-cook it from scratch if it stays down")
                 return
-            cooldown_left = (_REGEN_COOLDOWN_S
-                             - (time.time() - lane.last_regenerate_at))
-            if lane.last_regenerate_at and cooldown_left > 0:
-                return
             lane.last_regenerate_at = time.time()
             self._emit_lane(lane, "heal",
                             f"lane {lane.index} stayed down -- re-cooking "
                             f"from scratch")
+            if lane.exit_country != "*":
+                self.tor.rotate_exit_country(lane)
             if self.tor.regenerate_lane(lane):
                 lane.clear_stalls()
             else:
