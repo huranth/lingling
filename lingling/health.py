@@ -29,11 +29,8 @@ PROBE_TIMEOUT = 15.0
 _ESCALATE_AFTER = 2
 # Consecutive 429 probes before cheap heals give way to rotating the exit country + regenerating.
 _BURN_ESCALATE_AFTER = 3
-# Min gap between regenerates: the bootstrap floor, not a penalty. A burned
-# unpinned lane re-cooks as soon as its fresh tor has had time to come up;
-# the pool-drained override in _heal_burn/_heal_dead waives even this when
-# healthy backups are thin, so lanes never sit idle waiting on a timer.
-_REGEN_COOLDOWN_S = 120.0
+# Min gap between regenerates; Tor bootstrap is 30-90s and re-rolling faster just keeps the lane booting.
+_REGEN_COOLDOWN_S = 1200.0
 # A sidelined lane gets one re-probe after this long; blocks do lift.
 _SIDELINE_RECHECK_S = 3600.0
 _FAST_FAIL_CYCLES = 4
@@ -122,8 +119,8 @@ class HealthDaemon:
                     lane.probe_ms = ms
                     self._emit({
                         "type": "lane", "kind": "bench", "t": time.time(),
-                        "lane": lane.index, "cc": lane.display_cc,
-                        "msg": f"lane {lane.index} {{{lane.display_cc}}} "
+                        "lane": lane.index, "cc": lane.exit_country,
+                        "msg": f"lane {lane.index} {{{lane.exit_country}}} "
                                f"answered in {ms / 1000:.1f}s"})
                 elif code == 429:
                     lane.healthy = False
@@ -152,12 +149,7 @@ class HealthDaemon:
                 return "dead"
         except Exception:  # noqa: BLE001
             return "dead"
-        self._fingerprint(lane)
-        return "healthy"
-
-    def _fingerprint(self, lane: Lane) -> None:
-        """Resolve the lane's current exit IP (for the proof pane) and warm
-        the country-display cache. No-op if the exit site is unreachable."""
+        # Lane is carrying traffic; fingerprint its exit IP for the proof pane.
         try:
             code, body = netutil.https_get_via_socks(
                 lane.socks_port, "check.torproject.org", "/api/ip",
@@ -165,14 +157,10 @@ class HealthDaemon:
             if code == 200:
                 obj = json.loads(body.decode("utf-8", "replace"))
                 if obj.get("IsTor") and obj.get("IP"):
-                    ip = str(obj["IP"])
-                    if ip != lane.exit_ip:
-                        lane.exit_ip = ip
-                        lane.exit_cc = ""
-                        lane.exit_cc_ip = ""
-                    lane.resolve_exit_cc()  # warm the display cache
+                    lane.exit_ip = str(obj["IP"])
         except Exception:  # noqa: BLE001
             pass
+        return "healthy"
 
     def check_once(self) -> None:
         for lane in self.tor.lanes:
@@ -202,13 +190,8 @@ class HealthDaemon:
                 # succeeding proves nothing about real streams. Real request
                 # success (mitm) or a heal below clears the record.
                 if was is not True:
-                    if lane.exit_country == "any":
-                        # Control port can be mid-restart after a heal; one
-                        # synchronous retry so the log shows a real country.
-                        # No-op (cached) when resolution already succeeded.
-                        lane.resolve_exit_cc()
                     self._emit_lane(lane, "up",
-                                    f"lane {lane.index} {{{lane.display_cc}}} "
+                                    f"lane {lane.index} {{{lane.exit_country}}} "
                                     f"is cooking -- exit {lane.exit_ip or '?'}")
                 if (lane.exit_ip
                         and self.tor.is_bad_exit(lane.exit_country,
@@ -222,7 +205,7 @@ class HealthDaemon:
                         self._emit_lane(
                             lane, "heal",
                             f"lane {lane.index} can't shake bad exit "
-                            f"{bad_ip} -- re-cooking on {{{lane.display_cc}}}")
+                            f"{bad_ip} -- re-cooking on {{{lane.exit_country}}}")
                         lane.healthy = False
                         lane.bad_dodges = 0
                         lane.healing = True
@@ -232,12 +215,6 @@ class HealthDaemon:
                             lane.healing = False
                     elif self.tor.renew(lane):
                         lane.bad_dodges += 1
-                        # Re-stamp the exit identity NOW: this lane keeps
-                        # serving while the new circuit builds, and an
-                        # unfingerprinted lane logs {??} or a stale country on
-                        # the next request. The call rides the tunnel, so it
-                        # resolves the NEW circuit's exit.
-                        self._fingerprint(lane)
                         self._emit_lane(
                             lane, "heal",
                             f"lane {lane.index} landed on known-bad exit "
@@ -246,23 +223,12 @@ class HealthDaemon:
                     lane.bad_dodges = 0
                 continue
 
+            lane.healthy = False
             # Warmup grace: first failed probe on a live port means the first circuit is still building.
             if self._warmup and netutil.port_is_open(
                     "127.0.0.1", lane.socks_port, timeout=netutil.PORT_CHECK_TIMEOUT):
                 continue
 
-            # One flaky probe is usually noise -- e.g. lane congested while
-            # racing during the startup benchmark. Don't kill a lane for a
-            # single timeout, and don't flip its healthy flag either: a flip
-            # here makes the next good probe re-emit "up" (a duplicate
-            # 'cooking' line). Lanes with real-traffic evidence (stalls/burns)
-            # skip the gate: their verdict is already worse than a probe timeout.
-            if (verdict == "dead" and lane.unhealthy_cycles == 0
-                    and lane.burned_cycles == 0 and lane.stall_cycles == 0):
-                lane.unhealthy_cycles = 1
-                continue
-
-            lane.healthy = False
             if verdict == "burned":
                 lane.unhealthy_cycles = 0
                 lane.burned_cycles += 1
@@ -273,11 +239,6 @@ class HealthDaemon:
                 self._heal_dead(lane)
         self._warmup = False
 
-    def _pool_drained(self) -> bool:
-        """True when healthy backup lanes are thin enough that a parked lane
-        should re-cook right away instead of waiting out the cooldown."""
-        return len(self.tor.healthy_lanes()) < 2
-
     def _heal_burn(self, lane: Lane) -> None:
         """429 from upstream: lane is already out of rotation (caller set
         healthy=False); re-cook from scratch, rotating exit country on repeat burns."""
@@ -285,8 +246,7 @@ class HealthDaemon:
         try:
             cooldown_left = (_REGEN_COOLDOWN_S
                              - (time.time() - lane.last_regenerate_at))
-            if (lane.last_regenerate_at and cooldown_left > 0
-                    and not self._pool_drained()):
+            if lane.last_regenerate_at and cooldown_left > 0:
                 if lane.burned_cycles <= 1:
                     self._emit_lane(
                         lane, "burn",
@@ -309,7 +269,7 @@ class HealthDaemon:
                     self._emit_lane(
                         lane, "rotate",
                         f"lane {lane.index} keeps burning -- re-cooking on a "
-                        f"fresh unpinned exit")
+                        f"fresh {{{new_cc}}} exit")
             lane.last_regenerate_at = time.time()
             lane.burned_cycles = 0
             if self.tor.regenerate_lane(lane):
@@ -342,8 +302,7 @@ class HealthDaemon:
                 return
             cooldown_left = (_REGEN_COOLDOWN_S
                              - (time.time() - lane.last_regenerate_at))
-            if (lane.last_regenerate_at and cooldown_left > 0
-                    and not self._pool_drained()):
+            if lane.last_regenerate_at and cooldown_left > 0:
                 return
             lane.last_regenerate_at = time.time()
             self._emit_lane(lane, "heal",
@@ -373,6 +332,6 @@ class HealthDaemon:
     def _emit_lane(self, lane: Lane, kind: str, message: str) -> None:
         self._emit({
             "type": "lane", "kind": kind, "t": time.time(),
-            "lane": lane.index, "cc": lane.display_cc,
+            "lane": lane.index, "cc": lane.exit_country,
             "ip": lane.exit_ip, "msg": message,
         })

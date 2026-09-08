@@ -73,9 +73,6 @@ class Lane:
     last_used_at: float = 0.0
     #: Consecutive NEWNYM dodges that failed to shake a known-bad exit.
     bad_dodges: int = 0
-    #: Resolved country of exit_ip ("" = unknown); cleared when the IP changes.
-    exit_cc: str = ""
-    exit_cc_ip: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def cookie_path(self) -> Path:
@@ -83,46 +80,6 @@ class Lane:
 
     def torrc_path(self) -> Path:
         return self.data_dir / "torrc"
-
-    def resolve_exit_cc(self) -> str:
-        """Resolve this lane's current exit IP to a real country via the
-        lane's own Tor control port (bundled GeoIP, offline). Cached until
-        the exit IP changes. Returns "" when unresolvable."""
-        if self.exit_cc and self.exit_cc_ip == self.exit_ip:
-            return self.exit_cc
-        self.exit_cc = ""
-        if not self.exit_ip or not netutil.port_is_open(
-                "127.0.0.1", self.control_port, timeout=0.3):
-            return ""
-        try:
-            from stem.control import Controller
-            import stem.connection
-            with Controller.from_port(port=self.control_port) as controller:
-                stem.connection.authenticate_cookie(
-                    controller, str(self.cookie_path()))
-                cc = controller.get_info(f"ip-to-country/{self.exit_ip}")
-                cc = (cc or "").strip().lower()
-                self.exit_cc_ip = self.exit_ip
-                if cc and cc != "??":
-                    self.exit_cc = cc.upper()
-                else:
-                    # Tor's bundled GeoIP doesn't know this exit (fresh
-                    # allocations, datacenter space): "??" is an honest
-                    # answer and the log should show {??}. Cache it; it
-                    # won't change for this IP.
-                    self.exit_cc = "??"
-                return self.exit_cc
-        except Exception:  # noqa: BLE001
-            pass
-        return ""
-
-    @property
-    def display_cc(self) -> str:
-        """Country shown in the proof log: the real country of the current
-        exit for unpinned 'any' lanes, the configured pool otherwise."""
-        if self.exit_country == "any":
-            return self.resolve_exit_cc() or "??"
-        return self.exit_country
 
     # -- stall memory ----------------------------------------------------------
     # Stalls are counted in a sliding window, not consecutively: a lemon exit
@@ -386,15 +343,13 @@ class TorManager:
             "Log": f"notice file {lane.data_dir / 'tor.log'}",
         }
         # Pin country only with geoip present, else StrictNodes can't build circuits.
-        # exit_country "any" means no pin: Tor picks from the whole network.
         geoip = self._geoip_path()
         if geoip is not None:
             cfg["GeoIPFile"] = str(geoip)
             geo6 = self._geoip6_path()
             if geo6 is not None:
                 cfg["GeoIPv6File"] = str(geo6)
-            if lane.exit_country != "any":
-                cfg["ExitNodes"] = "{" + lane.exit_country + "}"
+            cfg["ExitNodes"] = "{" + lane.exit_country + "}"
         return cfg
 
     def _write_torrc(self, lane: Lane) -> None:
@@ -600,8 +555,6 @@ class TorManager:
             shutil.rmtree(lane.data_dir, ignore_errors=True)
         lane.data_dir.mkdir(parents=True, exist_ok=True)
         lane.exit_ip = ""
-        lane.exit_cc = ""
-        lane.exit_cc_ip = ""
         lane.last_circuit_built_ts = 0.0
         lane.bad_dodges = 0
         lane.boot_ok = False
@@ -638,8 +591,6 @@ class TorManager:
                 controller.signal(Signal.NEWNYM)
                 lane.last_circuit_built_ts = time.time()
                 lane.exit_ip = ""  # refilled by the next health probe
-                lane.exit_cc = ""
-                lane.exit_cc_ip = ""
                 return True
         except Exception:  # noqa: BLE001
             return False
@@ -720,13 +671,10 @@ class TorManager:
 
     def rotate_exit_country(self, lane: Lane) -> Optional[str]:
         """Move a lane to another exit country (burns throttle the whole
-        country persona, not one IP). "any" lanes stay unpinned and re-cook
-        onto a fresh exit from the whole network. Preferred countries are
-        sticky: the lane re-cooks on the SAME country for a fresh exit unless
-        that country has exhausted its pool of good exits. Then the quiet
-        pool, then the crowded fallback pool. Returns the new country."""
-        if lane.exit_country == "any":
-            return "any"
+        country persona, not one IP). Preferred countries are sticky: the
+        lane re-cooks on the SAME country for a fresh exit unless that
+        country has exhausted its pool of good exits. Then the quiet pool,
+        then the crowded fallback pool. Returns the new country."""
         if (lane.exit_country in self._preferred
                 and not self._country_exhausted(lane.exit_country)):
             return lane.exit_country

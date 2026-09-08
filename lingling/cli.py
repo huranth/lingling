@@ -18,12 +18,10 @@ from pathlib import Path
 from . import __version__, data_dir, proof
 from .health import HealthDaemon
 from .lanes import TorManager
-from .netutil import pid_alive, port_is_open
 from .relay import Relay
 
 DATA_DIR = data_dir()
 PROOF_LOG = DATA_DIR / "proof.log"
-LOCK_FILE = DATA_DIR / "lingling.lock"
 
 DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
@@ -144,49 +142,6 @@ def _parse_args(argv: list[str]) -> dict:
     return opts
 
 
-def _singleton() -> bool:
-    """Own a single-instance lock file in the data dir. Returns True on
-    success; False if another lingling is managing the same lanes. Stale
-    locks (dead PID) are reclaimed. `--proof` tailing is exempt (it never
-    boots lanes) and handles only reads, so it doesn't take the lock."""
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if LOCK_FILE.exists():
-            try:
-                other = int(LOCK_FILE.read_text(encoding="utf-8").strip())
-            except ValueError:
-                other = 0
-            if other and other != os.getpid() and pid_alive(other):
-                print(_c(
-                    f"lingling: another instance is already running (PID "
-                    f"{other}) and owns the lanes.\n"
-                    f"  To use lingling here, close the other one first "
-                    f"(Ctrl+C it, or `taskkill /PID {other} /T`).",
-                    "31"))
-                return False
-            # Stale lock from a dead instance (crash, force-kill): reclaim.
-            LOCK_FILE.unlink(missing_ok=True)
-        LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
-    except OSError as exc:
-        print(_c(f"lingling: could not write the lane lock: {exc}", "33"))
-        return False
-    import atexit
-    atexit.register(_drop_lock)
-    return True
-
-
-def _drop_lock() -> None:
-    """Remove the lock file only if it still names our PID (a newer
-    instance may have reclaimed it after a crash)."""
-    try:
-        if LOCK_FILE.exists():
-            cur = LOCK_FILE.read_text(encoding="utf-8").strip()
-            if cur == str(os.getpid()):
-                LOCK_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
 def main(argv: list[str]) -> int:
     opts = _parse_args(argv)
 
@@ -204,23 +159,6 @@ def main(argv: list[str]) -> int:
     if "--version" in opts["passthrough"] or "-v" in opts["passthrough"]:
         print(f"lingling {__version__} (wraps opencode)")
         return 0
-
-    # The real run owns the lanes; a second instance must not boot another
-    # health daemon over the same tor.exe set. The PID lock only catches
-    # NEW (2.1.3+) instances -- an older, lock-less build leaves the base
-    # lane ports bound instead. Detect that too, so we never spiral into
-    # two parallel lane sets racing the same upstream.
-    if not opts["no_tor"] and not _singleton():
-        return 1
-    if not opts["no_tor"] and any(
-            port_is_open("127.0.0.1", port) for port in (52001, 52002)):
-        print(_c(
-            "lingling: lane ports 52001/52002 are already bound -- an "
-            "older lingling is probably running and owns the lanes.\n"
-            "  Close it first (Ctrl+C it, or `taskkill /IM lingling.exe "
-            "/T`) and re-run.",
-            "31"))
-        return 1
 
     opencode = shutil.which("opencode")
     if opencode is None:

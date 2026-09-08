@@ -224,7 +224,7 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
             t0 = time.time()
             emit({
                 "type": "call", "t": t0, "n": seq, "c": call_n,
-                "lane": lane.index, "cc": lane.display_cc,
+                "lane": lane.index, "cc": lane.exit_country,
                 "ip": lane.exit_ip,
                 "method": method, "path": path, "model": model, "host": host,
             })
@@ -274,7 +274,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         sock.close()
         err = f"{type(exc).__name__}"
         emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
-              "lane": lane.index, "cc": lane.display_cc, "status": 0,
+              "lane": lane.index, "cc": lane.exit_country, "status": 0,
               "kb": 0, "secs": round(time.time() - t0, 1), "err": err})
         return err, 0, b"", True
 
@@ -309,7 +309,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         if rhead is None:
             err = "upstream closed"
             emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
-                  "lane": lane.index, "cc": lane.display_cc, "status": 0,
+                  "lane": lane.index, "cc": lane.exit_country, "status": 0,
                   "kb": 0, "secs": round(time.time() - t0, 1), "err": err})
             return err, 0, b"", True
         status = 0
@@ -365,7 +365,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                 _send(chunk)
 
         emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
-              "lane": lane.index, "cc": lane.display_cc, "status": status,
+              "lane": lane.index, "cc": lane.exit_country, "status": status,
               "kb": round(total / 1024, 1),
               "secs": round(time.time() - t0, 1), "err": ""})
         return "", status, bytes(held or b""), False
@@ -373,7 +373,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         err = f"{type(exc).__name__}"
         retryable = held is not None or total == 0
         emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
-              "lane": lane.index, "cc": lane.display_cc, "status": 0,
+              "lane": lane.index, "cc": lane.exit_country, "status": 0,
               "kb": round(total / 1024, 1),
               "secs": round(time.time() - t0, 1), "err": err})
         return err, 0, b"", retryable
