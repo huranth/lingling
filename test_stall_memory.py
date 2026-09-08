@@ -87,6 +87,68 @@ assert regened == [1], "stubborn bad exit did not escalate to re-cook"
 assert lane.healthy is False, "re-cooking lane stayed in rotation"
 print("ok: stubborn bad exit escalates to a full re-cook")
 
+# --- 6b. a single flaky probe must NOT flip a lane's healthy flag ------------
+# (that flip would make the next good probe re-emit a duplicate "cooking" line)
+tor3 = TorManager.__new__(TorManager)  # skip filesystem setup
+tor3.lanes = [make_lane(10, cc="any", ip="10.0.0.10")]
+tor3._bad_exits = {}
+tor3._preferred = []
+tor3._quiet = []
+tor3._fallback = []
+l30 = tor3.lanes[0]
+l30.healthy = True
+l30.unhealthy_cycles = 0
+
+daemon3 = HealthDaemon.__new__(HealthDaemon)
+daemon3.tor = tor3
+emitted = []
+daemon3._emit = emitted.append
+daemon3._stop = threading.Event()
+daemon3._warmup = False
+daemon3.probe_lane = lambda l: "dead"  # one transient timeout
+
+daemon3.check_once()
+assert l30.healthy is True, "a single flaky probe flipped the lane healthy flag"
+assert l30.unhealthy_cycles == 1, "flaky probe did not tick the unhealthy counter"
+print("ok: single flaky probe does not flip healthy flag")
+
+# next good probe: no duplicate "cooking" line, stays healthy
+daemon3.probe_lane = lambda l: "healthy"
+daemon3.check_once()
+assert l30.healthy is True
+assert not any(e.get("kind") == "up" for e in emitted), \
+    "healthy probe after a flaky one re-emitted a duplicate 'cooking' line"
+print("ok: no duplicate 'cooking' line after a flaky probe")
+
+# --- 6c. a NEWNYM renew re-fingerprints the exit immediately -----------------
+# exit_ip stays the known-bad IP (fingerprint would have set it); the dodge
+# must fire and then re-stamp the lane rather than leaving it stale.
+# Fresh daemon + lane: the shared top-level daemon is stateful after 6.
+lane6c = make_lane(20, cc="gb", ip="1.2.3.4")
+tor6c = TorManager.__new__(TorManager)
+tor6c.lanes = [lane6c]
+tor6c._bad_exits = {("gb", "1.2.3.4"): [time.time(), 1]}
+tor6c._preferred = []
+tor6c._quiet = ["cz"]
+tor6c._fallback = []
+lane6c.healthy = True
+lane6c.bad_dodges = 0
+
+daemon6c = HealthDaemon.__new__(HealthDaemon)
+daemon6c.tor = tor6c
+daemon6c._emit = lambda e: None
+daemon6c._warmup = False
+daemon6c._stop = threading.Event()
+daemon6c.probe_lane = lambda l: "healthy"
+fingerprinted = []
+tor6c.renew = lambda l: (fingerprinted.append("renew") or True)
+tor6c.is_bad_exit = TorManager.is_bad_exit.__get__(tor6c)
+daemon6c._fingerprint = lambda lane: fingerprinted.append("fingerprint")
+daemon6c.check_once()
+assert fingerprinted == ["renew", "fingerprint"], \
+    f"renew did not re-fingerprint immediately: {fingerprinted}"
+print("ok: NEWNYM renew re-fingerprints the lane right after")
+
 print("ALL PASS")
 
 # --- 7. preferred country is sticky until exhausted -------------------------

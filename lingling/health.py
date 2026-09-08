@@ -149,7 +149,12 @@ class HealthDaemon:
                 return "dead"
         except Exception:  # noqa: BLE001
             return "dead"
-        # Lane is carrying traffic; fingerprint its exit IP for the proof pane.
+        self._fingerprint(lane)
+        return "healthy"
+
+    def _fingerprint(self, lane: Lane) -> None:
+        """Resolve the lane's current exit IP (for the proof pane) and warm
+        the country-display cache. No-op if the exit site is unreachable."""
         try:
             code, body = netutil.https_get_via_socks(
                 lane.socks_port, "check.torproject.org", "/api/ip",
@@ -165,7 +170,6 @@ class HealthDaemon:
                     lane.resolve_exit_cc()  # warm the display cache
         except Exception:  # noqa: BLE001
             pass
-        return "healthy"
 
     def check_once(self) -> None:
         for lane in self.tor.lanes:
@@ -224,6 +228,12 @@ class HealthDaemon:
                             lane.healing = False
                     elif self.tor.renew(lane):
                         lane.bad_dodges += 1
+                        # Re-stamp the exit identity NOW: this lane keeps
+                        # serving while the new circuit builds, and an
+                        # unfingerprinted lane prints a stale {any} on the
+                        # next request. The call rides the tunnel, so it
+                        # resolves the NEW circuit's exit.
+                        self._fingerprint(lane)
                         self._emit_lane(
                             lane, "heal",
                             f"lane {lane.index} landed on known-bad exit "
@@ -232,7 +242,6 @@ class HealthDaemon:
                     lane.bad_dodges = 0
                 continue
 
-            lane.healthy = False
             # Warmup grace: first failed probe on a live port means the first circuit is still building.
             if self._warmup and netutil.port_is_open(
                     "127.0.0.1", lane.socks_port, timeout=netutil.PORT_CHECK_TIMEOUT):
@@ -240,14 +249,16 @@ class HealthDaemon:
 
             # One flaky probe is usually noise -- e.g. lane congested while
             # racing during the startup benchmark. Don't kill a lane for a
-            # single timeout; wait for back-to-back failures. Lanes with
-            # real-traffic evidence (stalls/burns) skip the gate: their
-            # verdict is already worse than a probe timeout.
+            # single timeout, and don't flip its healthy flag either: a flip
+            # here makes the next good probe re-emit "up" (a duplicate
+            # 'cooking' line). Lanes with real-traffic evidence (stalls/burns)
+            # skip the gate: their verdict is already worse than a probe timeout.
             if (verdict == "dead" and lane.unhealthy_cycles == 0
                     and lane.burned_cycles == 0 and lane.stall_cycles == 0):
                 lane.unhealthy_cycles = 1
                 continue
 
+            lane.healthy = False
             if verdict == "burned":
                 lane.unhealthy_cycles = 0
                 lane.burned_cycles += 1
