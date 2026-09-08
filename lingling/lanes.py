@@ -108,8 +108,8 @@ class Lane:
                 else:
                     # Tor's bundled GeoIP doesn't know this exit (fresh
                     # allocations, datacenter space): "??" is an honest
-                    # answer and the log should show {??}, not the pool
-                    # label {any}. Cache it; it won't change for this IP.
+                    # answer and the log should show {??}. Cache it; it
+                    # won't change for this IP.
                     self.exit_cc = "??"
                 return self.exit_cc
         except Exception:  # noqa: BLE001
@@ -121,7 +121,7 @@ class Lane:
         """Country shown in the proof log: the real country of the current
         exit for unpinned 'any' lanes, the configured pool otherwise."""
         if self.exit_country == "any":
-            return self.resolve_exit_cc() or "any"
+            return self.resolve_exit_cc() or "??"
         return self.exit_country
 
     # -- stall memory ----------------------------------------------------------

@@ -29,8 +29,11 @@ PROBE_TIMEOUT = 15.0
 _ESCALATE_AFTER = 2
 # Consecutive 429 probes before cheap heals give way to rotating the exit country + regenerating.
 _BURN_ESCALATE_AFTER = 3
-# Min gap between regenerates; Tor bootstrap is 30-90s and re-rolling faster just keeps the lane booting.
-_REGEN_COOLDOWN_S = 1200.0
+# Min gap between regenerates: the bootstrap floor, not a penalty. A burned
+# unpinned lane re-cooks as soon as its fresh tor has had time to come up;
+# the pool-drained override in _heal_burn/_heal_dead waives even this when
+# healthy backups are thin, so lanes never sit idle waiting on a timer.
+_REGEN_COOLDOWN_S = 120.0
 # A sidelined lane gets one re-probe after this long; blocks do lift.
 _SIDELINE_RECHECK_S = 3600.0
 _FAST_FAIL_CYCLES = 4
@@ -199,9 +202,10 @@ class HealthDaemon:
                 # succeeding proves nothing about real streams. Real request
                 # success (mitm) or a heal below clears the record.
                 if was is not True:
-                    if lane.exit_country == "any" and not lane.display_cc:
-                        # Resolution just failed (control port mid-restart);
-                        # one synchronous retry before labeling this lane up.
+                    if lane.exit_country == "any":
+                        # Control port can be mid-restart after a heal; one
+                        # synchronous retry so the log shows a real country.
+                        # No-op (cached) when resolution already succeeded.
                         lane.resolve_exit_cc()
                     self._emit_lane(lane, "up",
                                     f"lane {lane.index} {{{lane.display_cc}}} "
@@ -230,8 +234,8 @@ class HealthDaemon:
                         lane.bad_dodges += 1
                         # Re-stamp the exit identity NOW: this lane keeps
                         # serving while the new circuit builds, and an
-                        # unfingerprinted lane prints a stale {any} on the
-                        # next request. The call rides the tunnel, so it
+                        # unfingerprinted lane logs {??} or a stale country on
+                        # the next request. The call rides the tunnel, so it
                         # resolves the NEW circuit's exit.
                         self._fingerprint(lane)
                         self._emit_lane(
@@ -269,6 +273,11 @@ class HealthDaemon:
                 self._heal_dead(lane)
         self._warmup = False
 
+    def _pool_drained(self) -> bool:
+        """True when healthy backup lanes are thin enough that a parked lane
+        should re-cook right away instead of waiting out the cooldown."""
+        return len(self.tor.healthy_lanes()) < 2
+
     def _heal_burn(self, lane: Lane) -> None:
         """429 from upstream: lane is already out of rotation (caller set
         healthy=False); re-cook from scratch, rotating exit country on repeat burns."""
@@ -276,7 +285,8 @@ class HealthDaemon:
         try:
             cooldown_left = (_REGEN_COOLDOWN_S
                              - (time.time() - lane.last_regenerate_at))
-            if lane.last_regenerate_at and cooldown_left > 0:
+            if (lane.last_regenerate_at and cooldown_left > 0
+                    and not self._pool_drained()):
                 if lane.burned_cycles <= 1:
                     self._emit_lane(
                         lane, "burn",
@@ -299,7 +309,7 @@ class HealthDaemon:
                     self._emit_lane(
                         lane, "rotate",
                         f"lane {lane.index} keeps burning -- re-cooking on a "
-                        f"fresh {{{new_cc}}} exit")
+                        f"fresh unpinned exit")
             lane.last_regenerate_at = time.time()
             lane.burned_cycles = 0
             if self.tor.regenerate_lane(lane):
@@ -332,7 +342,8 @@ class HealthDaemon:
                 return
             cooldown_left = (_REGEN_COOLDOWN_S
                              - (time.time() - lane.last_regenerate_at))
-            if lane.last_regenerate_at and cooldown_left > 0:
+            if (lane.last_regenerate_at and cooldown_left > 0
+                    and not self._pool_drained()):
                 return
             lane.last_regenerate_at = time.time()
             self._emit_lane(lane, "heal",

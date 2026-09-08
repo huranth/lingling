@@ -149,6 +149,73 @@ assert fingerprinted == ["renew", "fingerprint"], \
     f"renew did not re-fingerprint immediately: {fingerprinted}"
 print("ok: NEWNYM renew re-fingerprints the lane right after")
 
+# --- 6d. pool drained: a burned lane re-cooks despite a fresh cooldown -------
+# ...and the rotate line for an unpinned lane says "fresh unpinned exit",
+# never the {any} pool label.
+laneD = make_lane(30, cc="any", ip="10.0.0.30")
+torD = TorManager.__new__(TorManager)
+torD.lanes = [laneD]
+torD._bad_exits = {}
+torD._preferred = []
+torD._quiet = []
+torD._fallback = []
+laneD.healthy = True
+laneD.burned_cycles = 3  # repeat burner: rotate + re-cook
+laneD.last_regenerate_at = time.time()  # just re-cooked, inside the cooldown
+regened = []
+torD.regenerate_lane = lambda l: (regened.append(l.index) or True)
+emitted = []
+daemonD = HealthDaemon.__new__(HealthDaemon)
+daemonD.tor = torD
+daemonD._emit = emitted.append
+daemonD._warmup = False
+daemonD._stop = threading.Event()
+daemonD.probe_lane = lambda l: "burned"
+daemonD.check_once()
+assert regened == [30], \
+    f"pool-drained lane did not re-cook immediately: {regened}"
+assert not any("{any}" in e.get("msg", "")
+               for e in emitted if e.get("kind") == "rotate"), \
+    "rotate line still shows the {any} pool label"
+print("ok: pool-drained lane re-cooks immediately; rotate line says 'fresh unpinned exit'")
+
+# --- 6e. pool healthy: a burned lane parks during the cooldown ---------------
+laneE = make_lane(40, cc="any", ip="10.0.0.40")
+laneE2 = make_lane(41, cc="any", ip="10.0.0.41")
+laneE3 = make_lane(42, cc="any", ip="10.0.0.42")
+torE = TorManager.__new__(TorManager)
+torE.lanes = [laneE, laneE2, laneE3]
+torE._bad_exits = {}
+torE._preferred = []
+torE._quiet = []
+torE._fallback = []
+for l in torE.lanes:
+    l.healthy = True
+laneE.last_regenerate_at = time.time()  # deep inside the cooldown
+regenedE = []
+torE.regenerate_lane = lambda l: (regenedE.append(l.index) or True)
+daemonE = HealthDaemon.__new__(HealthDaemon)
+daemonE.tor = torE
+daemonE._emit = lambda e: None
+daemonE._warmup = False
+daemonE._stop = threading.Event()
+daemonE.probe_lane = lambda l: ("burned" if l.index == 40 else "healthy")
+daemonE.check_once()
+assert regenedE == [], \
+    f"burned lane re-cooked during cooldown with healthy backups: {regenedE}"
+assert laneE.healthy is False, "burned lane stayed in rotation"
+print("ok: burned lane parks during cooldown when backups exist")
+
+# --- 6f. unpinned lane shows ?? not {any} when the country is unresolvable ---
+laneF = make_lane(50, cc="any", ip="10.0.0.50")
+assert laneF.display_cc == "??", \
+    f"unresolved any-lane should show ?? not {laneF.display_cc}"
+laneF.exit_cc = "DE"
+laneF.exit_cc_ip = "10.0.0.50"  # cached country for the current exit IP
+assert laneF.display_cc == "DE", \
+    f"resolved any-lane should show its real country: {laneF.display_cc}"
+print("ok: unpinned lane shows ?? until resolved, then the real country")
+
 print("ALL PASS")
 
 # --- 7. preferred country is sticky until exhausted -------------------------
