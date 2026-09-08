@@ -119,8 +119,8 @@ class HealthDaemon:
                     lane.probe_ms = ms
                     self._emit({
                         "type": "lane", "kind": "bench", "t": time.time(),
-                        "lane": lane.index, "cc": lane.exit_country,
-                        "msg": f"lane {lane.index} {{{lane.exit_country}}} "
+                        "lane": lane.index, "cc": lane.display_cc,
+                        "msg": f"lane {lane.index} {{{lane.display_cc}}} "
                                f"answered in {ms / 1000:.1f}s"})
                 elif code == 429:
                     lane.healthy = False
@@ -157,7 +157,12 @@ class HealthDaemon:
             if code == 200:
                 obj = json.loads(body.decode("utf-8", "replace"))
                 if obj.get("IsTor") and obj.get("IP"):
-                    lane.exit_ip = str(obj["IP"])
+                    ip = str(obj["IP"])
+                    if ip != lane.exit_ip:
+                        lane.exit_ip = ip
+                        lane.exit_cc = ""
+                        lane.exit_cc_ip = ""
+                    lane.resolve_exit_cc()  # warm the display cache
         except Exception:  # noqa: BLE001
             pass
         return "healthy"
@@ -191,7 +196,7 @@ class HealthDaemon:
                 # success (mitm) or a heal below clears the record.
                 if was is not True:
                     self._emit_lane(lane, "up",
-                                    f"lane {lane.index} {{{lane.exit_country}}} "
+                                    f"lane {lane.index} {{{lane.display_cc}}} "
                                     f"is cooking -- exit {lane.exit_ip or '?'}")
                 if (lane.exit_ip
                         and self.tor.is_bad_exit(lane.exit_country,
@@ -205,7 +210,7 @@ class HealthDaemon:
                         self._emit_lane(
                             lane, "heal",
                             f"lane {lane.index} can't shake bad exit "
-                            f"{bad_ip} -- re-cooking on {{{lane.exit_country}}}")
+                            f"{bad_ip} -- re-cooking on {{{lane.display_cc}}}")
                         lane.healthy = False
                         lane.bad_dodges = 0
                         lane.healing = True
@@ -332,6 +337,6 @@ class HealthDaemon:
     def _emit_lane(self, lane: Lane, kind: str, message: str) -> None:
         self._emit({
             "type": "lane", "kind": kind, "t": time.time(),
-            "lane": lane.index, "cc": lane.exit_country,
+            "lane": lane.index, "cc": lane.display_cc,
             "ip": lane.exit_ip, "msg": message,
         })

@@ -157,7 +157,7 @@ class Relay:
         self.tor.mark_bad_exit(lane)
         self._emit({
             "type": "lane", "kind": "burn", "t": time.time(),
-            "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
+            "lane": lane.index, "cc": lane.display_cc, "ip": lane.exit_ip,
             "msg": f"lane {lane.index} hit a hidden limit -- traffic moved, "
                    f"re-cooking it fresh",
         })
@@ -176,7 +176,7 @@ class Relay:
         why = "dead exit gave nothing" if hard else "kept stalling"
         self._emit({
             "type": "lane", "kind": "heal", "t": time.time(),
-            "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
+            "lane": lane.index, "cc": lane.display_cc, "ip": lane.exit_ip,
             "msg": f"lane {lane.index} {why} -- pulled from "
                    f"rotation, re-cooking it",
         })
@@ -249,7 +249,7 @@ class Relay:
                     err_note = str(exc)
                     self._emit({
                         "type": "lane", "kind": "fail", "t": time.time(),
-                        "lane": lane.index, "cc": lane.exit_country,
+                        "lane": lane.index, "cc": lane.display_cc,
                         "ip": lane.exit_ip,
                         "msg": f"lane {lane.index} couldn't reach {host} "
                                f"({err_note}) -- switching lanes",
@@ -288,7 +288,7 @@ class Relay:
             lane.active += 1
         self._emit({
             "type": "req", "t": time.time(), "n": seq, "lane": lane.index,
-            "cc": lane.exit_country, "ip": lane.exit_ip,
+            "cc": lane.display_cc, "ip": lane.exit_ip,
             "target": f"{host}:{port}", "ok": True, "note": "",
         })
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -389,7 +389,7 @@ class Relay:
                 last = total
                 self._emit({
                     "type": "flow", "t": time.time(), "n": seq,
-                    "lane": lane.index, "cc": lane.exit_country,
+                    "lane": lane.index, "cc": lane.display_cc,
                     "kb": round(total / 1024, 1),
                 })
 
@@ -404,7 +404,7 @@ class Relay:
             beat.cancel()
             self._emit({
                 "type": "reqend", "t": time.time(), "n": seq,
-                "lane": lane.index, "cc": lane.exit_country,
+                "lane": lane.index, "cc": lane.display_cc,
                 "kb": round((stats["up"] + stats["down"]) / 1024, 1),
                 "secs": round(time.time() - started, 1),
             })
