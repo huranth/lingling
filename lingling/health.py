@@ -195,6 +195,10 @@ class HealthDaemon:
                 # succeeding proves nothing about real streams. Real request
                 # success (mitm) or a heal below clears the record.
                 if was is not True:
+                    if lane.exit_country == "any" and not lane.display_cc:
+                        # Resolution just failed (control port mid-restart);
+                        # one synchronous retry before labeling this lane up.
+                        lane.resolve_exit_cc()
                     self._emit_lane(lane, "up",
                                     f"lane {lane.index} {{{lane.display_cc}}} "
                                     f"is cooking -- exit {lane.exit_ip or '?'}")
@@ -232,6 +236,16 @@ class HealthDaemon:
             # Warmup grace: first failed probe on a live port means the first circuit is still building.
             if self._warmup and netutil.port_is_open(
                     "127.0.0.1", lane.socks_port, timeout=netutil.PORT_CHECK_TIMEOUT):
+                continue
+
+            # One flaky probe is usually noise -- e.g. lane congested while
+            # racing during the startup benchmark. Don't kill a lane for a
+            # single timeout; wait for back-to-back failures. Lanes with
+            # real-traffic evidence (stalls/burns) skip the gate: their
+            # verdict is already worse than a probe timeout.
+            if (verdict == "dead" and lane.unhealthy_cycles == 0
+                    and lane.burned_cycles == 0 and lane.stall_cycles == 0):
+                lane.unhealthy_cycles = 1
                 continue
 
             if verdict == "burned":

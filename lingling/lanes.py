@@ -102,10 +102,16 @@ class Lane:
                     controller, str(self.cookie_path()))
                 cc = controller.get_info(f"ip-to-country/{self.exit_ip}")
                 cc = (cc or "").strip().lower()
+                self.exit_cc_ip = self.exit_ip
                 if cc and cc != "??":
                     self.exit_cc = cc.upper()
-                    self.exit_cc_ip = self.exit_ip
-                    return self.exit_cc
+                else:
+                    # Tor's bundled GeoIP doesn't know this exit (fresh
+                    # allocations, datacenter space): "??" is an honest
+                    # answer and the log should show {??}, not the pool
+                    # label {any}. Cache it; it won't change for this IP.
+                    self.exit_cc = "??"
+                return self.exit_cc
         except Exception:  # noqa: BLE001
             pass
         return ""
