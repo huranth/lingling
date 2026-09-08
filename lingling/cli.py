@@ -67,15 +67,20 @@ def _c(text: str, code: str) -> str:
 
 
 class _Loader:
-    """Self-rewriting status line; deliberately vibe-only, no lane counts or progress bar."""
+    """Self-rewriting status line. Shows a kitchen phrase by default; when
+    the boot gate has real news (bootstrap %, escalation), it shows that
+    instead so a user never kills a boot that is merely slow."""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._detail: str = ""
+        self._lock = threading.Lock()
 
     def set(self, detail: str = "") -> None:
         # Kept for API compatibility; details are intentionally not shown.
-        pass
+        with self._lock:
+            self._detail = detail
 
     def start(self) -> None:
         if not sys.stdout.isatty():
@@ -88,8 +93,13 @@ class _Loader:
         while not self._stop.is_set():
             t = next(tick)
             spin = _c(_SPIN[t % len(_SPIN)], "1;38;5;220")
-            idx = (t // 24) % len(_KITCHEN_LINES)
-            msg = _c(_KITCHEN_LINES[idx], _PHRASE_COLORS[idx])
+            with self._lock:
+                detail = self._detail
+            if detail:
+                msg = _c(detail, "38;5;114")
+            else:
+                idx = (t // 24) % len(_KITCHEN_LINES)
+                msg = _c(_KITCHEN_LINES[idx], _PHRASE_COLORS[idx])
             sys.stdout.write(f"\r\x1b[K {spin} {msg}")
             sys.stdout.flush()
             time.sleep(0.09)
@@ -200,13 +210,41 @@ def main(argv: list[str]) -> int:
                 manager.start_lanes([first])
 
                 # Block until lane 1 provably carries traffic, else the user's first prompt dies.
-                deadline = time.time() + 150
+                # A slow boot is NOT a dead boot: the directory network can
+                # stall for minutes (missing exit microdescriptors) and then
+                # recover on its own. So the gate tracks *progress* -- a
+                # lane that keeps advancing gets all the time it needs (hard
+                # cap 10 min); a lane that stops advancing gets poked:
+                # restart (same guards), then unpin the country (a pinned
+                # exit needs exactly the descriptors that are missing),
+                # then a full re-cook. Only a lane that still cannot carry
+                # traffic after all that fails over to direct.
+                deadline = time.time() + 600
+                last_pct = -1
+                last_pct_at = time.time()
+                poked = set()
                 while time.time() < deadline:
                     verdict = daemon.probe_lane(first)
                     if verdict == "healthy":
                         first.healthy = True
                         first.unhealthy_cycles = 0
                         break
+                    pct = manager.lane_bootstrap_pct(first)
+                    if pct > last_pct:
+                        last_pct = pct
+                        last_pct_at = time.time()
+                        loader.set(f"tor {pct}%")
+                    if (pct == last_pct
+                            and time.time() - last_pct_at > 90
+                            and pct not in poked):
+                        poked.add(pct)
+                        if pct == -1:
+                            loader.set("tor not responding -- restarting")
+                            manager.restart_lane(first)
+                        elif pct < 100:
+                            loader.set(f"tor stuck at {pct}% -- "
+                                       "unpinning country")
+                            manager.unpin_lane(first)
                     if verdict == "burned":
                         first.burned_cycles += 1
                         daemon._heal_burn(first)
@@ -216,7 +254,8 @@ def main(argv: list[str]) -> int:
                                    "going direct", "31"))
                     direct = True
                     manager.stop_all()
-                daemon.start()
+                else:
+                    daemon.start()
 
         if direct:
             loader.stop()

@@ -164,11 +164,14 @@ class TorManager:
         self._load_existing()
 
     def _fresh_lanes_dir(self) -> None:
-        """Fresh identity each launch (wipe keys/state/cookie) but keep tor's
-        ``cached-*`` consensus files -- wiping them forces a multi-minute
-        bootstrap. Also kill orphaned tor.exe left by kill -9 (the Job Object
-        only covers clean exits) and remove stale lock files."""
-        identity_files = ("lock", "state", "control_auth_cookie", "torrc")
+        """Reuse each lane's guard identity and consensus cache across
+        launches. Wiping ``state``/``keys`` re-rolls the guard lottery on a
+        degraded directory network, which freezes tor at 50% for minutes;
+        keeping them turns a cold 150s boot into a ~5s hop. Only volatile
+        files (lock, auth cookie, torrc) are cleared, and orphaned tor.exe
+        from a previous hard kill are reaped. ``regenerate_lane`` still
+        wipes fully for genuinely burned lanes."""
+        identity_files = ("lock", "control_auth_cookie", "torrc")
         if self.lanes_dir.exists():
             for torrc in self.lanes_dir.glob("tor-*/torrc"):
                 for line in torrc.read_text().splitlines():
@@ -189,7 +192,6 @@ class TorManager:
                         (lane_dir / name).unlink(missing_ok=True)
                     except OSError:
                         pass
-                shutil.rmtree(lane_dir / "keys", ignore_errors=True)
         self.lanes_dir.mkdir(parents=True, exist_ok=True)
 
     # -- setup --------------------------------------------------------------
@@ -349,7 +351,10 @@ class TorManager:
             geo6 = self._geoip6_path()
             if geo6 is not None:
                 cfg["GeoIPv6File"] = str(geo6)
-            cfg["ExitNodes"] = "{" + lane.exit_country + "}"
+            if lane.exit_country == "*":
+                cfg["ExitNodes"] = "*"  # unpinned: any exit
+            else:
+                cfg["ExitNodes"] = "{" + lane.exit_country + "}"
         return cfg
 
     def _write_torrc(self, lane: Lane) -> None:
@@ -455,7 +460,11 @@ class TorManager:
     def _launch_tor_process(self, stem: Any, lane: Lane,
                             config: Dict[str, str], msg_handler) -> Any:
         """stem's timeout uses SIGALRM (POSIX only), so we race its launcher
-        thread against ``boot_timeout`` ourselves."""
+        thread against ``boot_timeout`` ourselves. stem returns as soon as
+        tor prints its first bootstrap line (completion_percent=0): a tor
+        that bootstraps slowly must NOT be killed here -- the boot gate
+        tracks progress and escalates. This race only guards against a tor
+        that never starts at all."""
         result_q: "queue.Queue" = queue.Queue()
 
         def _do_launch() -> None:
@@ -466,6 +475,7 @@ class TorManager:
                     init_msg_handler=msg_handler,
                     take_ownership=True,
                     close_output=False,
+                    completion_percent=0,
                 )
                 result_q.put(("ok", proc))
             except BaseException as exc:  # noqa: BLE001
@@ -476,22 +486,16 @@ class TorManager:
         try:
             kind, payload = result_q.get(timeout=self.boot_timeout)
         except queue.Empty:
-            kind = None
-            # SOCKS up but stem lagging: give it a moment, else kill the
-            # wedged tor so stem's stdout read returns.
-            if netutil.port_is_open("127.0.0.1", lane.socks_port, timeout=0.2):
-                try:
-                    kind, payload = result_q.get(timeout=10)
-                except queue.Empty:
-                    pass
-            if kind is None:
-                for port in (lane.control_port, lane.socks_port):
-                    pid = netutil.pid_on_port(port)
-                    if pid:
-                        netutil.kill_pid(pid, grace_s=1)
-                raise RuntimeError(
-                    f"tor lane #{lane.index} did not bootstrap within "
-                    f"{self.boot_timeout}s")
+            # tor never printed a bootstrap line: it is not starting.
+            # Kill whatever wedged process holds the ports so the next
+            # attempt starts clean.
+            for port in (lane.control_port, lane.socks_port):
+                pid = netutil.pid_on_port(port)
+                if pid:
+                    netutil.kill_pid(pid, grace_s=1)
+            raise RuntimeError(
+                f"tor lane #{lane.index} did not start within "
+                f"{self.boot_timeout}s")
         if kind == "err":
             raise RuntimeError(f"tor lane #{lane.index} launch failed: {payload}")
         return payload
@@ -526,6 +530,48 @@ class TorManager:
                 pass
         lane.process = None
         lane.boot_ok = False
+
+    def lane_bootstrap_pct(self, lane: Lane) -> int:
+        """Best-known bootstrap percent from the lane's tor.log; -1 = no
+        evidence of progress recorded. -1 is treated as 0% progress by the
+        boot gate: a lane that never even logged 0% hasn't started."""
+        try:
+            lines = lane.data_dir.joinpath("tor.log").read_text(
+                encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return -1
+        for line in reversed(lines):
+            if "Bootstrapped" not in line:
+                continue
+            m = re.search(r"Bootstrapped\s+(\d+)%", line)
+            if m:
+                return int(m.group(1))
+        return -1
+
+    def unpin_lane(self, lane: Lane) -> bool:
+        """Drop the ExitNodes country pin and relaunch. A pinned lane needs
+        the exit descriptors for exactly one country; when the directory
+        network is missing them, unpinning lets tor build any path. The pin
+        is not sticky: a country that cannot bootstrap re-rolls to the next
+        quiet pool entry instead of staying stuck."""
+        if self._stopping:
+            return False
+        if self._geoip_path() is None or not lane.torrc_path().exists():
+            return False
+        self._stop_lane_process(lane)
+        for port in (lane.socks_port, lane.control_port):
+            if netutil.port_is_open("127.0.0.1", port):
+                pid = netutil.pid_on_port(port)
+                if pid:
+                    netutil.kill_pid(pid, grace_s=2)
+        old = lane.exit_country
+        lane.exit_country = "*"
+        try:
+            self._write_torrc(lane)
+            return self._launch_lane(lane) in ("started", "already_running")
+        except BaseException:  # noqa: BLE001
+            lane.exit_country = old
+            return False
 
     def restart_lane(self, lane: Lane) -> bool:
         if self._stopping:
