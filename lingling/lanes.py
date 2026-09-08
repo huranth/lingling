@@ -343,13 +343,15 @@ class TorManager:
             "Log": f"notice file {lane.data_dir / 'tor.log'}",
         }
         # Pin country only with geoip present, else StrictNodes can't build circuits.
+        # exit_country "any" means no pin: Tor picks from the whole network.
         geoip = self._geoip_path()
         if geoip is not None:
             cfg["GeoIPFile"] = str(geoip)
             geo6 = self._geoip6_path()
             if geo6 is not None:
                 cfg["GeoIPv6File"] = str(geo6)
-            cfg["ExitNodes"] = "{" + lane.exit_country + "}"
+            if lane.exit_country != "any":
+                cfg["ExitNodes"] = "{" + lane.exit_country + "}"
         return cfg
 
     def _write_torrc(self, lane: Lane) -> None:
@@ -671,10 +673,13 @@ class TorManager:
 
     def rotate_exit_country(self, lane: Lane) -> Optional[str]:
         """Move a lane to another exit country (burns throttle the whole
-        country persona, not one IP). Preferred countries are sticky: the
-        lane re-cooks on the SAME country for a fresh exit unless that
-        country has exhausted its pool of good exits. Then the quiet pool,
-        then the crowded fallback pool. Returns the new country."""
+        country persona, not one IP). "any" lanes stay unpinned and re-cook
+        onto a fresh exit from the whole network. Preferred countries are
+        sticky: the lane re-cooks on the SAME country for a fresh exit unless
+        that country has exhausted its pool of good exits. Then the quiet
+        pool, then the crowded fallback pool. Returns the new country."""
+        if lane.exit_country == "any":
+            return "any"
         if (lane.exit_country in self._preferred
                 and not self._country_exhausted(lane.exit_country)):
             return lane.exit_country
