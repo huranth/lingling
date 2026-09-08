@@ -3,6 +3,7 @@ trusted to bound the SOCKS5 handshake, so one socket timeout covers the lot."""
 
 from __future__ import annotations
 
+import os
 import platform
 import socket
 import ssl
@@ -89,6 +90,17 @@ def _pid_alive(pid: int) -> bool:
         return str(pid) in output and "No tasks" not in output
     except Exception:
         return False
+
+
+def pid_alive(pid: int) -> bool:
+    """Cross-platform process-alive check (Windows: tasklist)."""
+    if platform.system().lower() != "windows":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    return _pid_alive(pid)
 
 
 def kill_pid(pid: int, grace_s: float = 2.0) -> bool:
