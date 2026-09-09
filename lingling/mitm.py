@@ -20,6 +20,11 @@ from .lanes import Lane, TorManager
 #: Only opencode.ai is unwrapped; everything else stays a blind tunnel.
 MITM_HOSTS = ("opencode.ai",)
 
+#: First-byte budget for a fresh circuit (cold lanes are slow to answer).
+_FIRST_BYTE_TIMEOUT = 90.0
+#: Steady per-read ceiling once the stream is provably alive.
+_READ_TIMEOUT = 30.0
+
 _ca_lock = threading.Lock()
 _ca_ctx: Dict[Path, "tuple"] = {}  # dir -> (ca_cert, ca_key, ssl.SSLContext cache)
 
@@ -260,9 +265,10 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
     ``held`` instead of forwarded, so the caller can retry on a fresh lane;
     ``retryable`` is True only when nothing reached the client yet."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Per-read ceiling. A healthy exit answers within seconds; 30s of silence
-    # means the circuit is dead, so fail over instead of staring at a hang.
-    sock.settimeout(30)
+    # Fresh circuits are slow to deliver their first bytes; a cold lane gets
+    # a long first-read budget, then the ceiling tightens to the steady
+    # per-read limit once the stream is provably alive.
+    sock.settimeout(_FIRST_BYTE_TIMEOUT)
     try:
         sock.connect(("127.0.0.1", lane.socks_port))
         err = netutil.socks5_open(sock, host, port)
@@ -312,6 +318,10 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                   "lane": lane.index, "cc": lane.exit_country, "status": 0,
                   "kb": 0, "secs": round(time.time() - t0, 1), "err": err})
             return err, 0, b"", True
+        # Upstream answered: the circuit is alive, tighten the ceiling.
+        # (The raw sock's fd is owned by the SSL socket after wrap_socket,
+        # so the timeout lives on ``up`` from here on.)
+        up.settimeout(_READ_TIMEOUT)
         status = 0
         try:
             status = int(rhead.split(b" ", 2)[1])
