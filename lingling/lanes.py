@@ -181,8 +181,10 @@ class TorManager:
 
     # -- setup --------------------------------------------------------------
     def _load_existing(self) -> None:
-        """Re-read ports + country from previous torrcs so a restart keeps
-        the same lane layout; heal unbindable ports up front."""
+        """Re-read ports from previous torrcs so a restart keeps the same
+        lane layout; heal unbindable ports up front. A concrete country pin
+        in a torrc is a stale copy of a previous list -- the current
+        countries.txt wins. Only an unpin ({*}) survives a restart."""
         seen_socks: set[int] = set()
         seen_control: set[int] = set()
         for i in range(self.count):
@@ -216,8 +218,8 @@ class TorManager:
                     elif line.startswith("ExitNodes"):
                         try:
                             val = line.split(None, 1)[1].strip().strip("{}").strip()
-                            if val:
-                                exit_cc = val.lower()
+                            if val == "*":
+                                exit_cc = "*"  # unpinned: keep the runtime state
                         except IndexError:
                             pass
             if socks_port in seen_socks or not netutil.bindable(socks_port):
