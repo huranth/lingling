@@ -187,6 +187,13 @@ _STALE_CAP = 2000
 #: so the file holds nothing sensitive -- just fingerprints.
 _stale_file: Optional[Path] = None
 
+#: The lane whose exit issued a session's current reasoning blobs --
+#: the provider only validates blobs against the exit that issued
+#: them, so the next call tries that lane first and skips the 400.
+_owner_lock = threading.Lock()
+_owners: Dict[str, "Lane"] = {}
+_OWNER_CAP = 64
+
 
 def prime_stale_memory(path) -> None:
     """Load known-stale fingerprints learned by earlier launches.
@@ -244,6 +251,40 @@ def _remember_stale(body: bytes) -> None:
         changed = len(_stale_blobs) != before
     if changed:
         _save_stale_memory()
+
+
+def _own_headers(headers: dict) -> str:
+    """Session key for a request: provider affinity ids, else the
+    caller's session id, else empty (no owner preference applies)."""
+    for k in ("x-session-affinity", "x-session-id", "session-id"):
+        v = headers.get(k)
+        if isinstance(v, bytes):
+            v = v.decode("latin1", "replace")
+        if v:
+            return str(v)
+    return ""
+
+
+def _remember_owner(session: str, lane: Lane) -> None:
+    """Record the lane that just answered a session cleanly. The exit
+    that issued the current blobs is the only one that validates them."""
+    if not session:
+        return
+    with _owner_lock:
+        if len(_owners) >= _OWNER_CAP:
+            _owners.clear()
+        _owners[session] = lane
+
+
+def _owner_of(session: str) -> Optional[Lane]:
+    """The lane whose exit issued the session's current blobs, if alive."""
+    if not session:
+        return None
+    with _owner_lock:
+        lane = _owners.get(session)
+    if lane is None or not lane.healthy or lane.sidelined or lane.healing:
+        return None
+    return lane
 
 
 def _without_stale_reasoning(body: bytes) -> Optional[bytes]:
@@ -309,6 +350,7 @@ def _try_heal(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
     if healed_body is None:
         return False
     t0 = time.time()
+    session = _own_headers(headers)
     emit({
         "type": "lane", "kind": "heal", "t": t0,
         "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
@@ -335,7 +377,10 @@ def _try_heal(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         if status == 429:
             relay.report_burn(healed)
             continue
+        if retryable:  # partial body reached the client; not ours to fix
+            return False
         if 200 <= status < 300:
+            _remember_owner(session, healed)
             emit({
                 "type": "lane", "kind": "up", "t": time.time(),
                 "lane": healed.index, "cc": healed.exit_country,
@@ -423,9 +468,12 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
             send_body, _prestripped = _prestrip_known_stale(body)
 
         held = b""
-        tried = set()
+        tried: set = set()
+        session = _own_headers(headers)
+        lane = _owner_of(session)
         while True:
-            lane = relay.pick_model_lane(exclude=tried)
+            if lane is None or lane.index in tried:
+                lane = relay.pick_model_lane(exclude=tried)
             if lane is None:
                 # Every lane just 429'd us: hand back the last one verbatim.
                 if held:
@@ -470,6 +518,9 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                     # File what we actually sent: the provider just
                     # rejected it, and rejected blobs never turn valid.
                     _remember_stale(send_body)
+                    # This lane can only keep rejecting the session's
+                    # blobs: pull it and let the daemon re-cook it fresh.
+                    relay.report_poison(lane)
                     # The healer says nothing when nothing is safe to heal.
                     if _try_heal(
                             client, lane, host, port, method, path, headers,
@@ -483,6 +534,11 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
             if status == 400:
                 # Not a model call, so no body to heal: forward untouched.
                 client.sendall(held)
+            else:
+                # Whatever else answered will issue the next turn's blobs:
+                # pin the session to this lane so its exits only ever
+                # validate what they issued (zero 400s, zero heals).
+                _remember_owner(session, lane)
             break
         conn_hdr = headers.get("connection")
         if isinstance(conn_hdr, bytes):

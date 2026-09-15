@@ -100,8 +100,13 @@ class Relay:
                            writer: asyncio.StreamWriter) -> None:
         """Answer 200, dup the socket (the transport owns its fd), close the
         asyncio side, and hand the dup to a blocking MITM thread."""
-        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await writer.drain()
+        try:
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+        except (ConnectionError, OSError):
+            # Client vanished mid-handshake: nothing to hand off.
+            writer.close()
+            return
         transport_sock = writer.get_extra_info("socket")
         if transport_sock is None:
             writer.close()
@@ -185,6 +190,23 @@ class Relay:
                    f"rotation, re-cooking it",
         })
 
+    def report_poison(self, lane: Lane) -> None:
+        """A lane's exit rejected the session's reasoning blobs as not
+        issued to this caller: it can only keep refusing them, so pull it
+        and let the health daemon re-cook it with a fresh exit."""
+        if not lane.healthy:
+            return
+        # Healthy so the daemon's stall/burn records don't misfire on it.
+        lane.healthy = False
+        lane.burned_cycles = 0
+        lane.unhealthy_cycles = 0
+        self._emit({
+            "type": "lane", "kind": "heal", "t": time.time(),
+            "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
+            "msg": f"lane {lane.index} kept refusing this session's "
+                   f"reasoning -- pulled, re-cooking it with a fresh exit",
+        })
+
     # -- connection handling --------------------------------------------------
     async def _handle(self, reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter) -> None:
@@ -206,11 +228,14 @@ class Relay:
                     h = await asyncio.wait_for(reader.readline(), timeout=5)
                     if h in (b"\r\n", b"\n", b""):
                         break
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, ConnectionError):
                 pass
-            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\n"
-                         b"Content-Length: 0\r\n\r\n")
-            await writer.drain()
+            try:
+                writer.write(b"HTTP/1.1 405 Method Not Allowed\r\n"
+                             b"Content-Length: 0\r\n\r\n")
+                await writer.drain()
+            except (ConnectionError, OSError):
+                pass
             writer.close()
             return
 
@@ -225,7 +250,7 @@ class Relay:
                 h = await asyncio.wait_for(reader.readline(), timeout=5)
                 if h in (b"\r\n", b"\n", b""):
                     break
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ConnectionError):
             writer.close()
             return
 
@@ -277,9 +302,12 @@ class Relay:
             tried.clear()
             await asyncio.sleep(0.5)
         if lane is None or upstream_w is None or upstream_r is None:
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n"
-                         b"Content-Length: 0\r\n\r\n")
-            await writer.drain()
+            try:
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n"
+                             b"Content-Length: 0\r\n\r\n")
+                await writer.drain()
+            except (ConnectionError, OSError):
+                pass
             writer.close()
             self._emit({
                 "type": "req", "t": time.time(), "n": seq, "lane": 0,
@@ -295,11 +323,15 @@ class Relay:
             "cc": lane.exit_country, "ip": lane.exit_ip,
             "target": f"{host}:{port}", "ok": True, "note": "",
         })
-        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await writer.drain()
         try:
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
             await self._pipe(seq, lane, reader, writer,
                              upstream_r, upstream_w)
+        except (ConnectionError, OSError):
+            # Client vanished mid-handshake or mid-tunnel: routine on a
+            # laptop that sleeps; nothing to surface, sockets close below.
+            pass
         finally:
             with lane.lock:
                 lane.active -= 1
