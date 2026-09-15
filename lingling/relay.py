@@ -46,11 +46,6 @@ class Relay:
         self._seq = itertools.count(1)
         #: Set by CLI when the local CA is ready; None = blind tunnels only.
         self.cert_shop = None  # lingling.mitm.CertShop
-        #: Global pin for opencode.ai MITM traffic: all intercepted model
-        #: calls share one exit so encrypted-reasoning chains stay on the
-        #: caller that was issued them. Blind tunnels keep rotating.
-        self._mitm_lock = threading.Lock()
-        self._mitm_lane: Optional[Lane] = None
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> int:
@@ -153,39 +148,6 @@ class Relay:
         lane = min(candidates, key=key)
         lane.last_used_at = time.perf_counter_ns()
         return lane
-
-    def pick_mitm_lane(self, exclude: Optional[set] = None) -> Optional[Lane]:
-        """Shared pin for all opencode.ai model calls. Returns the pinned
-        lane while usable, else picks a fresh one and pins it. Thread-safe:
-        parallel CONNECTs converge on one exit instead of each pinning
-        their own (which re-creates the encrypted_content split)."""
-        with self._mitm_lock:
-            cur = self._mitm_lane
-            if (cur is not None
-                    and (not exclude or cur.index not in exclude)
-                    and cur.healthy
-                    and not cur.sidelined
-                    and not cur.healing):
-                return cur
-            # Pinned lane unusable (or excluded after a burn): pick fresh.
-            lane = self.pick_lane(exclude=exclude, ignore_busy=True)
-            if lane is not None:
-                if cur is not None and cur is not lane:
-                    self._emit({
-                        "type": "lane", "kind": "rotate", "t": time.time(),
-                        "lane": lane.index, "cc": lane.exit_country,
-                        "ip": lane.exit_ip,
-                        "msg": f"model traffic pinned to lane {lane.index} "
-                               f"{{{lane.exit_country}}} -- start a fresh "
-                               f"session if encrypted reasoning 400s",
-                    })
-                self._mitm_lane = lane
-            return lane
-
-    def clear_mitm_lane(self, lane: Lane) -> None:
-        with self._mitm_lock:
-            if self._mitm_lane is lane:
-                self._mitm_lane = None
 
     def report_burn(self, lane: Lane) -> None:
         """A real request just got 429'd through this lane: park it now and
