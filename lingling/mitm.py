@@ -553,16 +553,15 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                 tried.add(lane.index)
                 continue
             if status == 400 and method == "POST":
-                # A 400 is the lane reporting, not the lane failing, so it
-                # stays in rotation.
+                # A 400 is the lane reporting, not the lane failing: the
+                # exit refused reasoning issued by ANOTHER lane's exit, so
+                # the lane stays in rotation -- pulling it only starves the
+                # pool and costs re-cook time.
                 poisoned = _looks_poisoned(held)
                 if poisoned:
                     # File what we actually sent: the provider just
                     # rejected it, and rejected blobs never turn valid.
                     _remember_stale(send_body)
-                    # This lane can only keep rejecting the session's
-                    # blobs: pull it and let the daemon re-cook it fresh.
-                    relay.report_poison(lane)
                     # The healer says nothing when nothing is safe to heal.
                     if _try_heal(
                             client, lane, host, port, method, path, headers,

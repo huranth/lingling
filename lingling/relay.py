@@ -190,23 +190,6 @@ class Relay:
                    f"rotation, re-cooking it",
         })
 
-    def report_poison(self, lane: Lane) -> None:
-        """A lane's exit rejected the session's reasoning blobs as not
-        issued to this caller: it can only keep refusing them, so pull it
-        and let the health daemon re-cook it with a fresh exit."""
-        if not lane.healthy:
-            return
-        # Healthy so the daemon's stall/burn records don't misfire on it.
-        lane.healthy = False
-        lane.burned_cycles = 0
-        lane.unhealthy_cycles = 0
-        self._emit({
-            "type": "lane", "kind": "heal", "t": time.time(),
-            "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
-            "msg": f"lane {lane.index} kept refusing this session's "
-                   f"reasoning -- pulled, re-cooking it with a fresh exit",
-        })
-
     # -- connection handling --------------------------------------------------
     async def _handle(self, reader: asyncio.StreamReader,
                       writer: asyncio.StreamWriter) -> None:
