@@ -149,6 +149,12 @@ class Relay:
         lane.last_used_at = time.perf_counter_ns()
         return lane
 
+    def pick_model_lane(self, exclude: Optional[set] = None) -> Optional[Lane]:
+        """Pick a lane for one intercepted model call. Same speed-first
+        rotation as any other traffic: the healer untangles stale
+        reasoning, so calls are free to ride any lane."""
+        return self.pick_lane(exclude=exclude, ignore_busy=True)
+
     def report_burn(self, lane: Lane) -> None:
         """A real request just got 429'd through this lane: park it now and
         let the health daemon re-cook it from scratch."""

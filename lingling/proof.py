@@ -94,7 +94,11 @@ def _render(ev: Dict) -> str:
                 f"{_c(f'tunnel #{n} closed -- {kb} KB over {span}', '90')}")
     if ev.get("type") == "lane":
         kind = ev.get("kind", "")
-        color = {"up": "32", "burn": "33", "rotate": "35", "heal": "33",
+        # Maintenance (heal, bench) renders dim: the lane keeps working,
+        # nothing needs attention. Things that actually move traffic or
+        # fail out loud (burn, rotate, up, fail, sidelined) stay colored.
+        color = {"up": "32", "burn": "33", "rotate": "35",
+                 "heal": "90", "bench": "90",
                  "fail": "31", "sidelined": "31"}.get(kind, "37")
         return f"{_c(ts, '90')}  {_c('*', color)} {_c(ev.get('msg', ''), color)}"
     return ""

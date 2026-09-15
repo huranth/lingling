@@ -269,6 +269,7 @@ def main(argv: list[str]) -> int:
             try:
                 from . import mitm
                 relay.cert_shop = mitm.CertShop(DATA_DIR / "mitm")
+                mitm.prime_stale_memory(DATA_DIR / "mitm" / "stale_blobs.json")
                 ca_pem = relay.cert_shop.ca_pem_path
             except Exception:  # noqa: BLE001
                 pass

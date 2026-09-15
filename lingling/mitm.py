@@ -6,7 +6,9 @@ code on daemon threads, kept off the asyncio loop so SSE never stalls it."""
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
+import os
 import socket
 import ssl
 import threading
@@ -147,6 +149,205 @@ def _model_of(body: bytes) -> str:
         return ""
 
 
+def _body_json(body: bytes):
+    """Decoded JSON dict, or None when the body is not one."""
+    try:
+        obj = json.loads(body.decode("utf-8"))
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _blob_holders(node):
+    """Yield every dict in decoded JSON that carries an encrypted blob."""
+    if isinstance(node, dict):
+        if isinstance(node.get("encrypted_content"), str):
+            yield node
+        for value in node.values():
+            yield from _blob_holders(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _blob_holders(value)
+
+
+def _blob_id(blob: str) -> str:
+    """Stable fingerprint of one blob. Hashes only: the ciphertext
+    itself is never kept or logged."""
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+#: Fingerprints of blobs the provider already rejected under this
+#: process. A rejected blob never turns valid again (exits never
+#: repeat), so later turns can skip resending them instead of paying
+#: a fresh 400 every time. Hashes only, capped, shared by MITM threads.
+_stale_lock = threading.Lock()
+_stale_blobs: set = set()
+_STALE_CAP = 2000
+#: Disk sidecar for the memory above, set once at startup. Hashes only,
+#: so the file holds nothing sensitive -- just fingerprints.
+_stale_file: Optional[Path] = None
+
+
+def prime_stale_memory(path) -> None:
+    """Load known-stale fingerprints learned by earlier launches.
+
+    A missing or broken file simply means learning restarts: one taxed
+    turn, then the memory refills itself.
+    """
+    global _stale_file
+    _stale_file = Path(path)
+    try:
+        saved = json.loads(_stale_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(saved, list):
+        return
+    with _stale_lock:
+        for fingerprint in saved:
+            if (isinstance(fingerprint, str)
+                    and len(_stale_blobs) < _STALE_CAP):
+                _stale_blobs.add(fingerprint)
+
+
+def _save_stale_memory() -> None:
+    """Write the memory to its sidecar file, if primed.
+
+    Best-effort: a failed write only costs re-learning next launch.
+    Snapshots are complete, so two threads racing a save can't corrupt
+    each other -- the last writer simply wins with a full set.
+    """
+    if _stale_file is None:
+        return
+    try:
+        with _stale_lock:
+            snapshot = sorted(_stale_blobs)
+        _stale_file.parent.mkdir(parents=True, exist_ok=True)
+        _stale_file.write_text(json.dumps(snapshot), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _remember_stale(body: bytes) -> None:
+    """File every blob in an as-sent body as known-stale (memory + disk)."""
+    obj = _body_json(body)
+    if obj is None:
+        return
+    fresh = [_blob_id(holder["encrypted_content"])
+             for holder in _blob_holders(obj)]
+    if not fresh:
+        return
+    with _stale_lock:
+        if len(_stale_blobs) > _STALE_CAP:
+            _stale_blobs.clear()
+        before = len(_stale_blobs)
+        _stale_blobs.update(fresh)
+        changed = len(_stale_blobs) != before
+    if changed:
+        _save_stale_memory()
+
+
+def _without_stale_reasoning(body: bytes) -> Optional[bytes]:
+    """Copy of a JSON request body minus stale encrypted reasoning.
+
+    Returns None when the body is not JSON or holds no encrypted blobs,
+    so the caller can fall back to today's behavior untouched. Only the
+    provider's ciphertext goes -- ids, summaries, history all stay.
+    """
+    obj = _body_json(body)
+    if obj is None:
+        return None
+    holders = list(_blob_holders(obj))
+    if not holders:
+        return None
+    for holder in holders:
+        del holder["encrypted_content"]
+    return json.dumps(obj).encode("utf-8")
+
+
+def _prestrip_known_stale(body: bytes):
+    """Remove already-rejected blobs before sending.
+
+    Returns (body_to_send, dropped). dropped 0 means nothing matched --
+    the original goes out untouched so valid chains keep working.
+    """
+    obj = _body_json(body)
+    if obj is None:
+        return body, 0
+    with _stale_lock:
+        known = set(_stale_blobs)
+    if not known:
+        return body, 0
+    dropped = 0
+    for holder in _blob_holders(obj):
+        if _blob_id(holder["encrypted_content"]) in known:
+            del holder["encrypted_content"]
+            dropped += 1
+    if not dropped:
+        return body, 0
+    return json.dumps(obj).encode("utf-8"), dropped
+
+
+def _looks_poisoned(reply: bytes) -> bool:
+    """True when an upstream error body complains about stale encrypted
+    reasoning. Byte-level on purpose: error pages are tiny ASCII JSON."""
+    return b"encrypted_content" in reply
+
+
+def _try_heal(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
+              method: str, path: str, headers: dict, body: bytes,
+              model: str, emit, seq: int, call_n: int, relay) -> bool:
+    """Retry a poisoned call, stripped of stale reasoning, on a fresh lane.
+
+    The provider rejected the blobs as not-issued-to-this-caller, so the
+    same lane would only re-offend: try the next-fastest lane instead.
+    Returns True only when the client received a fresh answer and the
+    original 400 must NOT be forwarded; anything else returns False and
+    the caller forwards the original 400 untouched."""
+    if os.environ.get("LINGLING_NO_HEAL", "").lower() in ("1", "true"):
+        return False
+    healed_body = _without_stale_reasoning(body)
+    if healed_body is None:
+        return False
+    t0 = time.time()
+    emit({
+        "type": "lane", "kind": "heal", "t": t0,
+        "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
+        "msg": f"stale reasoning on lane {lane.index} -- retrying "
+               f"#{seq}.{call_n} without it, on another lane ...",
+    })
+    for _ in range(4):
+        healed = relay.pick_model_lane(exclude={lane.index})
+        if healed is None:
+            return False
+        emit({
+            "type": "call", "t": time.time(), "n": seq, "c": call_n,
+            "lane": healed.index, "cc": healed.exit_country,
+            "ip": healed.exit_ip,
+            "method": method, "path": path, "model": model, "host": host,
+        })
+        err, status, _held, retryable = _roundtrip(
+            client, healed, host, port, method, path, headers,
+            healed_body, emit, seq, call_n, t0)
+        if err:
+            if retryable:
+                continue
+            return False
+        if status == 429:
+            relay.report_burn(healed)
+            continue
+        if 200 <= status < 300:
+            emit({
+                "type": "lane", "kind": "up", "t": time.time(),
+                "lane": healed.index, "cc": healed.exit_country,
+                "ip": healed.exit_ip,
+                "msg": f"healed #{seq}.{call_n} -- stale reasoning dropped, "
+                       f"history kept, fresh answer delivered",
+            })
+            return True
+        return False
+    return False
+
+
 def handle_conn(raw: socket.socket, host: str, port: int, seq: int,
                 shop: CertShop, manager: TorManager,
                 emit: Callable[[Dict], None], relay) -> None:
@@ -214,10 +415,17 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
         model = _model_of(body) if body and method == "POST" else ""
         call_n += 1
 
+        # Skip blobs this process already saw rejected: resending them
+        # buys a certain 400. Fresh (never-failed) blobs stay, so valid
+        # reasoning chains keep working.
+        send_body = body
+        if os.environ.get("LINGLING_NO_HEAL", "").lower() not in ("1", "true"):
+            send_body, _prestripped = _prestrip_known_stale(body)
+
         held = b""
         tried = set()
         while True:
-            lane = relay.pick_lane(exclude=tried, ignore_busy=True)
+            lane = relay.pick_model_lane(exclude=tried)
             if lane is None:
                 # Every lane just 429'd us: hand back the last one verbatim.
                 if held:
@@ -238,7 +446,7 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
             try:
                 err, status, held, retryable = _roundtrip(
                     client, lane, host, port, method, path, headers,
-                    body, emit, seq, call_n, t0)
+                    send_body, emit, seq, call_n, t0)
             finally:
                 with lane.lock:
                     lane.active -= 1
@@ -254,7 +462,34 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                 relay.report_burn(lane)
                 tried.add(lane.index)
                 continue
+            if status == 400 and method == "POST":
+                # A 400 is the lane reporting, not the lane failing, so it
+                # stays in rotation.
+                poisoned = _looks_poisoned(held)
+                if poisoned:
+                    # File what we actually sent: the provider just
+                    # rejected it, and rejected blobs never turn valid.
+                    _remember_stale(send_body)
+                    # The healer says nothing when nothing is safe to heal.
+                    if _try_heal(
+                            client, lane, host, port, method, path, headers,
+                            body, model, emit, seq, call_n, relay):
+                        break
+                # Healer passed or failed: the original answer stands.
+                # (held always carries the head here: a status line only
+                # exists because one was read from upstream.)
+                client.sendall(held)
+                break
+            if status == 400:
+                # Not a model call, so no body to heal: forward untouched.
+                client.sendall(held)
             break
+        conn_hdr = headers.get("connection")
+        if isinstance(conn_hdr, bytes):
+            conn_hdr = conn_hdr.decode("latin1", "replace")
+        if "close" in str(conn_hdr or "").lower():
+            # The client asked for one shot; don't wait for the next head.
+            return
 
 
 def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
@@ -263,7 +498,9 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                ) -> "tuple[str, int, bytes, bool]":
     """Returns (err, status, held, retryable). A 429 is fully buffered into
     ``held`` instead of forwarded, so the caller can retry on a fresh lane;
-    ``retryable`` is True only when nothing reached the client yet."""
+    a 400 is buffered too (error pages are tiny) so the caller can inspect
+    it and decide: heal, then forward. ``retryable`` is True only when
+    nothing reached the client yet."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # Fresh circuits are slow to deliver their first bytes; a cold lane gets
     # a long first-read budget, then the ceiling tightens to the steady
@@ -333,7 +570,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                 k, v = raw.split(b":", 1)
                 rheaders[k.strip().lower()] = v.strip()
 
-        if status != 429:
+        if status not in (429, 400):
             held = None  # stream straight to the client from here on
         _send(rhead)
 
