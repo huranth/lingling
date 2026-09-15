@@ -337,6 +337,19 @@ def _looks_poisoned(reply: bytes) -> bool:
     return b"encrypted_content" in reply
 
 
+def _dst_failure(err: str) -> bool:
+    """True when a failed ride is the destination's fault, not the lane's
+    (SOCKS replies for a dead host). The site, not the exit, answered, so
+    the lane keeps its health -- a page that refuses every exit must not
+    drain the pool."""
+    return (
+        err == "host unreachable"
+        or err == "connection refused"
+        or err == "network unreachable"
+        or err == "TTL expired"
+    )
+
+
 def _wait_lane(relay, emit, seq: int, call_n: int, model: str) -> Optional[Lane]:
     """Block up to the lane-wait budget for any healthy lane. The caller
     polls so a lane that just re-cooked is used the moment it's ready."""
@@ -541,10 +554,13 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                 with lane.lock:
                     lane.active -= 1
             if err:
-                # retryable == nothing reached the client: dead exit, free
-                # retry, so it counts as a hard stall (instant pull).
-                relay.report_stall(lane, hard=retryable)
                 if retryable:
+                    # Nothing reached the client -- a free retry. A dead
+                    # destination is the site's fault, never the lane's:
+                    # the lane keeps its health so dead pages can't drain
+                    # the pool.
+                    if not _dst_failure(err):
+                        relay.report_stall(lane, hard=True)
                     tried.add(lane.index)
                     continue
                 return

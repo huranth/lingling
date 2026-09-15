@@ -20,6 +20,17 @@ _SOCKS_FAIL = {
     7: "cmd unsupported", 8: "bad address type",
 }
 
+#: SOCKS replies that mean the DESTINATION refused (site down, host dead).
+#: The lane itself is fine -- pulling it would re-cook a healthy exit for
+#: a page that no exit can reach.
+_DST_REPLIES = (3, 4, 5, 6)
+
+
+class _DestRefused(ConnectionError):
+    """CONNECT refused because the destination is unreachable, never
+    because the lane failed. Kept distinct so the blind-tunnel path can
+    switch lanes without pulling the exit from rotation."""
+
 
 class Relay:
     def __init__(
@@ -249,15 +260,23 @@ class Relay:
         deadline = time.time() + self.wait_budget
         held = False
         while True:
+            # Every lane tried and every refusal came from the destination:
+            # a fresh exit cannot fix a dead page, so bail now -- no waiting,
+            # no "holding" park line.
+            sweep_refused = True
+            sweep_tried = 0
             for _ in range(max(1, len(self.tor.lanes))):
                 lane = self.pick_lane(exclude=tried)
                 if lane is None:
                     break
                 tried.add(lane.index)
+                sweep_tried += 1
                 try:
                     upstream_r, upstream_w = await self._dial(lane, host, port)
                     break
                 except Exception as exc:  # noqa: BLE001
+                    sweep_refused = sweep_refused and isinstance(
+                        exc, _DestRefused)
                     err_note = str(exc)
                     self._emit({
                         "type": "lane", "kind": "fail", "t": time.time(),
@@ -266,10 +285,15 @@ class Relay:
                         "msg": f"lane {lane.index} couldn't reach {host} "
                                f"({err_note}) -- switching lanes",
                     })
-                    # A dial failure is a live signal the daemon hasn't seen.
-                    lane.healthy = False
+                    # The destination itself refused: a dead page must not
+                    # pull healthy exits. Any other dial failure is a live
+                    # signal the daemon hasn't seen yet.
+                    if not isinstance(exc, _DestRefused):
+                        lane.healthy = False
                     lane = None
             if lane is not None:
+                break
+            if sweep_tried and sweep_refused:
                 break
             # Hold quietly and re-check rather than an instant 502.
             if time.time() >= deadline:
@@ -347,6 +371,9 @@ class Relay:
             await writer.drain()
             head = await reader.readexactly(4)
             if head[1] != 0x00:
+                if head[1] in _DST_REPLIES:
+                    raise _DestRefused(
+                        _SOCKS_FAIL.get(head[1], f"socks reply {head[1]}"))
                 raise ConnectionError(
                     _SOCKS_FAIL.get(head[1], f"socks reply {head[1]}"))
             atyp = head[3]
