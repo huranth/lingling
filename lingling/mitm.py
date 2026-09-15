@@ -178,8 +178,16 @@ def handle_conn(raw: socket.socket, host: str, port: int, seq: int,
 
 def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
            manager: TorManager, emit: Callable[[Dict], None], relay) -> None:
-    """HTTP/1.1 keep-alive loop; one lane tunnel per request so consecutive
-    calls visibly rotate lanes."""
+    """HTTP/1.1 keep-alive loop; globally pinned lane for model traffic.
+
+    All opencode.ai calls across all CONNECTs share one exit via
+    ``relay.pick_mitm_lane()``. The upstream binds
+    ``reasoning.encrypted_content`` to the issuing caller, so even
+    per-connection stickiness splits a session as soon as opencode opens
+    a second parallel TLS connection (``#53.1 -> lane 2`` while the
+    session lives on lane 4 -> ``400 encrypted_content was not issued
+    to this caller``). Only burn / hard stall moves the global pin.
+    """
     cf = client.makefile("rb")
     call_n = 0
     while True:
@@ -217,7 +225,9 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
         held = b""
         tried = set()
         while True:
-            lane = relay.pick_lane(exclude=tried, ignore_busy=True)
+            # Global pin: every model call rides the same exit while it
+            # is usable, so encrypted reasoning never changes caller.
+            lane = relay.pick_mitm_lane(exclude=tried)
             if lane is None:
                 # Every lane just 429'd us: hand back the last one verbatim.
                 if held:
@@ -248,11 +258,13 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                 relay.report_stall(lane, hard=retryable)
                 if retryable:
                     tried.add(lane.index)
+                    relay.clear_mitm_lane(lane)
                     continue
                 return
             if status == 429:
                 relay.report_burn(lane)
                 tried.add(lane.index)
+                relay.clear_mitm_lane(lane)
                 continue
             break
 
