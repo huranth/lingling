@@ -26,6 +26,9 @@ MITM_HOSTS = ("opencode.ai",)
 _FIRST_BYTE_TIMEOUT = 90.0
 #: Steady per-read ceiling once the stream is provably alive.
 _READ_TIMEOUT = 30.0
+#: How long a poisoned or lane-less call parks while the daemon brings
+#: up a fresh lane, before the original answer is forwarded instead.
+_LANE_WAIT_S = 60.0
 
 _ca_lock = threading.Lock()
 _ca_ctx: Dict[Path, "tuple"] = {}  # dir -> (ca_cert, ca_key, ssl.SSLContext cache)
@@ -334,6 +337,28 @@ def _looks_poisoned(reply: bytes) -> bool:
     return b"encrypted_content" in reply
 
 
+def _wait_lane(relay, emit, seq: int, call_n: int, model: str) -> Optional[Lane]:
+    """Block up to the lane-wait budget for any healthy lane. The caller
+    polls so a lane that just re-cooked is used the moment it's ready."""
+    deadline = time.time() + _LANE_WAIT_S
+    told = False
+    while True:
+        lane = relay.pick_lane(exclude=None)
+        if lane is not None:
+            return lane
+        if time.time() >= deadline:
+            return None
+        if not told:
+            told = True
+            emit({
+                "type": "lane", "kind": "heal", "t": time.time(),
+                "lane": 0, "cc": "", "ip": "",
+                "msg": f"holding #{seq}.{call_n} ({model}) while a lane "
+                       f"finishes cooking ...",
+            })
+        time.sleep(0.5)
+
+
 def _try_heal(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
               method: str, path: str, headers: dict, body: bytes,
               model: str, emit, seq: int, call_n: int, relay) -> bool:
@@ -349,18 +374,22 @@ def _try_heal(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
     healed_body = _without_stale_reasoning(body)
     if healed_body is None:
         return False
-    t0 = time.time()
     session = _own_headers(headers)
+    # A poison call needs ANOTHER lane; if none is ready the daemon is
+    # mid-cook on all of them, so park the call and retry once it's up.
+    # The stripped body is safe on ANY exit, so a re-cooked lane counts.
+    healed = _wait_lane(relay, emit, seq, call_n, model)
+    if healed is None:
+        return False
+    t0 = time.time()
     emit({
         "type": "lane", "kind": "heal", "t": t0,
         "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
         "msg": f"stale reasoning on lane {lane.index} -- retrying "
                f"#{seq}.{call_n} without it, on another lane ...",
     })
+    tried = {lane.index}
     for _ in range(4):
-        healed = relay.pick_model_lane(exclude={lane.index})
-        if healed is None:
-            return False
         emit({
             "type": "call", "t": time.time(), "n": seq, "c": call_n,
             "lane": healed.index, "cc": healed.exit_country,
@@ -372,10 +401,18 @@ def _try_heal(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
             healed_body, emit, seq, call_n, t0)
         if err:
             if retryable:
+                tried.add(healed.index)
+                healed = relay.pick_model_lane(exclude=tried)
+                if healed is None:
+                    return False
                 continue
             return False
         if status == 429:
             relay.report_burn(healed)
+            tried.add(healed.index)
+            healed = relay.pick_model_lane(exclude=tried)
+            if healed is None:
+                return False
             continue
         if retryable:  # partial body reached the client; not ours to fix
             return False
@@ -471,11 +508,16 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
         tried: set = set()
         session = _own_headers(headers)
         lane = _owner_of(session)
+        if lane is None and method == "POST" and model:
+            # No owner yet (first call or it died): nothing rides yet, so
+            # park the call until a lane cooks instead of 502ing.
+            lane = _wait_lane(relay, emit, seq, call_n, model)
         while True:
             if lane is None or lane.index in tried:
                 lane = relay.pick_model_lane(exclude=tried)
             if lane is None:
-                # Every lane just 429'd us: hand back the last one verbatim.
+                # Every lane just refused us: hand back the last one
+                # verbatim rather than a 502.
                 if held:
                     client.sendall(held)
                 else:
