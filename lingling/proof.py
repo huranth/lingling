@@ -1,6 +1,5 @@
-"""Proof pane: relay and lane events are appended as JSON lines to
-``data/proof.log``; a second console tails it and renders one human line
-per event until a {"type": "done"} sentinel or the window closes."""
+"""Proof pane: events append as JSON lines to ``data/proof.log``; a second
+console tails and renders them until the ``done`` sentinel."""
 
 from __future__ import annotations
 
@@ -72,15 +71,19 @@ def _render(ev: Dict) -> str:
         err = ev.get("err") or ""
         if err:
             verdict = _c(f"failed ({err})", "31")
+        elif ev.get("ghost"):
+            verdict = (_c(str(status), "33")
+                       + _c(" GHOST -- stream ended with no content", "31"))
         else:
             color = "32" if 200 <= status < 300 else "31"
             verdict = _c(str(status), color)
+            if ev.get("cut"):
+                verdict += _c(" STREAM CUT mid-body", "31")
         return (f"{_c(ts, '90')}    {_c('|', '90')} "
                 f"{_c(f'#{n}.{c}', '90')} {verdict} "
                 f"{_c(f'{kb} KB in {secs}s', '90')}")
     if ev.get("type") == "flow":
-        # TLS hides individual requests, so this heartbeat is the only proof
-        # of activity on a long-lived tunnel; dim it as a continuation.
+        # dim heartbeat.
         n = ev.get("n", 0)
         kb = ev.get("kb", 0)
         return (f"{_c(ts, '90')}    {_c('|', '90')} "
@@ -104,7 +107,7 @@ def tail(path: Path) -> int:
     print(_c("lingling lanes -- live proof", "1"))
     print(_c(f"tailing {path}", "90"))
     print(_c("every request below shows the exit lane it actually rode.\n", "90"))
-    # Start from the end of any previous run's log; only this session matters.
+    # this session only.
     pos = path.stat().st_size if path.exists() else 0
     try:
         while True:

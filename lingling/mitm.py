@@ -1,12 +1,12 @@
-"""Per-request MITM for opencode.ai: terminate TLS locally with a throwaway
-CA (trusted via NODE_EXTRA_CA_CERTS) so individual model calls become
-visible, then re-encrypt through a lane's SOCKS5 tunnel. Blocking-socket
-code on daemon threads, kept off the asyncio loop so SSE never stalls it."""
+"""Per-request MITM for opencode.ai: a local CA terminates TLS so each model
+call is visible, then re-encrypts through a lane's SOCKS5 tunnel.
+Blocking sockets on daemon threads, off the asyncio loop."""
 
 from __future__ import annotations
 
 import datetime
 import json
+import os
 import socket
 import ssl
 import threading
@@ -17,13 +17,17 @@ from typing import Callable, Dict, Optional
 from . import netutil
 from .lanes import Lane, TorManager
 
-#: Only opencode.ai is unwrapped; everything else stays a blind tunnel.
+#: Hosts unwrapped; the rest tunnel blind.
 MITM_HOSTS = ("opencode.ai",)
 
-#: First-byte budget for a fresh circuit (cold lanes are slow to answer).
+#: Cold-circuit first-byte budget.
 _FIRST_BYTE_TIMEOUT = 90.0
-#: Steady per-read ceiling once the stream is provably alive.
-_READ_TIMEOUT = 30.0
+#: Mid-stream per-read ceiling (LINGLING_STREAM_TIMEOUT).
+_READ_TIMEOUT = float(os.environ.get("LINGLING_STREAM_TIMEOUT", "45"))
+#: Streams per lane before calls queue up (LINGLING_LANE_CONCURRENCY).
+_LANE_CAP = int(os.environ.get("LINGLING_LANE_CONCURRENCY", "2"))
+#: Wait budget for free capacity or a cooking lane (LINGLING_LANE_WAIT).
+_LANE_WAIT = float(os.environ.get("LINGLING_LANE_WAIT", "90"))
 
 _ca_lock = threading.Lock()
 _ca_ctx: Dict[Path, "tuple"] = {}  # dir -> (ca_cert, ca_key, ssl.SSLContext cache)
@@ -147,14 +151,47 @@ def _model_of(body: bytes) -> str:
         return ""
 
 
+def _force_connection_close(head: bytes) -> bytes:
+    """Always advertise ``Connection: close``: safest contract for a proxy
+    that may drop the tunnel anytime (no pooled-socket resets)."""
+    lines = head.split(b"\r\n")
+    out = [lines[0]]
+    replaced = False
+    i = 1
+    while i < len(lines) and lines[i]:
+        ln = lines[i]
+        if ln[:10].lower() == b"connection" and b":" in ln:
+            out.append(b"Connection: close")
+            replaced = True
+        else:
+            out.append(ln)
+        i += 1
+    if not replaced:
+        out.append(b"Connection: close")
+    out.extend(lines[i:])  # terminator verbatim
+    return b"\r\n".join(out)
+
+
+def _grab_lane(relay, tried: set):
+    """Capacity-aware pick; waits rather than stacking one exit."""
+    deadline = time.time() + _LANE_WAIT
+    while True:
+        lane = relay.pick_lane(exclude=tried, max_active=_LANE_CAP)
+        if lane is not None:
+            return lane
+        if time.time() >= deadline:
+            return relay.pick_lane(exclude=tried)  # last resort
+        time.sleep(0.25)
+
+
 def handle_conn(raw: socket.socket, host: str, port: int, seq: int,
                 shop: CertShop, manager: TorManager,
                 emit: Callable[[Dict], None], relay) -> None:
     """Own one intercepted TLS connection end to end (blocking thread)."""
     try:
-        # The socket was dup'd from asyncio -- it arrives non-blocking.
+        # dup'd socket arrives non-blocking.
         raw.setblocking(True)
-        raw.settimeout(300)  # idle keep-alive ceiling between model calls
+        raw.settimeout(300)  # idle ceiling
         ctx = shop.context_for(host)
         client = ctx.wrap_socket(raw, server_side=True)
     except (ssl.SSLError, OSError):
@@ -166,8 +203,7 @@ def handle_conn(raw: socket.socket, host: str, port: int, seq: int,
     try:
         _serve(client, host, port, seq, manager, emit, relay)
     except (OSError, ssl.SSLError, TimeoutError):
-        # Idle keep-alive ceiling or a client that vanished mid-request --
-        # the connection is over either way, nothing to report.
+        # idle ceiling or vanished client.
         pass
     finally:
         try:
@@ -178,8 +214,7 @@ def handle_conn(raw: socket.socket, host: str, port: int, seq: int,
 
 def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
            manager: TorManager, emit: Callable[[Dict], None], relay) -> None:
-    """HTTP/1.1 keep-alive loop; one lane tunnel per request so consecutive
-    calls visibly rotate lanes."""
+    """Serve model calls on one client TLS connection; a lane per call."""
     cf = client.makefile("rb")
     call_n = 0
     while True:
@@ -217,9 +252,10 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
         held = b""
         tried = set()
         while True:
-            lane = relay.pick_lane(exclude=tried, ignore_busy=True)
+            # spread, never stampede.
+            lane = _grab_lane(relay, tried)
             if lane is None:
-                # Every lane just 429'd us: hand back the last one verbatim.
+                # nothing left: last body wins.
                 if held:
                     client.sendall(held)
                 else:
@@ -238,7 +274,7 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
             try:
                 err, status, held, retryable = _roundtrip(
                     client, lane, host, port, method, path, headers,
-                    body, emit, seq, call_n, t0)
+                    body, emit, seq, call_n, t0, relay)
             finally:
                 with lane.lock:
                     lane.active -= 1
@@ -259,15 +295,11 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
 
 def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                method: str, path: str, headers: dict, body: bytes,
-               emit, seq: int, call_n: int, t0: float
+               emit, seq: int, call_n: int, t0: float, relay: "object"
                ) -> "tuple[str, int, bytes, bool]":
-    """Returns (err, status, held, retryable). A 429 is fully buffered into
-    ``held`` instead of forwarded, so the caller can retry on a fresh lane;
-    ``retryable`` is True only when nothing reached the client yet."""
+    """One upstream attempt; 429s buffer into ``held`` for a lane retry."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Fresh circuits are slow to deliver their first bytes; a cold lane gets
-    # a long first-read budget, then the ceiling tightens to the steady
-    # per-read limit once the stream is provably alive.
+    # cold lane: long first-byte budget.
     sock.settimeout(_FIRST_BYTE_TIMEOUT)
     try:
         sock.connect(("127.0.0.1", lane.socks_port))
@@ -286,17 +318,29 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
 
     total = 0
     held = bytearray()
+    clean_end = False       # terminator seen
+    saw_content = False     # real output seen
+    saw_terminal = False    # terminal event seen
+    _tail = b""             # split-read guard
 
     def _send(data: bytes) -> None:
-        nonlocal total
+        nonlocal total, saw_content, saw_terminal, _tail
         total += len(data)
         if held is not None:
             held.extend(data)
-        else:
-            client.sendall(data)
+            return
+        # catch ghost streams.
+        window = _tail + data
+        saw_content = (saw_content or b"output_text.delta" in window
+                       or b"function_call" in window)
+        saw_terminal = (saw_terminal or b"response.completed" in window
+                        or b"response.incomplete" in window
+                        or b"response.failed" in window)
+        _tail = window[-64:]
+        client.sendall(data)
 
     try:
-        # Rebuild the request head; force identity-ish framing we understand.
+        # rebuild head, identity framing.
         out_head = f"{method} {path} HTTP/1.1\r\n".encode("latin1")
         skip = {"connection", "keep-alive", "proxy-authenticate",
                 "proxy-authorization", "te", "trailer", "transfer-encoding",
@@ -318,9 +362,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                   "lane": lane.index, "cc": lane.exit_country, "status": 0,
                   "kb": 0, "secs": round(time.time() - t0, 1), "err": err})
             return err, 0, b"", True
-        # Upstream answered: the circuit is alive, tighten the ceiling.
-        # (The raw sock's fd is owned by the SSL socket after wrap_socket,
-        # so the timeout lives on ``up`` from here on.)
+        # stream alive: tighten ceiling.
         up.settimeout(_READ_TIMEOUT)
         status = 0
         try:
@@ -334,11 +376,11 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                 rheaders[k.strip().lower()] = v.strip()
 
         if status != 429:
-            held = None  # stream straight to the client from here on
-        _send(rhead)
+            held = None  # stream to client now
+        _send(_force_connection_close(rhead))
 
         if b"chunked" in rheaders.get(b"transfer-encoding", b""):
-            # Stream chunk frames verbatim -- SSE flows through as it lands.
+            # forward frames verbatim.
             while True:
                 size_line = uf.readline()
                 if not size_line:
@@ -349,7 +391,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                 except ValueError:
                     break
                 if size == 0:
-                    # Trailer: header lines (usually none), then a bare CRLF.
+                    # trailer, then blank line.
                     while True:
                         tl = uf.readline()
                         if not tl:
@@ -357,8 +399,12 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                         _send(tl)
                         if tl in (b"\r\n", b"\n"):
                             break
+                    clean_end = True
                     break
-                _send(_read_exact(uf, size + 2))
+                chunk = _read_exact(uf, size + 2)
+                _send(chunk)
+                if len(chunk) < size + 2:
+                    break  # died mid-chunk
         elif b"content-length" in rheaders:
             remaining = int(rheaders[b"content-length"])
             while remaining > 0:
@@ -367,17 +413,30 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                     break
                 _send(chunk)
                 remaining -= len(chunk)
+            clean_end = remaining <= 0
         else:
             while True:
                 chunk = uf.read(65536)
                 if not chunk:
                     break
                 _send(chunk)
+            clean_end = True  # EOF is the end.
 
+        streamed = held is None
+        is_sse = b"text/event-stream" in rheaders.get(b"content-type", b"")
+        ghost = (status == 200 and streamed and is_sse
+                 and not saw_content and not saw_terminal)
         emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
               "lane": lane.index, "cc": lane.exit_country, "status": status,
               "kb": round(total / 1024, 1),
-              "secs": round(time.time() - t0, 1), "err": ""})
+              "secs": round(time.time() - t0, 1), "err": "",
+              "cut": not clean_end, "ghost": ghost})
+        if streamed and (ghost or not clean_end):
+            # poison: pull it.
+            relay.report_stall(
+                lane,
+                why=("kept serving empty streams" if ghost
+                     else "kept cutting streams mid-body"))
         return "", status, bytes(held or b""), False
     except (ssl.SSLError, OSError) as exc:
         err = f"{type(exc).__name__}"
@@ -385,7 +444,8 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
         emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
               "lane": lane.index, "cc": lane.exit_country, "status": 0,
               "kb": round(total / 1024, 1),
-              "secs": round(time.time() - t0, 1), "err": err})
+              "secs": round(time.time() - t0, 1), "err": err,
+              "cut": True})
         return err, 0, b"", retryable
     finally:
         try:

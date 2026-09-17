@@ -35,10 +35,9 @@ class Relay:
         self.port = port  # 0 = ask the OS; read .port after start()
         self._emit = event or (lambda e: None)
         self.dial_timeout = dial_timeout
-        #: Hold quietly instead of an instant 502, which OpenCode surfaces
-        #: loudly as "Cannot connect to API".
+        #: Hold, don't 502.
         self.wait_budget = float(
-            __import__("os").environ.get("LINGLING_LANE_WAIT", "60"))
+            __import__("os").environ.get("LINGLING_LANE_WAIT", "90"))
         self._server: Optional[asyncio.AbstractServer] = None
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -58,8 +57,7 @@ class Relay:
         return self.port
 
     def _run(self) -> None:
-        # Selector, not Proactor: Proactor's pending overlapped recv would
-        # eat the TLS ClientHello before the MITM thread's dup'd socket sees it.
+        # Selector loop: keeps the ClientHello reachable.
         if os.name == "nt":
             asyncio.set_event_loop_policy(
                 asyncio.WindowsSelectorEventLoopPolicy())
@@ -84,7 +82,7 @@ class Relay:
     def _shutdown(self) -> None:
         if self._server:
             self._server.close()
-        # Drop the loop on the next tick so close() can land first.
+        # stop next tick.
         self._loop.call_later(0.2, self._loop.stop)
 
     # -- MITM interception ---------------------------------------------------
@@ -98,16 +96,14 @@ class Relay:
     async def _handle_mitm(self, host: str, port: int, seq: int,
                            reader: asyncio.StreamReader,
                            writer: asyncio.StreamWriter) -> None:
-        """Answer 200, dup the socket (the transport owns its fd), close the
-        asyncio side, and hand the dup to a blocking MITM thread."""
+        """200, dup socket, hand it to a MITM thread."""
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
         transport_sock = writer.get_extra_info("socket")
         if transport_sock is None:
             writer.close()
             return
-        # Keep the loop from consuming TLS bytes before the MITM thread's
-        # dup'd socket can read them.
+        # pause loop reads.
         transport = writer.transport
         try:
             transport.pause_reading()
@@ -127,22 +123,22 @@ class Relay:
 
     # -- lane picking --------------------------------------------------------
     def pick_lane(self, exclude: Optional[set] = None,
-                  ignore_busy: bool = False) -> Optional[Lane]:
+                  max_active: int = 0) -> Optional[Lane]:
+        """Least-loaded healthy lane; ``max_active`` queues when saturated."""
         candidates: List[Lane] = [
             l for l in self.tor.healthy_lanes()
             if not exclude or l.index not in exclude
         ]
         if not candidates:
             return None
-        # Sticky-fastest: ride the lowest measured probe RTT until it burns
-        # or stalls out, then fall to the next fastest. Unmeasured lanes
-        # (probe_ms == 0) sort last among measured ones but still get handed
-        # out round-robin via last_used_at, so early traffic calibrates.
+        if max_active:
+            free = [l for l in candidates if l.active < max_active]
+            if not free:
+                return None  # saturated: caller waits
+            candidates = free
+
         def key(l: Lane):
             unmeasured = 1 if l.probe_ms <= 0 else 0
-            if ignore_busy:
-                return (unmeasured, l.probe_ms, l.last_used_at)
-            # Tunnels live for minutes: spread by load first, speed second.
             return (l.active, unmeasured, l.probe_ms, l.last_used_at)
 
         lane = min(candidates, key=key)
@@ -150,8 +146,7 @@ class Relay:
         return lane
 
     def report_burn(self, lane: Lane) -> None:
-        """A real request just got 429'd through this lane: park it now and
-        let the health daemon re-cook it from scratch."""
+        """429 here: park the lane, re-cook."""
         lane.healthy = False
         lane.burned_cycles += 1
         self._emit({
@@ -161,17 +156,16 @@ class Relay:
                    f"re-cooking it fresh",
         })
 
-    def report_stall(self, lane: Lane, hard: bool = False) -> None:
-        """A real request timed out or dropped through this lane. Stalls are
-        counted in a sliding window -- a lemon exit that alternates
-        stall/success/stall still gets pulled, and remembered. A ``hard``
-        stall (zero bytes delivered: dead exit, free retry) pulls at once."""
+    def report_stall(self, lane: Lane, hard: bool = False,
+                     why: str = "") -> None:
+        """Repeated stalls pull the lane; hard stalls pull at once."""
         if lane.note_stall() < 2 and not hard:
             return
         if not lane.healthy:
             return
         lane.healthy = False
-        why = "dead exit gave nothing" if hard else "kept stalling"
+        if not why:
+            why = "dead exit gave nothing" if hard else "kept stalling"
         self._emit({
             "type": "lane", "kind": "heal", "t": time.time(),
             "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
@@ -194,7 +188,7 @@ class Relay:
             writer.close()
             return
         if method.upper() != "CONNECT":
-            # Only tunnelling: plain-HTTP forwarding would mean cleartext.
+            # CONNECT only: cleartext stays out.
             try:
                 while True:
                     h = await asyncio.wait_for(reader.readline(), timeout=5)
@@ -252,12 +246,12 @@ class Relay:
                         "msg": f"lane {lane.index} couldn't reach {host} "
                                f"({err_note}) -- switching lanes",
                     })
-                    # A dial failure is a live signal the daemon hasn't seen.
+                    # live signal: park it.
                     lane.healthy = False
                     lane = None
             if lane is not None:
                 break
-            # Hold quietly and re-check rather than an instant 502.
+            # hold, don't 502.
             if time.time() >= deadline:
                 break
             if not held:
@@ -351,11 +345,7 @@ class Relay:
                     client_writer: asyncio.StreamWriter,
                     upstream_reader: asyncio.StreamReader,
                     upstream_writer: asyncio.StreamWriter) -> None:
-        """Shuttle bytes both ways until either side closes.
-
-        Requests inside the TLS tunnel are invisible, so we count bytes and
-        emit a periodic "still flowing" heartbeat (one CONNECT often carries
-        a whole opencode session) plus a close event with totals."""
+        """Shuttle bytes both ways until either side closes."""
         stats = {"up": 0, "down": 0}
         started = time.time()
 
