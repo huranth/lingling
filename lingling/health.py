@@ -11,6 +11,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from typing import Callable, Dict, Optional
 
 from . import netutil
@@ -33,6 +34,11 @@ _BURN_ESCALATE_AFTER = 3
 _SIDELINE_RECHECK_S = 60.0
 # Dead cycles before a lane is sidelined.
 _FAST_FAIL_CYCLES = 4
+# 429s across all lanes in the window that trip rest mode.
+_REST_TRIGGER = 4
+_REST_WINDOW_S = 300.0
+# Quiet minutes that drain the upstream window (LINGLING_REST_S).
+_REST_S = float(os.environ.get("LINGLING_REST_S", "120"))
 
 
 class HealthDaemon:
@@ -52,6 +58,8 @@ class HealthDaemon:
         self._thread: Optional[threading.Thread] = None
         self._warmup = True
         self._benchmarked = False
+        self._burn_times: deque = deque()
+        self._rest_until = 0.0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -162,6 +170,12 @@ class HealthDaemon:
         return "healthy"
 
     def check_once(self) -> None:
+        if time.time() < self._rest_until:
+            return  # rest mode: total silence drains the shared window
+        if self._rest_until:
+            self._rest_until = 0.0  # rest over: one canary probe first
+            if not self._canary():
+                return
         for lane in self.tor.lanes:
             if self._stop.is_set():
                 return
@@ -206,8 +220,42 @@ class HealthDaemon:
                 self._heal_dead(lane)
         self._warmup = False
 
+    def _note_burn(self, lane: Lane) -> None:
+        """Count a 429; trip rest mode when the wall is identity-wide."""
+        now = time.time()
+        self._burn_times.append(now)
+        while self._burn_times and self._burn_times[0] < now - _REST_WINDOW_S:
+            self._burn_times.popleft()
+        if len(self._burn_times) < _REST_TRIGGER:
+            return
+        self._burn_times.clear()
+        self._rest_until = now + _REST_S
+        for l in self.tor.lanes:
+            l.burned_cycles = 0
+        self._emit_lane(
+            lane, "rest",
+            f"429s on every lane -- this limit follows your identity, not "
+            f"the exits; resting {_REST_S:.0f}s so the window drains")
+
+    def _canary(self) -> bool:
+        """One probe after rest; False re-enters rest."""
+        lane = next((l for l in self.tor.lanes
+                     if not l.sidelined and not l.healing), None)
+        if lane is None:
+            return False
+        if self.probe_lane(lane) == "burned":
+            self._rest_until = time.time() + _REST_S
+            self._emit_lane(lane, "rest",
+                            f"still limited -- resting another {_REST_S:.0f}s")
+            return False
+        return True
+
     def _heal_burn(self, lane: Lane) -> None:
-        """429 from upstream: re-cook from scratch, rotating country on repeat burns."""
+        """429 from upstream: rest on storms, else re-cook on repeats."""
+        self._note_burn(lane)
+        if time.time() < self._rest_until:
+            lane.healthy = False
+            return
         lane.healing = True
         try:
             self._emit_lane(

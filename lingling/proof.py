@@ -98,7 +98,7 @@ def _render(ev: Dict) -> str:
     if ev.get("type") == "lane":
         kind = ev.get("kind", "")
         color = {"up": "32", "burn": "33", "rotate": "35", "heal": "33",
-                 "fail": "31", "sidelined": "31"}.get(kind, "37")
+                 "fail": "31", "sidelined": "31", "rest": "36"}.get(kind, "37")
         return f"{_c(ts, '90')}  {_c('*', color)} {_c(ev.get('msg', ''), color)}"
     return ""
 

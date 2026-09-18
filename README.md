@@ -59,6 +59,11 @@ out. The moment a lane comes back throttled:
    with rate limits;
 3. if the same lane keeps getting burned, it gets a new country too. A new
    personality, basically.
+4. when 429s stack up across **every** lane at once, the limit isn't the
+   exits -- it follows your contributor identity. Lingling calls a full
+   rest: probes, retries and re-cooks all stop for a couple of minutes
+   (`LINGLING_REST_S`), the window drains, and traffic resumes by itself.
+   Same effect as a restart, without losing your session.
 
 No cooldowns, no waiting: the moment a lane looks limited, it's dropped and
 a fresh one takes its place. Lanes that just fall over get poked, restarted,
