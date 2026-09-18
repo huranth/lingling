@@ -63,6 +63,7 @@ class Relay:
                 asyncio.WindowsSelectorEventLoopPolicy())
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        self._loop.set_exception_handler(self._quiet)
         self._loop.run_until_complete(self._serve())
         self._loop.run_forever()
 
@@ -85,6 +86,24 @@ class Relay:
         # stop next tick.
         self._loop.call_later(0.2, self._loop.stop)
 
+    @staticmethod
+    async def _answer(writer: asyncio.StreamWriter, head: bytes) -> bool:
+        """Write a proxy head; False if the client already vanished."""
+        try:
+            writer.write(head)
+            await writer.drain()
+            return True
+        except (ConnectionError, OSError):
+            writer.close()
+            return False
+
+    @staticmethod
+    def _quiet(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        """Clients abort tunnels constantly; that is not news."""
+        if isinstance(context.get("exception"), ConnectionError):
+            return
+        loop.default_exception_handler(context)
+
     # -- MITM interception ---------------------------------------------------
     def _should_mitm(self, host: str) -> bool:
         if self.cert_shop is None:
@@ -97,8 +116,9 @@ class Relay:
                            reader: asyncio.StreamReader,
                            writer: asyncio.StreamWriter) -> None:
         """200, dup socket, hand it to a MITM thread."""
-        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await writer.drain()
+        if not await self._answer(
+                writer, b"HTTP/1.1 200 Connection Established\r\n\r\n"):
+            return
         transport_sock = writer.get_extra_info("socket")
         if transport_sock is None:
             writer.close()
@@ -196,9 +216,8 @@ class Relay:
                         break
             except asyncio.TimeoutError:
                 pass
-            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\n"
-                         b"Content-Length: 0\r\n\r\n")
-            await writer.drain()
+            await self._answer(writer, b"HTTP/1.1 405 Method Not Allowed\r\n"
+                               b"Content-Length: 0\r\n\r\n")
             writer.close()
             return
 
@@ -265,9 +284,8 @@ class Relay:
             tried.clear()
             await asyncio.sleep(0.5)
         if lane is None or upstream_w is None or upstream_r is None:
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n"
-                         b"Content-Length: 0\r\n\r\n")
-            await writer.drain()
+            await self._answer(writer, b"HTTP/1.1 502 Bad Gateway\r\n"
+                               b"Content-Length: 0\r\n\r\n")
             writer.close()
             self._emit({
                 "type": "req", "t": time.time(), "n": seq, "lane": 0,
@@ -283,11 +301,12 @@ class Relay:
             "cc": lane.exit_country, "ip": lane.exit_ip,
             "target": f"{host}:{port}", "ok": True, "note": "",
         })
-        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await writer.drain()
+        answered = await self._answer(
+            writer, b"HTTP/1.1 200 Connection Established\r\n\r\n")
         try:
-            await self._pipe(seq, lane, reader, writer,
-                             upstream_r, upstream_w)
+            if answered:
+                await self._pipe(seq, lane, reader, writer,
+                                 upstream_r, upstream_w)
         finally:
             with lane.lock:
                 lane.active -= 1
