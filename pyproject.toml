@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lingling"
-version = "2.1.17"
-description = "Official OpenCode, but your requests ride rotating Tor exit lanes."
+version = "2.1.18"
+description = "OpenCode, but your requests ride rotating Tor exit lanes."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "LicenseRef-Lingling" }
