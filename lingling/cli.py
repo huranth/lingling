@@ -65,6 +65,7 @@ class _Loader:
         self._thread: threading.Thread | None = None
         self._detail: str = ""
         self._first: str = ""
+        self._t0 = time.time()
         self._lock = threading.Lock()
 
     def set(self, detail: str = "") -> None:
@@ -80,10 +81,17 @@ class _Loader:
     def start(self) -> None:
         if not sys.stdout.isatty():
             return
+        self._t0 = time.time()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
+        """
+        The percent only repaints when tor itself advances, so a five
+        second gap reads as a hang. The elapsed counter ticks every
+        second whether or not anything else changed -- motion that
+        proves the loop is alive, and the honest cost of the wait.
+        """
         tick = itertools.count()
         while not self._stop.is_set():
             t = next(tick)
@@ -92,7 +100,8 @@ class _Loader:
                 detail = self._detail
                 first = self._first
             msg = _c(detail or first or "starting", "38;5;114")
-            sys.stdout.write(f"\r\x1b[K {spin} {msg}")
+            secs = _c(f"{int(time.time() - self._t0)}s", "90")
+            sys.stdout.write(f"\r\x1b[K {spin} {msg} {secs}")
             sys.stdout.flush()
             time.sleep(0.09)
 
@@ -444,4 +453,9 @@ def _run_opencode(binary: str, args: list[str],
 
 
 def entry() -> None:
-    sys.exit(main(sys.argv[1:]))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        """A boot cut short is a choice, not a crash -- no traceback."""
+        print(_c(" Ctrl+C -- closing the kitchen.", "90"))
+        sys.exit(130)
