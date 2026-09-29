@@ -692,6 +692,10 @@ def main():
                   "verify_expect_header", "verify_short_body",
                   "verify_close_honoured", "verify_pool_ttl",
                   "verify_send_window", "verify_torrc",
+                  # a cold data dir must not turn the first boot into a
+                  # restart loop: the gate waits out a moving descriptor
+                  # download and escalates only on true silence
+                  "verify_cold_boot",
                   # the 503/504 session: a retryable verdict must reach the
                   # client whole, a 5xx must stop after two attempts, and the
                   # far end's error body must land on the callend

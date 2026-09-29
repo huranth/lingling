@@ -158,6 +158,76 @@ def _parse_args(argv: list[str]) -> dict:
     return opts
 
 
+def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
+               download_limit: float = 120, quick_limit: float = 30,
+               deep_limit: float = 90, deadline_s: float = 600) -> bool:
+    """Wait for the first lane, escalating only at genuine dead air.
+
+    A cold cache makes this gate different from a warm one: fetching the
+    relay descriptors takes minutes on a fresh install, and tor writes them
+    incrementally -- so a MOVING cache is progress, not a stall, and a
+    restart over it resets the download each cycle. That restart loop was
+    every fresh user's first boot before this gate could see what tor was
+    doing: the [circ,edge] sink never carried a percent, so a healthy
+    mid-download tor read as stuck at 0%.
+
+    Two evidence sources now feed it, both cheap:
+
+      * ``boot.log`` -- a plain-notice sink written by the lane config, and
+        the only place bootstrap percentages are visible at all;
+      * ``cache_mtime`` -- descriptor file mtimes, which move exactly while
+        tor is fetching. Log lines can be suppressed; a growing 36 MB cache
+        cannot.
+
+    Escalation holds off while either moves, and a tor that is silent in
+    BOTH is the only thing that gets poked. Returns True once the lane
+    answers, False when the deadline passed without one."""
+    deadline = time.time() + deadline_s
+    last_pct = -1
+    last_pct_at = time.time()
+    last_cache = manager.cache_mtime(first)
+    cache_moved = False
+    pokes = 0
+    while time.time() < deadline:
+        code = daemon.reachable(first)
+        if code == 429:
+            daemon.on_refused(first, code)
+        elif code:
+            first.healthy = True
+            return True
+        pct = manager.lane_bootstrap_pct(first)
+        cache_at = manager.cache_mtime(first)
+        if pct > last_pct:
+            last_pct = pct
+            last_pct_at = time.time()
+            loader.set(f"tor {pct}%")
+        elif cache_at > last_cache:
+            # downloading
+            last_cache = cache_at
+            cache_moved = True
+            last_pct_at = time.time()
+            loader.set("fetching the relay directory -- first start only")
+        # stuck checks
+        stall = time.time() - last_pct_at
+        limit = download_limit if (cache_moved and pct <= 10) else \
+            (quick_limit if pct <= 10 else deep_limit)
+        if pct == last_pct and stall > limit and pokes < 3:
+            pokes += 1
+            if pokes == 1 and pct <= 10:
+                loader.set("tor not responding -- restarting")
+                manager.restart_lane(first)
+            elif pokes <= 2 and (pct <= 10 or pokes == 1):
+                loader.set(f"tor stuck at {pct}% -- unpinning country")
+                manager.unpin_lane(first)
+            else:
+                loader.set("tor stuck -- re-cooking lane")
+                manager.regenerate_lane(first)
+            last_pct = -1
+            last_pct_at = time.time()
+        time.sleep(2)
+    return first.healthy is True
+
+
 def main(argv: list[str]) -> int:
     opts = _parse_args(argv)
 
@@ -240,43 +310,11 @@ def main(argv: list[str]) -> int:
                 # first lane
                 first = manager.lanes[0]
                 manager.start_lanes([first], on_lane=_report_boot)
+                if manager.cache_mtime(first) == 0.0:
+                    loader.set("first cold start -- fetching the relay "
+                               "directory")
 
-                # boot gate
-                deadline = time.time() + 600
-                last_pct = -1
-                last_pct_at = time.time()
-                pokes = 0
-                while time.time() < deadline:
-                    code = daemon.reachable(first)
-                    if code == 429:
-                        daemon.on_refused(first, code)
-                    elif code:
-                        first.healthy = True
-                        break
-                    pct = manager.lane_bootstrap_pct(first)
-                    if pct > last_pct:
-                        last_pct = pct
-                        last_pct_at = time.time()
-                        loader.set(f"tor {pct}%")
-                    # stuck signatures
-                    stall = time.time() - last_pct_at
-                    limit = 30 if pct <= 10 else 90
-                    if pct == last_pct and stall > limit and pokes < 3:
-                        pokes += 1
-                        if pokes == 1 and pct <= 10:
-                            loader.set("tor not responding -- restarting")
-                            manager.restart_lane(first)
-                        elif pokes <= 2 and (pct <= 10 or pokes == 1):
-                            loader.set(f"tor stuck at {pct}% -- "
-                                       "unpinning country")
-                            manager.unpin_lane(first)
-                        else:
-                            loader.set("tor stuck -- re-cooking lane")
-                            manager.regenerate_lane(first)
-                        last_pct = -1
-                        last_pct_at = time.time()
-                    time.sleep(2)
-                if first.healthy is not True:
+                if not _boot_gate(manager, first, daemon, loader):
                     loader.stop(_c(" !! the kitchen stayed cold -- "
                                    "going direct", "31"))
                     direct = True
