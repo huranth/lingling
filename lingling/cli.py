@@ -265,17 +265,49 @@ lingling uninstall -- wipe everything lingling put on disk
 
 Deletes lanes, tor.exe, the relay cache, MITM certs and proof logs.
 Keeps countries.txt (and its backups) so your lane pins survive.
+Refuses to run while tor or opencode are still alive -- half a boot
+is what leaves half-deleted files behind.
 The pip package itself is removed the usual way, afterwards:
 
     pip uninstall lingling
 """
 
 
+def _running_children() -> list:
+    """Lingling's helpers that lock the data dir, as (name, count)."""
+    if os.name != "nt":
+        return []
+    out = []
+    try:
+        raw = subprocess.run(
+            ["tasklist", "/fo", "csv", "/nh"], capture_output=True,
+            text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    import csv
+    import io
+    counts = {}
+    for row in csv.reader(io.StringIO(raw)):
+        if len(row) < 1:
+            continue
+        name = row[0].strip().strip('"').lower()
+        if name in ("tor.exe", "opencode.exe", "lingling.exe"):
+            counts[name] = counts.get(name, 0) + 1
+    return sorted(counts.items())
+
+
 def _uninstall(rest: list[str]) -> int:
-    """Wipe the lingling data dir, keeping the countries override."""
+    """Wipe the data dir cleanly: children stop first, then it deletes."""
     if "--help" in rest or "-h" in rest:
         print(UNINSTALL_HELP)
         return 0
+    running = _running_children()
+    if running:
+        listing = ", ".join(f"{n} x{c}" for n, c in running)
+        print(f"lingling is still running ({listing}).")
+        print("Close it first -- uninstalling mid-boot is what leaves "
+              "half-deleted tor files behind.")
+        return 1
     if not DATA_DIR.exists():
         print("nothing to remove -- no lingling data dir on this machine.")
         return 0
