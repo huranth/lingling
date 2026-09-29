@@ -17,15 +17,26 @@ _LOCK = threading.Lock()
 
 
 def make_emitter(path: Path):
-    """A thread-safe event sink appending JSON lines to ``path``."""
+    """A thread-safe event sink appending JSON lines to ``path``.
+
+    The file is opened once and flushed per event, instead of being reopened
+    for every event. Under a heavy burst the old version did thousands of
+    open/close cycles, all serialised behind one lock; flushing keeps the
+    proof pane just as live for a fraction of the syscalls.
+
+    The returned callable carries ``close``, because an open handle is a real
+    resource: the process would release it at exit, but a test that writes to
+    a temporary file cannot delete that file until it is closed."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a", encoding="utf-8")
 
     def emit(event: Dict) -> None:
-        line = json.dumps(event, ensure_ascii=False)
+        line = json.dumps(event, ensure_ascii=False) + "\n"
         with _LOCK:
-            with path.open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            handle.write(line)
+            handle.flush()
 
+    emit.close = handle.close
     return emit
 
 
@@ -35,8 +46,39 @@ def _c(text: str, code: str) -> str:
     return f"\x1b[{code}m{text}\x1b[0m"
 
 
+def _lat_bits(ev: Dict) -> str:
+    """Payload, then whichever latencies this call actually reached.
+
+    ``first_byte_s`` spans the lane's connect and TLS handshake, so it is
+    wall clock, not a server-only figure. Older events carry neither key."""
+    bits = [f"{ev.get('kb', 0)} KB in {ev.get('secs', 0)}s"]
+    if ev.get("first_byte_s"):
+        bits.append(f"first {ev['first_byte_s']}s")
+    if ev.get("first_event_s"):
+        bits.append(f"event {ev['first_event_s']}s")
+    if ev.get("reused"):
+        bits.append("reused tunnel")
+    return "  ".join(bits)
+
+
 def _render(ev: Dict) -> str:
+    """One proof-pane line for one event.
+
+    A 429 renders amber rather than red: the relay hands it straight to
+    another lane, and the far end's own retry-after names when that exit comes
+    back. Rendering it red made a working proxy look like a broken one.
+
+    A call that was CUT is not called a failure once a response has been
+    delivered. A 200 carrying part of a body is a truncated answer, and
+    labelling it "failed" made a served request look like a lost one -- which
+    is exactly how the owner read it. Only an attempt that never got a head is
+    "failed", and a timeout names WHICH SIDE stalled, so a client that stopped
+    reading is not mistaken for a slow lane."""
     ts = time.strftime("%H:%M:%S", time.localtime(ev.get("t", time.time())))
+    if ev.get("type") == "start":
+        cc = ",".join(ev.get("countries") or [])
+        return _c(f"--- session {ev.get('session', '?')} · "
+                  f"{ev.get('lanes', 0)} lanes · {cc}", "1;36")
     if ev.get("type") == "req":
         n = ev.get("n", 0)
         lane = ev.get("lane", 0)
@@ -66,22 +108,30 @@ def _render(ev: Dict) -> str:
         n = ev.get("n", 0)
         c = ev.get("c", 0)
         status = ev.get("status", 0)
-        kb = ev.get("kb", 0)
-        secs = ev.get("secs", 0)
         err = ev.get("err") or ""
         if err:
-            verdict = _c(f"failed ({err})", "31")
-        elif ev.get("ghost"):
-            verdict = (_c(str(status), "33")
-                       + _c(" GHOST -- stream ended with no content", "31"))
+            # served, cut
+            if status and (ev.get("kb") or 0) > 0:
+                verdict = _c(f"{status} cut ({err})", "31")
+            else:
+                verdict = _c(f"failed ({err})", "31")
+            if ev.get("stalled"):
+                verdict += _c(f" [{ev['stalled']} stalled]", "90")
+        elif status == 429:
+            mins = round((ev.get("retry_after") or 0) / 60)
+            note = (f" exit limited {mins}m -- moving lanes" if mins
+                    else " exit limited -- moving lanes")
+            verdict = _c("429", "33") + _c(note, "90")
         else:
             color = "32" if 200 <= status < 300 else "31"
             verdict = _c(str(status), color)
             if ev.get("cut"):
                 verdict += _c(" STREAM CUT mid-body", "31")
+            if status >= 400 and ev.get("note"):
+                verdict += _c(f"  {ev['note'][:80]}", "90")
         return (f"{_c(ts, '90')}    {_c('|', '90')} "
                 f"{_c(f'#{n}.{c}', '90')} {verdict} "
-                f"{_c(f'{kb} KB in {secs}s', '90')}")
+                f"{_c(_lat_bits(ev), '90')}")
     if ev.get("type") == "flow":
         # dim heartbeat.
         n = ev.get("n", 0)
@@ -97,8 +147,8 @@ def _render(ev: Dict) -> str:
                 f"{_c(f'tunnel #{n} closed -- {kb} KB over {span}', '90')}")
     if ev.get("type") == "lane":
         kind = ev.get("kind", "")
-        color = {"up": "32", "burn": "33", "rotate": "35", "heal": "33",
-                 "fail": "31", "sidelined": "31", "rest": "36"}.get(kind, "37")
+        color = {"up": "32", "limited": "33", "heal": "33",
+                 "fail": "31"}.get(kind, "37")
         return f"{_c(ts, '90')}  {_c('*', color)} {_c(ev.get('msg', ''), color)}"
     return ""
 
@@ -107,7 +157,7 @@ def tail(path: Path) -> int:
     print(_c("lingling lanes -- live proof", "1"))
     print(_c(f"tailing {path}", "90"))
     print(_c("every request below shows the exit lane it actually rode.\n", "90"))
-    # this session only.
+    # this session
     pos = path.stat().st_size if path.exists() else 0
     try:
         while True:
