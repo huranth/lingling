@@ -239,175 +239,27 @@ def _tor_present(data_dir: Path) -> bool:
         return False
 
 
-def _dir_size(path: Path) -> int:
-    """Total bytes under a path."""
-    total = 0
-    try:
-        for p in path.rglob("*"):
-            if p.is_file():
-                total += p.stat().st_size
-    except OSError:
-        pass
-    return total
-
-
-def _human(n: float) -> str:
-    """Bytes in human form."""
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} GB"
-
-
-UNINSTALL_HELP = """
-lingling uninstall -- wipe everything lingling put on disk
-
-Deletes lanes, tor.exe, the relay cache, MITM certs and proof logs.
-Keeps countries.txt (and its backups) so your lane pins survive.
-Refuses to run while tor or opencode are still alive -- half a boot
-is what leaves half-deleted files behind.
-The pip package itself is removed the usual way, afterwards:
-
-    pip uninstall lingling
-"""
-
-
-def _running_children() -> list:
-    """Lingling's helpers that lock the data dir, as (name, count)."""
+def _migrate_countries() -> None:
+    """One-time: pins from the old LOCALAPPDATA dir follow to the new one."""
     if os.name != "nt":
-        return []
-    """
-    This uninstaller is itself a lingling.exe, and so is the shim above
-    it -- count only *other* boots, by walking up the parent chain through
-    the process snapshot. One source of names, so nothing double counts.
-    """
-    import ctypes
-    import ctypes.wintypes as wt
-    TH32CS_SNAPPROCESS = 0x2
-
-    class _PENTRY(ctypes.Structure):
-        """The real PROCESSENTRY32, byte for byte."""
-        _fields_ = [("dwSize", wt.DWORD),
-                    ("cntUsage", wt.DWORD),
-                    ("th32ProcessID", wt.DWORD),
-                    ("th32DefaultHeapID", ctypes.c_size_t),
-                    ("th32ModuleID", wt.DWORD),
-                    ("cntThreads", wt.DWORD),
-                    ("th32ParentProcessID", wt.DWORD),
-                    ("pcPriClassBase", ctypes.c_long),
-                    ("dwFlags", wt.DWORD),
-                    ("szExeFile", ctypes.c_char * 260)]
-
-    k = ctypes.WinDLL("kernel32", use_last_error=True)
-    k.CreateToolhelp32Snapshot.restype = wt.HANDLE
-    k.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
-    k.Process32First.restype = wt.BOOL
-    k.Process32First.argtypes = [wt.HANDLE, ctypes.POINTER(_PENTRY)]
-    k.Process32Next.restype = wt.BOOL
-    k.Process32Next.argtypes = [wt.HANDLE, ctypes.POINTER(_PENTRY)]
-    k.CloseHandle.argtypes = [wt.HANDLE]
-    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    parents = {}
-    names = {}
-    if snap:
-        entry = _PENTRY()
-        entry.dwSize = ctypes.sizeof(_PENTRY)
-        if k.Process32First(snap, ctypes.byref(entry)):
-            while True:
-                parents[entry.th32ProcessID] = entry.th32ParentProcessID
-                names[entry.th32ProcessID] = (
-                    entry.szExeFile.decode("utf-8", "replace").lower())
-                if not k.Process32Next(snap, ctypes.byref(entry)):
-                    break
-        k.CloseHandle(snap)
-    mine = {os.getpid()}
-    pid = parents.get(os.getpid())
-    while pid and pid in parents and len(mine) < 8:
-        if names.get(pid, "").startswith("lingling"):
-            mine.add(pid)
-        pid = parents.get(pid)
-    counts = {}
-    for pid, name in names.items():
-        if pid in mine:
-            continue
-        if name in ("tor.exe", "opencode.exe", "lingling.exe"):
-            counts[name] = counts.get(name, 0) + 1
-    return sorted(counts.items())
-
-
-def _uninstall(rest: list[str]) -> int:
-    """Wipe the data dir cleanly: children stop first, then it deletes."""
-    if "--help" in rest or "-h" in rest:
-        print(UNINSTALL_HELP)
-        return 0
-    running = _running_children()
-    if running:
-        listing = ", ".join(f"{n} x{c}" for n, c in running)
-        print(f"lingling is still running ({listing}).")
-        print("Close it first -- uninstalling mid-boot is what leaves "
-              "half-deleted tor files behind.")
-        return 1
-    if not DATA_DIR.exists():
-        print("nothing to remove -- no lingling data dir on this machine.")
-        return 0
-    keep = {"countries.txt"}
-    keep |= {p.name for p in DATA_DIR.glob("countries.txt.bak-*")}
-    entries = []
-    for entry in sorted(DATA_DIR.iterdir()):
-        if entry.name in keep:
-            continue
-        size = entry.stat().st_size if entry.is_file() else _dir_size(entry)
-        entries.append((entry, size))
-    if not entries:
-        print("nothing to remove -- only the countries override is left.")
-        return 0
-    print("lingling uninstall -- this deletes:")
-    for entry, size in entries:
-        print(f"  {entry.name:<24} {_human(size):>10}")
-    total = sum(size for _, size in entries)
-    if "--yes" not in rest:
-        if not sys.stdin.isatty():
-            print("refusing to wipe without --yes in a non-interactive shell.")
-            return 1
+        return
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return
+    old = Path(base) / "lingling"
+    if old.resolve() == DATA_DIR.resolve():
+        return
+    src = old / "countries.txt"
+    dst = DATA_DIR / "countries.txt"
+    if src.exists() and not dst.exists():
         try:
-            answer = input(f"delete all of it ({_human(total)})? [y/N] ")
-        except EOFError:
-            # closed stdin
-            answer = ""
-        if answer.strip().lower() not in ("y", "yes"):
-            print("cancelled -- nothing was touched.")
-            return 1
-    freed = 0
-    stuck = []
-    for entry, size in entries:
-        try:
-            if entry.is_dir():
-                shutil.rmtree(entry)
-            else:
-                entry.unlink()
-            freed += size
-        except OSError:
-            stuck.append(entry.name)
-    print(f"wiped {_human(freed)}.")
-    left = [p.name for p in sorted(DATA_DIR.iterdir())]
-    if left:
-        print(f"kept: {', '.join(left)}")
-    if stuck:
-        print(f"could not delete (in use? close lingling and retry): "
-              f"{', '.join(stuck)}")
-    if not left:
-        try:
-            DATA_DIR.rmdir()
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(src.read_bytes())
         except OSError:
             pass
-    print("now remove the package itself:  pip uninstall lingling")
-    return 0
 
 
 def main(argv: list[str]) -> int:
-    if argv and argv[0] in ("uninstall", "--uninstall"):
-        return _uninstall(argv[1:])
     opts = _parse_args(argv)
 
     if opts["proof_tail"] is not None:
@@ -438,6 +290,7 @@ def main(argv: list[str]) -> int:
         print("Reinstall it:  pip install --force-reinstall cryptography")
         return 1
 
+    _migrate_countries()
     loader = _Loader()
     if _cache_is_cold(DATA_DIR):
         """
