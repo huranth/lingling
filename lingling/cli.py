@@ -147,7 +147,7 @@ def _parse_args(argv: list[str]) -> dict:
 def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
                download_limit: float = 120, quick_limit: float = 30,
                deep_limit: float = 90, deadline_s: float = 600) -> bool:
-    """Wait for the first lane, escalating only at genuine dead air."""
+    """Wait for the first lane: progress first, probe only when tor is done."""
     deadline = time.time() + deadline_s
     last_pct = -1
     last_pct_at = time.time()
@@ -155,12 +155,13 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
     cache_moved = False
     pokes = 0
     while time.time() < deadline:
-        code = daemon.reachable(first)
-        if code == 429:
-            daemon.on_refused(first, code)
-        elif code:
-            first.healthy = True
-            return True
+        """
+        Evidence before the probe. The exit probe blocks for its whole
+        window against a half-booted tor, and the old order ran it first --
+        so the screen froze on tor 0% while tor raced to 100% unobserved,
+        and a boot that was 17s from serving read as a hang. Progress is
+        read every sweep; the probe runs only at 100%, briefly.
+        """
         pct = manager.lane_bootstrap_pct(first)
         cache_at = manager.cache_mtime(first)
         if pct > last_pct:
@@ -173,13 +174,23 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
             cache_moved = True
             last_pct_at = time.time()
             loader.set("fetching the relay directory -- first start only")
-        elif pct >= 100:
+        if pct >= 100:
             loader.set("checking the exit")
+            code = daemon.reachable(first, probe_timeout=8)
+            if code == 429:
+                daemon.on_refused(first, code)
+            elif code:
+                first.healthy = True
+                return True
+        """
+        A dead exit at 100% escalates on the same ladder as a stalled
+        boot: the probe failing is silence too, just a slower one.
+        """
         # stuck checks
         stall = time.time() - last_pct_at
         limit = download_limit if (cache_moved and pct <= 10) else \
             (quick_limit if pct <= 10 else deep_limit)
-        if pct == last_pct and stall > limit and pokes < 3:
+        if stall > limit and pokes < 3:
             pokes += 1
             if pokes == 1 and pct <= 10:
                 loader.set("tor not responding -- restarting")

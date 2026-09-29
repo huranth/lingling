@@ -53,7 +53,7 @@ class FakeDaemon:
         self.good_at = good_at
         self.clock = None
 
-    def reachable(self, _lane):
+    def reachable(self, _lane, probe_timeout=None):
         if self.clock is not None and self.clock.now >= self.good_at:
             return 200
         return 0
@@ -65,10 +65,13 @@ class FakeDaemon:
 class FakeTor:
     """The manager surface the gate touches, with controllable evidence."""
 
-    def __init__(self, cache_at, mtime_fn=None):
+    def __init__(self, cache_at, mtime_fn=None, boot_pct=-1,
+                 pct_at=float("inf")):
         self.calls = []
         self.cache_at = cache_at
         self._mtime_fn = mtime_fn
+        self._pct = boot_pct
+        self._pct_at = pct_at
 
     def restart_lane(self, ln, repin=False):
         self.calls.append("restart")
@@ -83,9 +86,12 @@ class FakeTor:
         return True
 
     def lane_bootstrap_pct(self, ln):
-        return -1
+        return self._pct
 
     def cache_mtime(self, ln):
+        if self._pct_at is not None and self.clock is not None \
+                and self.clock.now >= self._pct_at:
+            self._pct = 100
         if self._mtime_fn is not None:
             return self._mtime_fn(ln)
         return self.cache_at
@@ -102,6 +108,7 @@ def fake_clock():
         yield clock
     finally:
         cli.time.time, cli.time.sleep = real_time, real_sleep
+    return clock
 
 
 def fresh_lane(tmp: Path) -> Lane:
@@ -159,6 +166,7 @@ def main():
     tmp = Path(_tf.mkdtemp(prefix="ll-coldmove-"))
     ln3 = fresh_lane(tmp)
     with fake_clock() as clock:
+        tor.clock = clock
         daemon.clock = clock
         ok = cli._boot_gate(tor, ln3, daemon, loader, deadline_s=600)
     print(f"  calls={tor.calls}  sim={clock.now - 1_000_000.0:.0f}s")
@@ -180,6 +188,7 @@ def main():
     tmp = Path(_tf.mkdtemp(prefix="ll-colddead-"))
     ln4 = fresh_lane(tmp)
     with fake_clock() as clock:
+        tor.clock = clock
         daemon.clock = clock
         cli._boot_gate(tor, ln4, daemon, loader, deadline_s=600)
     print(f"  calls={tor.calls}  sim={clock.now - 1_000_000.0:.0f}s")
@@ -191,19 +200,56 @@ def main():
           len(tor.calls) == 3, f"calls={tor.calls}")
 
     print("\n=== a long cold download that ENDS is a success, not a timeout ===")
-    moves = itertools.count(start=2)
-    tor = FakeTor(0.0, mtime_fn=lambda _ln: float(next(moves)))
+    tor = FakeTor(0.0, mtime_fn=lambda _ln: float(next(moves)),
+                  boot_pct=0, pct_at=1_000_000.0 + 190)
     daemon = FakeDaemon(good_at=1_000_000.0 + 200)
     loader = FakeLoader()
     tmp = Path(_tf.mkdtemp(prefix="ll-coldok-"))
     ln5 = fresh_lane(tmp)
     with fake_clock() as clock:
+        tor.clock = clock
         daemon.clock = clock
         ok = cli._boot_gate(tor, ln5, daemon, loader, deadline_s=600)
     print(f"  calls={tor.calls}  sim={clock.now - 1_000_000.0:.0f}s")
     check("the lane comes up and the gate says so", ok is True, f"ok={ok}")
     check("no pokes were spent on the download",
           tor.calls == [], f"calls={tor.calls}")
+
+    print("\n=== the screen never freezes while tor works: probe is last ===")
+    # The old gate probed FIRST, and the probe blocks ~15s against a
+    # half-booted tor -- so a lane that reached 100% in 18s sat behind a
+    # frozen 'tor 0%' for 17 more seconds and was Ctrl+C'd as a hang.
+    # The gate must read progress EVERY sweep and probe only at 100%.
+    tor = FakeTor(1_000_000.0, boot_pct=0, pct_at=1_000_000.0 + 18)
+    daemon = FakeDaemon(good_at=1_000_000.0 + 20)
+    loader = FakeLoader()
+    tmp = Path(_tf.mkdtemp(prefix="ll-coldfast-"))
+    ln6 = fresh_lane(tmp)
+    with fake_clock() as clock:
+        tor.clock = clock
+        daemon.clock = clock
+        ok = cli._boot_gate(tor, ln6, daemon, loader, deadline_s=600)
+    check("a lane that hits 100% at 18s serves by 20s",
+          ok is True and clock.now - 1_000_000.0 <= 26,
+          f"ok={ok} sim={clock.now - 1_000_000.0:.0f}s")
+
+    print("\n=== a dead exit at 100% still escalates, bounded ===")
+    tor = FakeTor(1_000_000.0, boot_pct=100)
+    daemon = FakeDaemon()
+    loader = FakeLoader()
+    tmp = Path(_tf.mkdtemp(prefix="ll-colddie-"))
+    ln7 = fresh_lane(tmp)
+    with fake_clock() as clock:
+        tor.clock = clock
+        daemon.clock = clock
+        cli._boot_gate(tor, ln7, daemon, loader, deadline_s=600)
+    print(f"  calls={tor.calls}")
+    # A bootstrapped lane with a dead exit should NOT be restarted -- a
+    # restart returns to the same exit. Rotation is the right first poke,
+    # so the 100% ladder starts at unpin, unlike the boot ladder.
+    check("the escalation ladder still fires at 100%",
+          len(tor.calls) == 3 and tor.calls[0] == "unpin",
+          f"calls={tor.calls}")
 
     print()
     if FAILS:

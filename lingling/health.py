@@ -83,7 +83,7 @@ class HealthDaemon:
                 self.log("health: cycle flamed out: %s", exc)
             self._stop.wait(self.check_interval)
 
-    def reachable(self, lane: Lane) -> int:
+    def reachable(self, lane: Lane, probe_timeout: float = PROBE_TIMEOUT) -> int:
         """One hand-rolled request through the lane: its HTTP status, or 0 if nothing came back."""
         if not netutil.port_is_open("127.0.0.1", lane.socks_port,
                                     timeout=netutil.PORT_CHECK_TIMEOUT):
@@ -93,13 +93,13 @@ class HealthDaemon:
             code, _ = netutil.https_via_socks(
                 lane.socks_port, UPSTREAM_HOST, "POST", PROBE_PATH,
                 UPSTREAM_UA, body=_scan_body(PROBE_MODEL, PROBE_PATH),
-                timeout=PROBE_TIMEOUT)
+                timeout=probe_timeout)
         except Exception:  # noqa: BLE001
             return 0
         try:
             c2, body = netutil.https_get_via_socks(
                 lane.socks_port, "check.torproject.org", "/api/ip",
-                UPSTREAM_UA, timeout=PROBE_TIMEOUT)
+                UPSTREAM_UA, timeout=probe_timeout)
             if c2 == 200:
                 obj = json.loads(body.decode("utf-8", "replace"))
                 if obj.get("IsTor") and obj.get("IP"):
