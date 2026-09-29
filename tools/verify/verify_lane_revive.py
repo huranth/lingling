@@ -1,25 +1,4 @@
-"""A lane that is down must be brought back, not skipped forever.
-
-Two permanent-death paths, both silent, both found in one soak that ran **all
-46 calls on lane 6**:
-
-  1. `check_once` skipped a lane with `process is None` outright. `_launch_lane`
-     leaves `process` None when a launch FAILS, so a lane whose tor never came
-     up was skipped on every sweep, for the whole session.
-  2. It then skipped any lane that was not `healthy`, BEFORE probing it -- so a
-     lane that had gone unhealthy could never be re-probed back to health.
-
-Neither state was reported anywhere in the log, and `start.lanes` still
-advertised the full pool. The owner would see one lane carrying everything and
-no explanation.
-
-`wanted` is what makes reviving safe: it is set when a lane is ASKED to run, so
-the daemon can tell "its launch failed" from "the CLI has not started it yet".
-Reviving the latter would race the CLI's own staggered boot.
-
-This fails on the old code: the down lane is never restarted and no event is
-emitted.
-"""
+"""A lane that is down must be brought back, not skipped forever."""
 import sys
 from pathlib import Path
 
@@ -103,11 +82,7 @@ def main():
     check("and nothing is reported about it", events == [], str(events))
 
     print("\n=== a lane that is MID-LAUNCH must not be restarted ===")
-    # `_launch_lane` sets healthy=False at the start and takes tens of seconds,
-    # so a daemon that only checks `healthy` kills the launch it is waiting on.
-    # `healing` is the flag for that, and it was declared and read by
-    # `healthy_lanes()` but never written -- inert, so nothing could tell
-    # "booting" from "broken". Found as a soak that brought up 3 of 6 lanes.
+    # `_launch_lane` sets healthy=False at the start and takes
     tor, events = drive([lane(5, process=FakeProc(alive=True), healthy=False,
                               wanted=True, healing=True)])
     print(f"  restarted={tor.restarted}  events={len(events)}")
@@ -122,10 +97,7 @@ def main():
     check("left alone", tor.restarted == [], f"restarted={tor.restarted}")
 
     print("\n=== orphaned tor processes are reaped before any lane launches ===")
-    # A tor that outlived its lingling holds its lane's DataDirectory, and the
-    # next launch dies with "another Tor process is running with the same data
-    # directory". Found with FIVE orphans alive and no lingling running: five of
-    # six lanes failed to boot and the pool quietly ran on one exit.
+    # A tor that outlived its lingling holds its
     from lingling import netutil
     from lingling.lanes import TorManager
 
@@ -140,10 +112,7 @@ def main():
     def fake_pids(ports):
         ports = list(ports)
         seen["asked"] = ports
-        # Only ports we were ASKED about. A real `pids_on_ports` parses one
-        # netstat and filters to the wanted set, so it cannot hand back an
-        # out-of-range port -- a first version of this fake returned one anyway
-        # and "proved" the reap touches ports it never asks about.
+        # Only ports we were ASKED about. A real
         want = set(ports)
         return {p: pid for p, pid in ((52003, 111), (9999, 222)) if p in want}
 
@@ -164,9 +133,7 @@ def main():
     check("it kills the leftover holding a lane port",
           killed == [111],
           f"killed={killed}")
-    # The scoping guarantee: it never even ASKS about a port outside the lane
-    # range, which is what makes it safe on a machine that also runs a Tor
-    # Browser. (`taskkill /IM tor.exe` was reverted for exactly this reason.)
+    # The scoping guarantee: it never even ASKS about
     lo = min(asked) if asked else 0
     hi = max(asked) if asked else 0
     check("and it only ever asks about ports in the lane range",
@@ -174,9 +141,7 @@ def main():
           f"asked about {lo}..{hi} -- outside the lane range")
 
     print("\n=== lane dirs for lanes the pool does not have are pruned ===")
-    # A lane dir is ~47 MB, almost all `cached-microdescs`. Nothing removed the
-    # dir of a lane that stopped being configured: measured 30 dirs / 1.4 GB
-    # for a pool of 5-6. Scoped hard, so it is checked hard.
+    # A lane dir is ~47 MB, almost all
     import tempfile
     from lingling.lanes import TorManager as _TM
 

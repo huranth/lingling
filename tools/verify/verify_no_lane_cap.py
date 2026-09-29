@@ -1,38 +1,4 @@
-"""The one rule the audit did not guard: no lane cap, ever.
-
-    python tools/verify/verify_no_lane_cap.py
-
-Why this exists. "Never invent a failure state for a healthy lane" is the
-owner's first rule, and it was guarded by REVIEW ONLY -- a re-added `_LANE_CAP`
-still passed `AUDIT CLEAN`. That is the same hole the window floors had: a
-decision that is load-bearing but has no test that fails when it is broken.
-
-What it pins, from `relay.pick_lane`:
-
-  * the signature takes only `self, exclude` -- no `max_active`, no cap
-    parameter, because a cap would need one to be configurable;
-  * no constant named like a cap (`_LANE_CAP`, `MAX_ACTIVE`, a quota);
-  * no comparison against `active` inside the picker, which is what a cap
-    actually looks like -- `if l.active >= _LANE_CAP: continue`;
-  * every healthy lane stays a candidate: the picker is a `min()` over all of
-    them, never a filtered subset.
-
-It reads the AST, not the text, and that is deliberate. Two false positives live
-in this codebase and a regex sweep hits both:
-
-  * `mitm._cap` / `_CAPTURE_MAX` are a CAPTURE BUFFER for cut dumps, not a
-    concurrency limit -- and `_cap` is the name a re-added cap would use;
-  * `relay.pick_lane`'s own docstring says "Holding a request while a healthy
-    lane sat idle was worse" -- the word is in prose describing why the cap is
-    gone. Comments and docstrings are not code.
-
-So the detector walks the AST and ignores string constants; both cases are
-pinned below as negative controls, so it cannot quietly start firing on them.
-
-Positive controls run in-process: synthetic sources that DO contain a cap must
-be detected. Without them this would be a guard that has never been shown to
-bite -- and one that has never bitten is not a guard.
-"""
+"""The one rule the audit did not guard: no lane cap, ever."""
 import ast
 import sys
 from pathlib import Path
@@ -69,9 +35,7 @@ def _soft_cap_name(name: str) -> bool:
 
 
 def _numeric(node) -> bool:
-    """A cap is a NUMBER. `_cap = bytearray()` is a buffer, and that is the
-    discriminator -- the buffer's name does not contain `capture`, so a
-    name-only rule flags it and the negative control catches it."""
+    """A cap is a NUMBER."""
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
             and not isinstance(node.value, bool):
         return True
@@ -105,7 +69,7 @@ def findings(src: str):
             if any(_is_cap_name(n) for n in names):
                 out.append(f"pick_lane takes a cap parameter {names}")
             for n in ast.walk(node):
-                # `if l.active >= X` -- what a cap looks like in code
+                # `if l.active >= X` -- what a cap
                 if isinstance(n, ast.Compare):
                     left = n.left
                     if isinstance(left, ast.Attribute) and left.attr == "active":

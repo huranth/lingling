@@ -1,26 +1,4 @@
-"""Score every session in proof.log: attempts, calls, failures by class.
-
-`start` is the authority for who was driving -- `version` is `soak` for my
-harness and `2.1.20.postN` for the owner. Nothing here trusts a guess about
-whose traffic a line belongs to.
-
-It reports the three things that decide whether the relay is working, because
-each has been the subject of a wrong conclusion drawn from a partial view:
-
-    reuse%   the latency story. 0% means every request pays the dial, and the
-             cause is the pool TTL against the same-lane lap -- so a session
-             whose laps are longer than `LINGLING_KEEPALIVE_S` will show 0%
-             however healthy the lanes are.
-    sendmax  the biggest `send_s` seen, against the shipped `_SEND_TIMEOUT`.
-             A ceiling is only a problem when the successes approach it, so
-             this column is the one that says whether the window is marginal.
-             Do NOT read `max_wait_s` for this -- it covers the reads too and
-             reaches 257s on this log, which is what argued a correct fix back
-             down to the value that was cutting uploads.
-    t.o      TimeoutError attempts, and how many arrived with zero bytes.
-
-Usage:  python tools/soak/score_session.py [--session 40a10351b2f9]
-"""
+"""Score every session in proof.log: attempts, calls, failures by class."""
 
 from __future__ import annotations
 
@@ -67,15 +45,7 @@ def sessions(evs: list) -> list:
 
 
 def requests(evs: list, lo: float, hi: float) -> dict:
-    """Group callends into requests. A request is (n, c); its outcome is last.
-
-    The `host` annotation is looked up INSIDE the same window as the callends.
-    It used to be built from the whole log keyed by `(n, c, lane)` -- and those
-    repeat across sessions, so it annotated a session's calls with the LAST
-    session's host. Harmless today only because every model call has the same
-    host; it is the same shape of join that once invented "45 403s on
-    /zen/v1/responses" out of nothing, so it is scoped now.
-    """
+    """Group callends into requests."""
     host = {}
     for e in evs:
         if e.get("type") == "call" and lo <= e["t"] < hi:
@@ -99,18 +69,7 @@ DIAL = ("timed out", "ConnectionRefusedError")
 
 
 def is_dial(e: dict) -> bool:
-    """True when the attempt never got a stream -- the circuit build failed.
-
-    `'timed out'` is the string `socks5_open` returns; `ConnectionRefusedError`
-    is the lane's SOCKS port refusing. Neither says anything about the model.
-
-    Worth its own column because these are INVISIBLE to the country scorer:
-    `note_result` counts only 200 and 429, so a country whose dials fail 8.7%
-    of the time looks exactly like one that fails 0.2%. Measured over the whole
-    log, that gap is real -- nl 59/679 = 8.7% against de 4/833 = 0.5%, at
-    2/607 = 0.3%, us 1/456 = 0.2% -- and it is concentrated in single exits
-    (nl 192.42.116.13 failed 15 of its 20 calls).
-    """
+    """True when the attempt never got a stream -- the circuit build failed."""
     return (e.get("err") or "").split(":")[-1].strip() in DIAL
 
 
@@ -145,8 +104,7 @@ def main() -> int:
                    if a.get("err") == "TimeoutError" and a.get("kb") == 0)
         bad = collections.Counter(label(a) for a in fin
                                   if label(a) != "200")
-        # reuse and the send window: the two numbers that decide latency, and
-        # whether the upload ceiling is marginal. Neither is in the pane.
+        # reuse and the send window: the two numbers
         ru = sum(1 for a in att if a.get("reused"))
         smax = max((a.get("send_s") or 0) for a in att) if att else 0
         dial = sum(1 for a in att if is_dial(a))
@@ -213,11 +171,7 @@ def show(s: dict, evs: list, end: float) -> None:
             continue
         print(f"    n={k[0]} c={k[1]}  host={v[-1].get('_host')}")
         for a in v:
-            # `client_kb` is the field that answers whether a `200 cut
-            # (SSLEOFError) [client stalled]` lost anything: equal to `kb`
-            # means the client received everything the far end sent. It is
-            # only printed when the callend carries it, so older lines are
-            # unchanged.
+            # `client_kb` is the field that answers whether a
             extra = ""
             if a.get("reused"):
                 extra += " reused"

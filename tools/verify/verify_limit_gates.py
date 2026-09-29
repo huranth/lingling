@@ -1,17 +1,4 @@
-"""Offline proof of the only two things allowed to move a lane. No network, no
-tor, and no fake clock -- there is nothing left to sweep.
-
-Run against whichever install is live:
-
-    python tools/verify/verify_limit_gates.py
-
-A lane may be moved by the far end's own words (a 429 or a 403), or restarted
-because its tor process has exited. Those are the two facts. Everything this
-codebase used to do on top -- probe verdicts, stall strikes, first-strike
-pulls, sidelining, revival ladders, benchmarking -- was inference about exits
-we had never measured, and it retired healthy ones. Five accused exits were
-re-tested with a raw request: not one answered 429 or 403.
-"""
+"""Offline proof of the only two things allowed to move a lane."""
 import asyncio
 import inspect
 import io
@@ -51,10 +38,7 @@ class FakeTor:
     """Lanes with a controllable process, and a record of what was asked."""
 
     def __init__(self, n=6):
-        # `wanted=True` because these lanes are meant to be RUNNING: the health
-        # daemon now leaves a lane alone until something has asked for it, which
-        # is what stops it racing the CLI's staggered boot. A test lane that
-        # never says it is wanted is a lane nobody asked for.
+        # `wanted=True` because these lanes are meant to be
         self.lanes = [
             Lane(index=i, socks_port=52000 + i, control_port=52300 + i,
                  exit_country="xx", data_dir=Path("."),
@@ -100,8 +84,7 @@ def daemon(n=6):
 
 
 print("\n=== A. a real 429 moves that one lane to a fresh exit ===")
-# A 429 is the far end's own words about one exit IP, so it is the strongest
-# evidence there is. No confirm gate, no second opinion.
+# A 429 is the far end's own words
 tor, _d, ev = daemon()
 Relay(tor).report_refused(tor.lanes[0], 429)
 check("the exit is scored", tor.notes == [("xx", 429)], str(tor.notes))
@@ -118,40 +101,30 @@ check("the message names the new country",
       str([e.get("msg") for e in ev]))
 
 print("\n=== B. a 403 moves nothing ===")
-# The free tier gates on the CLIENT: a hand-rolled request gets
-# `403 FreeTierError "can only be used from within OpenCode"` whatever headers
-# it sends, and lingling's own --demo and probes are hand-rolled. Real opencode
-# never sees it -- measured, driving the real binary: 8 runs, only 429, no 403.
-# Re-pinning a lane cannot fix a client gate, so 403 is not retried at all.
+# The free tier gates on the CLIENT: a
 check("403 is not retryable", 403 not in mitm._RETRYABLE)
 check("429 is retryable", 429 in mitm._RETRYABLE)
 check("there is no second refusal set", not hasattr(mitm, "_REFUSED"))
-# The heading above promises this and it was never checked, which is how a 403
-# came to be rotating and restarting lanes. `on_refused` now returns on
-# anything but a 429, so a 403 must move nothing.
+# The heading above promises this and it was
 tor, _d, _ev = daemon()
 Relay(tor).report_refused(tor.lanes[0], 403)
 check("a 403 moves nothing", not tor.restarted and not tor.rotated,
       f"restarted={tor.restarted} rotated={tor.rotated}")
 
 print("\n=== C. a lane whose tor has exited is restarted ===")
-# A process fact, not a judgement about the exit.
+# A process fact, not a judgement about the
 tor, d, ev = daemon()
 tor.lanes[1].process = FakeProc(code=1)
 d.check_once()
 check("the dead lane is restarted", tor.restarted == [2], str(tor.restarted))
-# Check the EVENT, not its wording. This asserted `"went down" in msg` and so
-# broke the moment the message was reworded to cover a lane whose launch failed
-# (which has not "gone down", it never came up). The intent is "the pane is
-# told", so measure that.
+# Check the EVENT, not its wording. This asserted
 check("and it says so",
       any(e.get("type") == "lane" and e.get("kind") == "up"
           and e.get("lane") == 2 for e in ev),
       str([e.get("msg") for e in ev]))
 
 print("\n=== D. a lane already asked is left alone ===")
-# No periodic probing: a lane is asked once, for its exit IP, and then not
-# again. Only the far end's refusal or its tor exiting moves it.
+# No periodic probing: a lane is asked once,
 tor, d, ev = daemon()
 for _l in tor.lanes:
     _l.asked = True
@@ -204,9 +177,7 @@ async def _unreachable(lane, host, port):
 
 
 print("\n=== E. a failed dial retires nothing ===")
-# The plain-CONNECT path carries everything that is not an LLM API host --
-# github, npm, the search MCPs. It used to mark a lane dead the moment a dial
-# raised, so one transient failure to one host pulled a healthy lane.
+# The plain-CONNECT path carries everything that is not
 tor, d, ev = daemon()
 relay = Relay(tor, event=ev.append)
 relay.wait_budget = 0.05  # do not sit in the retry loop for 90s
@@ -223,8 +194,7 @@ check("nothing is re-cooked", tor.restarted == [], str(tor.restarted))
 check("the client still gets an answer", b"502" in w.got, repr(w.got[:24]))
 
 print("\n=== F. there is no concurrency cap ===")
-# Holding traffic while a healthy lane sat idle, and describing our own limit
-# as the lane being "at cap", was withdrawn. A loaded lane still carries.
+# Holding traffic while a healthy lane sat idle,
 tor, _d, _e = daemon()
 for _l in tor.lanes:
     _l.active = 5

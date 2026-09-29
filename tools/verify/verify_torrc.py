@@ -1,26 +1,4 @@
-"""The generated torrc must actually parse, or every lane silently dies.
-
-    python tools/verify/verify_torrc.py
-
-Why this exists. `_lane_config` grew four directives and changed one
-(`SocksPort ... IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth`, `SocksTimeout`,
-`CircuitStreamTimeout`, `KeepalivePeriod`, `ConnectionPadding`, and a new
-`Log` domain). Every offline suite passed, and the whole audit reported clean --
-because none of them ever asks Tor whether the file it is handed is legal.
-
-It was not. `Log [circ,stream]notice` names a logging domain that does not
-exist ("No such logging domain as stream"), Tor refuses the config, exits
-before writing a single line, and the lane never listens. `tor.log` was 0
-bytes and the failure surfaced only as "the lane never listened" four minutes
-later.
-
-The domains Tor actually accepts are general, circ, or, edge, dir, entry and
-bug -- stream-level events are under `edge`. `edge` is what this pins.
-
-Skipped, not failed, when tor is not present: this is a config check, and a
-machine without the bundle cannot run it. The audit's other suites still cover
-everything else.
-"""
+"""The generated torrc must actually parse, or every lane silently dies."""
 import pathlib
 import subprocess
 import sys

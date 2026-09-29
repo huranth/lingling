@@ -1,17 +1,4 @@
-"""Ship check: does a real boot produce distinct, fresh, working exits?
-
-Everything else is verified offline. This boots the lanes for real and checks
-the three claims the mechanism now makes:
-
-  1. every lane is pinned to its OWN relay, and no two share one;
-  2. every exit is one we have not used lately (freshness is remembered);
-  3. each lane actually comes up on the exit it was pinned to.
-
-Costs no model quota -- it only fetches an IP echo through each lane. The
-lanes are stopped again at the end so a later run is not blocked on ports.
-
-    python ship_check.py
-"""
+"""Ship check: does a real boot produce distinct, fresh, working exits?"""
 import json
 import socket
 import ssl

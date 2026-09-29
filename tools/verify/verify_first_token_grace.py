@@ -1,26 +1,4 @@
-"""Why a late first token does NOT count as a timeout -- and when it does.
-
-The owner saw a lane produce its first token at 25s and asked why that was
-not a timeout. The answer is one property of the socket:
-
-  **A socket timeout is PER BLOCKING READ, not a total budget.**
-
-`up.settimeout(_READ_TIMEOUT)` (20s) is armed once, after the request is
-written. Every subsequent blocking read then gets its own fresh 20s. So the
-ceiling means "this long with *nothing* coming", not "this long for the whole
-call". A stream that keeps arriving -- however slowly -- is never cut off,
-and the total may run to minutes. That is why the log holds calls with
-`first_byte_s = 34.8` and `status = 200`.
-
-The 25s the owner saw was therefore a stream whose BYTES kept arriving while
-the first model EVENT was late. That is not silence, and not a timeout.
-
-The only thing that trips the ceiling is a single gap longer than it -- which
-is what a genuinely dead lane looks like, and also what a mid-answer stall
-looks like.
-
-This drives the shipped `_read_head` and `_roundtrip` against real sockets.
-"""
+"""Why a late first token does NOT count as a timeout -- and when it does."""
 import socket
 import ssl
 import sys
@@ -61,13 +39,7 @@ def quiet(schedule):
 
 
 def start_upstream(schedule):
-    """A SOCKS5-speaking upstream that runs `schedule` once connected.
-
-    `_roundtrip` dials lane.socks_port itself and only then calls
-    socks5_open, so the fake must answer the greeting and the CONNECT
-    reply -- it must not dial anything of its own, or the connect fails
-    with WinError 10056 and looks like a mystery OSError at 0.0s.
-    """
+    """A SOCKS5-speaking upstream that runs `schedule` once connected."""
     holder = []
     ready = threading.Event()
 
@@ -131,11 +103,7 @@ def drip_server(gaps):
 
 
 def read_head_direct(gaps, ceiling):
-    """Read exactly as many bytes as the server drips, one read each.
-
-    The socket is armed ONCE and nothing re-arms it. If the total can
-    still exceed the ceiling, the timeout is per read, not cumulative.
-    """
+    """Read exactly as many bytes as the server drips, one read each."""
     port = drip_server(gaps)
     s = socket.create_connection(("127.0.0.1", port))
     s.settimeout(ceiling)
@@ -215,11 +183,7 @@ def run(port, ceiling=20.0, first_byte=30.0):
 
 
 def case_head_trickles(c):
-    """The head trickles in over 9s, well past the 5s ceiling used here.
-
-    Every byte arrives sooner than the ceiling apart, so no single read
-    ever waits too long -- and the total sails past the ceiling.
-    """
+    """The head trickles in over 9s, well past the 5s ceiling used here."""
     socks_hello(c)
     for i in range(len(HEAD)):
         c.sendall(HEAD[i:i + 1])
@@ -229,10 +193,7 @@ def case_head_trickles(c):
 
 
 def case_event_late(c):
-    """Head at once, then a gap longer than the ceiling before event one.
-
-    One uninterrupted silence, so a single read exceeds the ceiling.
-    """
+    """Head at once, then a gap longer than the ceiling before event one."""
     socks_hello(c)
     c.sendall(HEAD)
     time.sleep(9.0)
@@ -253,7 +214,7 @@ def case_connect_silent(c):
 
 
 def main():
-    # Short windows so the proof runs in seconds; the ratio is what matters.
+    # Short windows so the proof runs in seconds;
     ceiling, first_byte = 5.0, 8.0
 
     print("=== (A0) per-read, not cumulative: 6 bytes 1.5s apart, "

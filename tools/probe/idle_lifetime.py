@@ -1,30 +1,4 @@
-"""How long does a pooled tunnel actually live? Ask the far end.
-
-    python tools/probe/idle_lifetime.py [seconds] [step]
-
-`_KEEPALIVE_S` is 600s, and that number was set from the OWNER's same-lane lap
-(median 70.2s, p75 150s, min 98.8s in the session that ran at 0% reuse). What
-it assumes is that a tunnel idle for that long is still usable.
-
-That assumption has never been tested. The pool's only guard is `_peer_closed`,
-a zero-timeout `select`, and the far end is free to drop an idle keep-alive
-connection whenever it likes -- nginx defaults to 75s, many CDNs to 60s. **If
-the far end hangs up sooner than the TTL, the TTL is not the binding constraint
-and raising it further buys nothing.**
-
-This measures it directly. It pools one tunnel from a real lane, then every
-`step` seconds asks the pool for it back:
-
-    take() is None  -> the far end had closed it; that is the answer
-    take() is a socket -> still alive; give() it back and wait again
-
-`give()` re-stamps the entry, so the TTL clock resets on every step and what
-this measures is the FAR END's patience, not ours. Note that: a run that says
-"still usable at 300s" is a statement about the peer, not about `_KEEPALIVE_S`.
-
-Costs no model quota. A hand-rolled request is refused by the free-tier gate,
-and a 403 is still a framed response, so it pools exactly like a real one.
-"""
+"""How long does a pooled tunnel actually live?"""
 import sys
 import time
 from pathlib import Path
@@ -87,11 +61,7 @@ def main():
         sink = Sink()
         mitm._roundtrip(
             Discard(), lane, HOST, 443, "POST", PROBE_PATH,
-            # Both of these are REQUIRED, and omitting either gets a 400 with
-            # `connection: close`, so nothing pools and there is nothing to
-            # measure. `_roundtrip` rebuilds the head from whatever the client
-            # sent and does not invent a `Host` -- HTTP/1.1 wants one -- and the
-            # far end answers 400 without the UA too. Two wasted runs.
+            # Both of these are REQUIRED, and omitting either
             {"host": HOST, "content-type": "application/json",
              "user-agent": UPSTREAM_UA},
             _scan_body(PROBE_MODEL, PROBE_PATH),

@@ -1,6 +1,4 @@
-"""Local rotating CONNECT relay in front of OpenCode: picks the least-loaded
-healthy lane, tunnels each CONNECT through its tor.exe SOCKS5, and pipes
-bytes blindly (end-to-end TLS -- the health daemon detects 429s instead)."""
+"""Local rotating CONNECT relay in front of OpenCode: picks the least-loaded healthy lane, tunnels ..."""
 
 from __future__ import annotations
 
@@ -56,13 +54,7 @@ class Relay:
         self._live_lock = threading.Lock()
 
     def _slot_enter(self) -> bool:
-        """Take a connection slot. False means we are at the cap.
-
-        The count is tracked beside the semaphore because a
-        ``BoundedSemaphore`` cannot report it, and "we are at the cap" without
-        the number is what made the original 503s undiagnosable: a slot held
-        by a connection that never finished looks identical to a genuine
-        burst."""
+        """Take a connection slot."""
         if not self._slots.acquire(blocking=False):
             return False
         with self._live_lock:
@@ -196,42 +188,13 @@ class Relay:
 
     # lane picking
     def any_unlimited(self, exclude: set) -> bool:
-        """True when some lane we have not tried can still serve.
-
-        A 429 retires one exit, so retrying elsewhere is right -- until every
-        remaining lane is limited too. Then one more attempt is a guaranteed 429
-        and pure amplification. Measured over the log, and the two traffic
-        classes differ sharply: the owner runs 668 attempts for 605 requests --
-        1.10 each, with only 4% landing on an exit that had already refused.
-        The soak harness, which fires bursts on purpose, runs 1.28 each with
-        54% already refused. So the amplification this guards against is real
-        but is a burst artefact, not normal traffic. A restarted lane has its
-        deadline cleared, so a lane that is still cooking counts as available."""
+        """True when some lane we have not tried can still serve."""
         now = time.time()
         return any(l.index not in exclude and l.limited_until <= now
                    for l in self.tor.lanes)
 
     def pick_lane(self, exclude: Optional[set] = None) -> Optional[Lane]:
-        """The least-loaded healthy lane, so a burst diverges evenly.
-
-        ``active`` -- how many requests the lane is carrying right now -- is
-        the first thing compared. That is the whole point: traffic spreads
-        across the pool instead of stacking on one exit, and every healthy
-        lane is forced to carry its share.
-
-        There is deliberately no concurrency cap. A lane already carrying
-        traffic still carries more. Holding a request while a healthy lane sat
-        idle was worse than the load it was trying to avoid, and describing our
-        own limit as the lane being "at cap" was simply untrue.
-
-        The soft signals only break ties between equally-loaded lanes. A lane
-        the far end has limited (429 with an hours-long `retry-after`) is a
-        guaranteed 429, and a country that has been losing is the weaker bet.
-        Neither is ever excluded -- the pool must not deadlock, and a 429 beats
-        a stall. The older concentrated picker left the pool as good as one
-        lane running at 4%; with this one, measured over the log, the owner's
-        five lanes carry 22/19/17/22/20 percent and the soak's six carry
-        20/19/19/15/16/11 -- as even as assignment can be."""
+        """The least-loaded healthy lane, so a burst diverges evenly."""
         candidates: List[Lane] = [
             l for l in self.tor.healthy_lanes()
             if not exclude or l.index not in exclude
@@ -258,10 +221,7 @@ class Relay:
         return lane
 
     def report_refused(self, lane: Lane, status: int) -> None:
-        """403 or 429 -- the far end refused this exit.
-
-        Hand it to the health daemon, which owns the re-pin, so the exit that
-        carried the request is the one charged for it."""
+        """403 or 429 -- the far end refused this exit."""
         # score it
         self.tor.note_result(lane.exit_country, status)
         if self.tor.limit_hook is not None:
@@ -403,11 +363,7 @@ class Relay:
     async def _dial(self, lane: Lane, host: str, port: int,
                     cred: Optional[tuple] = None
                     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """SOCKS5 CONNECT to (host, port) through the lane; atyp=0x03 so DNS
-        resolves at the exit -- the exit IP must be the lane's, not ours.
-
-        ``cred`` asks for username/password auth, which is what gives a lane
-        more than one circuit: Tor isolates on the SOCKS username."""
+        """SOCKS5 CONNECT to (host, port) through the lane; atyp=0x03 so DNS resolves at the exit -- the exit ..."""
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection("127.0.0.1", lane.socks_port),
             timeout=self.dial_timeout)

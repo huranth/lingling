@@ -1,32 +1,4 @@
-"""Which shipped value is actually guarded? Break each one and watch.
-
-    python tools/verify/sweep_guards.py
-
-Why this exists. `verify_audit.py` runs its suites as subprocesses with captured
-output, so a clean run shows no banner and says nothing about what ran. Asked
-"is the 120s send window protected?", grepping the output suggested NO -- the
-suite is in the tuple, its banner is simply swallowed. The only way to know a
-guard is live is to break the value and watch it fail.
-
-So this does that, for every env-overridable constant, against the suites that
-could plausibly notice. The interesting rows are the ones where NOTHING fails:
-a value with no guard, or a guard that passes both ways, which by this
-project's own rule is not a guard at all.
-
-Two mechanisms, because they answer differently:
-
-  * a suite that reads the LIVE module value (`mitm._SEND_TIMEOUT`) sees the
-    override and can fail on it -- a real guard on the shipped value;
-  * a suite that PINS its own window (the convention, to stop hangs) cannot
-    see the override at all, so it tests the mechanism while the shipped
-    default goes unguarded.
-
-Both are correct for the suite. Only the first protects the number.
-
-Run each suite only where it can notice, and print as it goes: the first
-version ran 9 suites per mutation and printed nothing until each row finished,
-so one slow suite looked like a hang and told me nothing for eight minutes.
-"""
+"""Which shipped value is actually guarded?"""
 import os
 import subprocess
 import sys
@@ -36,10 +8,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 VERIFY = ROOT / "tools" / "verify"
 #: 45s produced FALSE "HUNG" verdicts on `first_token_grace` and
-#: `idle_ceiling`, which are slow by design (they let a simulated stream run
-#: past a ceiling), and that silently turned three guarded values into
-#: "UNGUARDED". The audit allows 240s; use the same here, or the instrument
-#: reports its own timeout as a finding.
 TIMEOUT = 240
 
 #: shipped default -> a value that would be wrong -> the suites that could see it
@@ -52,8 +20,7 @@ MUTATIONS = (
      ("send_window", "reused_send")),
     ({"LINGLING_KEEPALIVE_S": "30"}, "KEEPALIVE 600->30 (below his 70s lap)",
      ("pool_ttl",)),
-    # `window_floors` is the only one of these that reads the LIVE value; the
-    # pinning suites are kept as witnesses that the mechanism still passes
+    # `window_floors` is the only one of these that
     ({"LINGLING_FIRST_BYTE_S": "2"}, "FIRST_BYTE 30->2",
      ("first_token_grace", "cold_connect", "committed_stream",
       "window_floors")),
@@ -84,9 +51,7 @@ def run(suite, env):
 
 
 def main():
-    # a bare `python sweep_guards.py READ IDLE` re-runs only those rows, so a
-    # timeout that was too tight can be corrected without paying for the whole
-    # sweep again -- the full run is minutes, and the slow suites dominate it
+    # a bare `python sweep_guards.py READ IDLE` re-runs only
     want = [a.upper() for a in sys.argv[1:]]
     results = {}
     for env, label, suites in MUTATIONS:
@@ -108,7 +73,7 @@ def main():
     if base:
         print(f"  control already fails {sorted(base)} -- fix before reading")
     for env, label, _ in MUTATIONS:
-        # a filtered run has no row for the envs it skipped
+        # a filtered run has no row for the
         if not env or label not in results:
             continue
         hit = sorted({s for s, _ in results[label]} - base)

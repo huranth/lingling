@@ -1,16 +1,4 @@
-"""``lingling --demo`` -- cook the lanes and show the receipts: which lane,
-which exit IP, and what the far end says back.
-
-Muse Spark lives only on the Responses API (``POST /zen/v1/responses``), not
-chat/completions.
-
-**The reply will be a 403.** The free tier gates on the client, so a hand-rolled
-request is refused with `FreeTierError "can only be used from within OpenCode"`
-whatever headers it sends -- and this demo is hand-rolled. The lanes, their
-pins and their exit IPs are all real; only the final request cannot be. To
-exercise a real model call use `lingling` normally, or `tools/soak/live_soak.py`
-which drives the real binary.
-"""
+"""``lingling --demo`` -- cook the lanes and show the receipts: which lane, which exit IP, and what ..."""
 
 from __future__ import annotations
 
@@ -50,14 +38,7 @@ def _extract_text(obj: dict) -> str:
 
 
 def run_demo(question: str, lanes: int = 2) -> int:
-    """Cook `lanes` lanes, then hand off to the body under a `finally`.
-
-    `stop_all` used to be called by hand on every failure path, which is fine
-    until something RAISES -- then it is skipped and the lanes outlive the demo
-    holding their DataDirectories, which is exactly what stops the next run
-    booting them. The reachable raise was `obj.get` on a non-dict reply; that is
-    guarded too. The `finally` is the real fix.
-    """
+    """Cook `lanes` lanes, then hand off to the body under a `finally`."""
     countries, fallback, preferred = load_countries()
     manager = TorManager(DATA_DIR, count=lanes,
                          exit_countries=countries,

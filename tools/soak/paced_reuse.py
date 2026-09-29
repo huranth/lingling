@@ -1,29 +1,4 @@
-"""Reuse at a given cadence -- the thing the soak could not reproduce.
-
-    python tools/soak/paced_reuse.py [calls] [gap_s]
-
-Why this exists. `_KEEPALIVE_S` went 30s -> 600s because his requests arrive
-STRICTLY SEQUENTIALLY, round-robin, so two requests reach the same lane one
-full lap apart -- median 70.2s, p75 150s, and in the 34-call session at 0%
-reuse the MINIMUM was 98.8s. Against a 30s TTL no tunnel can survive, so every
-request paid the dial. 600s was justified by ARITHMETIC over his log, not by a
-run at his cadence.
-
-The soak could not provide that run: at `SOAK_CONCURRENCY=1` it still fires
-requests back-to-back, which is why it reported 55-94% reuse while his own
-sessions sat at 0%. This tool takes the gap as an argument, so the lap can be
-set to his:
-
-    lane lap  = gap x lanes      (5 lanes, 14s gap -> a 70s lap, his median)
-
-It costs NO quota. The far end answers 403 to these (the free-tier gate fires
-on the client, after parsing), and a 403 spends nothing -- which is also why
-`send_s` here is meaningful: the body was read. Do not turn this into a
-200-seeking tool; that would spend his free tier to measure a TTL.
-
-Usage note: gap is the wait BEFORE each call after the first, so total wall is
-roughly `calls x gap` plus boot.
-"""
+"""Reuse at a given cadence -- the thing the soak could not reproduce."""
 import sys
 import time
 from pathlib import Path
@@ -42,8 +17,6 @@ BODY = ('{"model":"' + MODEL + '","stream":true,"input":[{"role":"user",'
         '"content":[{"type":"input_text","text":"hi"}]}]}').encode()
 
 #: `host` AND `user-agent` are both required: `_roundtrip` rebuilds the head
-#: from the caller's headers and does NOT invent a `Host`, and without one the
-#: far end answers 400 `connection: close` and nothing pools.
 HEADERS = {"host": HOST, "accept": "text/event-stream",
            "user-agent": "opencode/1.0"}
 
@@ -92,10 +65,7 @@ def main():
         done = [r for r in rows if r.get("status")]
         reu = sum(1 for r in rows if r.get("reused"))
 
-        # the first visit to a lane is COLD by definition, so `reused/calls`
-        # is capped at (calls - lanes)/calls and saturates -- with 10 calls over
-        # 6 lanes it cannot exceed 40% no matter how well the pool works. The
-        # number that means anything is reuse among the calls that COULD reuse.
+        # the first visit to a lane is COLD
         seen, possible, hit = set(), [], 0
         for r in rows:
             lane = r.get("lane")

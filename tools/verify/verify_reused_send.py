@@ -1,29 +1,4 @@
-"""A reused tunnel must have its window armed BEFORE it is used.
-
-Found in the log, and only visible because the wait fields were logged:
-
-    TimeoutError  secs=20.0  reused=True  max_wait_s=0.0
-
-A 20-second timeout with `max_wait_s` of 0 means no READ ever waited -- the
-wait was a SEND. The cause is ordering: `up.sendall(out_head + body)` ran
-BEFORE `up.settimeout(_READ_TIMEOUT)`, so on a pooled socket it used whatever
-timeout the previous use happened to leave behind.
-
-That value is not benign. `_flush` arms `_STREAM_IDLE_TIMEOUT` (300s) the
-moment a stream commits, and the socket is then handed back to the pool -- so
-a reused tunnel could block for five minutes on a send, or fail at 20s,
-depending on which phase ran last. Either way it was an accident of history
-rather than a decision.
-
-WHY THIS TEST RECORDS CALL ORDER RATHER THAN BLOCKING A REAL SOCKET. The
-obvious test -- fill the buffers so `sendall` blocks -- does not work here: a
-socketpair on this platform absorbs a 4 MB send in 0.00s, so there is no block
-to observe. (Measured: a LOOP of 64 KB sends blocks after ~450 KB, a single
-large `sendall` does not.) So the invariant is asserted directly: the socket
-must be told its window before it is asked to send anything.
-
-It fails on the old code, where `sendall` is the first call the socket sees.
-"""
+"""A reused tunnel must have its window armed BEFORE it is used."""
 import sys
 import threading
 import time
@@ -134,15 +109,7 @@ def main():
           "settimeout" in kinds
           and kinds.index("settimeout") < kinds.index("sendall"),
           f"order was {kinds} -- the send inherited a stale timeout")
-    # The send arms its OWN window, not the read window. All three used to be
-    # one constant, which is now 1800s -- so a stuck send would have hung for
-    # half an hour. Compared against `_SEND_TIMEOUT` only: this test lowers
-    # `_READ_TIMEOUT` to make the ceiling testable, so the two are not
-    # comparable here. The shipped values are dial 30s, send 30s, read 1800s.
-    # The send is NOT a total budget for the upload: a socket timeout on
-    # `sendall` is per wait-for-writable, so 30s means 30s with zero bytes of
-    # progress. Raising it to 300s was tried and reverted -- it cannot turn a
-    # stalled circuit into a success, only delay the same failure tenfold.
+    # The send arms its OWN window, not the
     check("the send arms its own window, not the read window",
           ("settimeout", mitm._SEND_TIMEOUT) in sock.calls,
           f"armed {[c for c in sock.calls if c[0] == 'settimeout']} "

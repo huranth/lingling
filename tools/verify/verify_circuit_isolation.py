@@ -1,26 +1,4 @@
-"""Live proof that one lane serves many circuits, not one.
-
-    python tools/verify/verify_circuit_isolation.py [lanes]
-
-Boots a real lane and dials it twice with two different SOCKS credentials,
-then asks the lane's own control port how many circuits exist.
-
-Why this matters. Tor's ``IsolateSOCKSAuth`` is on by default and keys circuit
-isolation on the SOCKS **username**. The code used to greet every stream with
-no-auth, so every stream shared one empty key -- one lane, one circuit, and one
-``RELAY_END`` took every concurrent stream on that lane down together. That is
-the mechanism behind the SSLEOFError bursts and the mid-body cuts: with ~20
-streams per lane, a single teardown cost ~20 requests.
-
-Offering username/password auth is what fixes it, but only if Tor actually
-*accepts* the credential and actually *isolates* on it. Both are testable
-here, so neither has to be assumed:
-
-  1. the greeting is accepted (the dial returns "")
-  2. two usernames yield two circuits, not one
-
-Costs no model quota: a bare CONNECT sends no API request at all.
-"""
+"""Live proof that one lane serves many circuits, not one."""
 import socket
 import sys
 import time
@@ -51,12 +29,7 @@ def cookie_path() -> Path:
 
 
 def open_control(control_port: int):
-    """An authenticated control connection, left open for the caller.
-
-    Deliberately not a context manager: the caller must hold it open across
-    both dials, because a stream only carries its circuit id while it is
-    alive. The first version returned a controller whose `with` block had
-    already closed -- so every query would have come back empty."""
+    """An authenticated control connection, left open for the caller."""
     import stem.connection
     from stem.control import Controller
 
@@ -66,15 +39,7 @@ def open_control(control_port: int):
 
 
 def dial_open(lane, cred):
-    """A SOCKS5 CONNECT, held open, with no TLS on top.
-
-    Deliberately no TLS handshake: a bare handshake sends no HTTP request, so
-    the far end closes the connection and the stream is gone before it can be
-    read -- measured, `stream-status` came back empty and the test reported
-    FAIL on a working fix. A bare CONNECT keeps the stream alive for as long as
-    the socket is held, which is all this needs.
-
-    Returns (err, socket, local_address)."""
+    """A SOCKS5 CONNECT, held open, with no TLS on top."""
     sock = socket.create_connection(("127.0.0.1", lane.socks_port), timeout=60)
     sock.settimeout(60)
     local = sock.getsockname()
@@ -86,18 +51,7 @@ def dial_open(lane, cred):
 
 
 def stream_circuits(ctl, port=443):
-    """(stream_id, circuit_id) for every live stream to `port`.
-
-    Read from the raw ``stream-status`` rather than ``get_streams()``. stem
-    leaves ``Stream.source_address`` as None, so the obvious "match the stream
-    by the local port I dialled from" approach matches nothing and reports a
-    FAIL on a working fix -- which is exactly what the first version of this
-    test did. The raw line is:
-
-        9 SUCCEEDED 3 172.65.90.20:443
-        ^id ^status ^circuit ^target
-
-    and that circuit id is the thing worth asserting on."""
+    """(stream_id, circuit_id) for every live stream to `port`."""
     out = []
     try:
         raw = ctl.get_info("stream-status") or ""
@@ -115,16 +69,7 @@ def stream_circuits(ctl, port=443):
 
 
 def live_session() -> bool:
-    """True when a lingling or opencode process is already running.
-
-    ``setup_lanes`` calls ``_reap_orphans``, which kills anything LISTENING in
-    the lane port range and cannot tell an orphan from a session someone is
-    using. Measured, the hard way: running this against a live session killed
-    lanes 2, 3 and 4, and the health daemon revived them, three times in a row.
-    ``live_soak``'s docstring warns about exactly this and I did it anyway.
-
-    So refuse rather than reap. The same hazard applies to any harness that
-    boots lanes while the CLI is up."""
+    """True when a lingling or opencode process is already running."""
     import subprocess
     try:
         out = subprocess.check_output(["tasklist"], text=True, timeout=15)
@@ -190,9 +135,7 @@ def main():
         try:
             ctl = open_control(lane.control_port)
         except Exception as exc:  # noqa: BLE001
-            # Full traceback, not just the type name: the first version printed
-            # "NameError" and nothing else, which named the bug without
-            # locating it.
+            # Full traceback, not just the type name: the
             import traceback
             traceback.print_exc()
             print(f"   [SKIP] control port unreadable: {type(exc).__name__}")
@@ -217,10 +160,7 @@ def main():
                 print("  - " + f)
             return 1
         if not verified:
-            # The credential is accepted, but the claim that matters was never
-            # tested. Saying CONFIRMED here would be the same class of mistake
-            # this whole exercise is about: reporting a result that was not
-            # measured.
+            # The credential is accepted, but the claim that
             print("INCONCLUSIVE: credential accepted, isolation NOT verified")
             return 1
         print("CIRCUIT ISOLATION: CONFIRMED")

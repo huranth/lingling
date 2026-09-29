@@ -1,27 +1,4 @@
-"""The SOCKS5 CONNECT reply is variable length, and must be read exactly.
-
-The reply is VER REP RSV ATYP, then a BND.ADDR whose size ATYP decides, then
-BND.PORT:
-
-    ATYP=0x01  IPv4      4 + 2 bytes   -> 10 total
-    ATYP=0x03  domain    1 + n + 2     -> 11 + n total
-    ATYP=0x04  IPv6     16 + 2 bytes   -> 22 total
-
-`netutil.socks5_open` read a flat 10 bytes, which is correct only for IPv4.
-Tor does return 0x01 with 0.0.0.0:0 today -- checked on a live lane -- so this
-is LATENT, not a live failure. But the consequence if it ever changes is not
-subtle: the leftover bytes stay in the socket, and the TLS handshake that
-follows reads them as its own first bytes. A corrupted ClientHello is an
-SSLEOFError, which is the largest error class in the log.
-
-`relay._dial` has always parsed all three ATYP cases, so the two SOCKS5
-implementations disagreed about the wire format. They now agree.
-
-This drives the shipped `socks5_open` against a fake SOCKS5 server that
-answers with each ATYP in turn, then sends a marker. The socket must be clean
-when the handshake returns -- the marker must be the very next byte. It fails
-on the old code, where an IPv6 or domain reply leaves 12+ bytes behind.
-"""
+"""The SOCKS5 CONNECT reply is variable length, and must be read exactly."""
 import socket
 import struct
 import sys
@@ -47,10 +24,7 @@ def check(name, ok, detail=""):
 
 
 def socks_server(atyp):
-    """A one-shot SOCKS5 server that replies with `atyp`, then a marker.
-
-    Returns the port it listens on.
-    """
+    """A one-shot SOCKS5 server that replies with `atyp`, then a marker."""
     holder = []
     ready = threading.Event()
 

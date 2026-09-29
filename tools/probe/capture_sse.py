@@ -1,16 +1,4 @@
-"""What a reasoning-only 200 actually contains: dump the raw SSE, byte for byte.
-
-    python tools/probe/capture_sse.py [count]
-
-Drives real model calls through a lane and writes every upstream chunk to
-`sse-capture/<n>.bin`, with a `<n>.chunks.json` of read offsets. Reads the raw
-socket, so nothing is interpreted: whichever event names appear are the ones
-the far end sent.
-
-The point is to settle, from bytes rather than from a guess, what a 200 that
-carries no `output_text.delta` really is. A model that reasons in several
-blocks produces exactly that shape and is healthy.
-"""
+"""What a reasoning-only 200 actually contains: dump the raw SSE, byte for byte."""
 import json
 import socket
 import ssl

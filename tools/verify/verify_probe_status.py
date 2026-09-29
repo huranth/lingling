@@ -1,24 +1,4 @@
-"""The health probe must get 403 or 429 -- never 401.
-
-`reachable()` asks the MODEL path because that is the only status that reflects
-the free tier. Measured on a live lane:
-
-    model "x"                            -> 401 ModelError "Model x is not
-                                            supported"
-    model "muse-spark-1.3-contributor-free" -> 403 FreeTierError (exit fine)
-                                            or 429 (exit's quota is spent)
-
-The model name is validated BEFORE the limit check and before the client gate.
-So the placeholder made every lane return 401, `check_once` read any truthy code
-as healthy, and the `code == 429` branch could never fire -- burnt exits were
-never caught and their first real request paid the 429. That is why 7 of the
-owner's 8 429s landed on exits that had served zero requests.
-
-This boots a real lane and sends both bodies, so it fails on the placeholder.
-It needs Tor and the network, so it is a ship check, not part of the audit --
-like `verify_boot.py`. It spends no model quota: the gate refuses a hand-rolled
-request before a model is reached.
-"""
+"""The health probe must get 403 or 429 -- never 401."""
 import json
 import sys
 import time
@@ -39,7 +19,6 @@ PLACEHOLDER = (b'{"model":"x","stream":false,"max_output_tokens":1,'
 BODY = _scan_body(PROBE_MODEL, PROBE_PATH)
 
 #: the (model, path) pairs measured to answer a verdict, and one that does not
-#: `tools/probe/model_matrix.py` is what measured them.
 GOOD_PAIRS = [
     ("muse-spark-1.3-contributor-free", "/zen/v1/responses"),
     ("mimo-v2.6-flash-free", "/zen/v1/chat/completions"),
@@ -109,12 +88,7 @@ def main():
               code2 in (403, 429), f"got {code2}")
 
         print("\n=== live: the (model, path) pairs, so the override is safe ===")
-        # The model and the path are a PAIR. Crossing them answers 500, which
-        # is not a verdict, so the lane is never marked up and the 429 branch
-        # is dead for that session. `LINGLING_PROBE_MODEL` without
-        # `LINGLING_PROBE_PATH` is therefore a footgun, and this is what says
-        # so. Measured by tools/probe/model_matrix.py; re-measured here so a
-        # far end that changes its mind is caught.
+        # The model and the path are a PAIR.
         for model, path in GOOD_PAIRS:
             time.sleep(1.5)
             code3, text3 = send(lane.socks_port, _scan_body(model, path), path)

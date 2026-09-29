@@ -1,28 +1,4 @@
-"""Offline proof of what a `callend` event reports about one model call.
-
-Run against whichever install is live:
-
-    python tools/verify/verify_call_outcome.py
-
-No network, no tor. It drives the real `mitm._roundtrip` against a canned
-upstream socket, so every stamp and verdict is exercised on the genuine code
-path -- including the early-error emits, where the locals are defined above
-the emit and a `NameError` would only show up in production.
-
-Three things this pins, each found in live traffic:
-
-* `first_byte_s` / `first_event_s`. `secs` measures request -> last byte,
-  which is not what the user waits through. The wait is request -> first byte
-  (lane connect + TLS + upstream), then request -> first model event.
-* No verdict is stamped on a 200. There is no `ghost` flag. A stream with no
-  `output_text.delta` is normal for a model that reasons in several blocks --
-  240 of 843 live calls looked like that and were fine, and the flag caught
-  only which marker the far end happened to send. `cut` is the only thing
-  reported about how a body ended, and that is a socket fact.
-* Tunnel reuse. The SOCKS5 CONNECT plus TLS handshake is ~1.27s of Tor round
-  trips, so `_roundtrip` reuses a pooled tunnel when it can, and reports
-  `reused` so the hit rate is visible.
-"""
+"""Offline proof of what a `callend` event reports about one model call."""
 import io
 import json
 import os
@@ -136,11 +112,7 @@ class DeadSock(FakeSock):
 
 
 class BoomReader:
-    """Delivers a head, then dies the way a cold Tor circuit does.
-
-    A young circuit tears the TLS session down between the status line and
-    the first token -- `SSLEOFError` at a median circuit age of 36s against
-    173s for the calls that went through."""
+    """Delivers a head, then dies the way a cold Tor circuit does."""
 
     def __init__(self, head, err):
         self.buf = io.BytesIO(head)
@@ -270,7 +242,6 @@ SSE_EMPTY = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
              + chunk(b'event: ping\ndata: {}\n\n') + b"0\r\n\r\n")
 
 #: a 429 buffers, so nothing is ever relayed or sniffed. The retry-after is
-#: what opencode actually sends for a limited exit (measured ~3.4h).
 BUSY = (b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: text/plain\r\n"
         b"retry-after: 12373\r\ncontent-length: 4\r\n\r\nbusy")
 
@@ -340,15 +311,13 @@ THINK_ONLY = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
 check("reasoning frame stamped the event",
       events2[-1].get("first_event_s", 0) > 0,
       str(events2[-1].get("first_event_s")))
-# Reasoning-only is how a multi-block model thinks. It is not a verdict.
+# Reasoning-only is how a multi-block model thinks. It
 check("a reasoning-only 200 is NOT judged",
       "ghost" not in events2[-1], str(sorted(events2[-1])))
 check("it ended cleanly, so not cut", events2[-1]["cut"] is False)
 check("and it blames no lane", _r2.refused == [], str(_r2.refused))
 
-# The marker used to be the literal `"type":"reasoning"`, so a stream that
-# spaced its JSON -- `"type": "reasoning"` -- was never stamped. 12 live calls
-# carrying 16-324 KB reported first_event_s = 0 that way.
+# The marker used to be the literal `"type":"reasoning"`,
 SPACED = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
           b"transfer-encoding: chunked\r\n\r\n"
           + chunk(b'event: response.output_item.added\ndata: '
@@ -381,10 +350,7 @@ check("keys present as 0, not missing",
       and events4[-1].get("first_event_s") == 0, str(events4[-1]))
 
 print("\n=== H2. a SOCKS5 refusal still reports an outcome ===")
-# It used to return without emitting, so the pane printed a "lane X -> model"
-# line with no result after it -- indistinguishable from a hung request. 25
-# requests in the live log were left unpaired that way, and the socket was
-# never closed either.
+# It used to return without emitting, so the
 (_o14, events14, _c14, _r14) = drive(b"", socks_err="connection refused")
 check("the refusal is logged, not swallowed",
       len(events14) == 1 and events14[-1]["err"] == "connection refused",
@@ -394,9 +360,7 @@ check("and it is not dressed up as a success",
       str(events14[-1]["status"]))
 
 print("\n=== I. plain traffic is never judged as a model stream ===")
-# This proxy also carries opencode's own fetches. GET /api.json is ~324 KB of
-# static JSON with no model event in it. Nothing judges it now: the columns
-# that describe a body are `kb` and `cut`, and both are facts about bytes.
+# This proxy also carries opencode's own fetches. GET
 (_o5, events5, _c5, relay5) = drive(PLAIN)
 check("a non-stream 200 carries no verdict", "ghost" not in events5[-1],
       str(sorted(events5[-1])))
@@ -414,8 +378,7 @@ check("it still relays the whole body", events12[-1]["kb"] > 300,
 check("and it blames nobody", relay12.refused == [], str(relay12.refused))
 
 print("\n=== J. an empty stream is reported, and blames no lane ===")
-# An empty stream used to pull the lane. There is no verdict now -- the byte
-# count and `cut` say what arrived, and nothing is inferred about the exit.
+# An empty stream used to pull the lane.
 (_o6, events6, _c6, relay6) = drive(SSE_EMPTY)
 check("an empty stream carries no verdict", "ghost" not in events6[-1],
       str(sorted(events6[-1])))
@@ -434,14 +397,11 @@ check("429 records the far end's retry-after",
       events7[-1]["retry_after"] == 12373, str(events7[-1]["retry_after"]))
 
 print("\n=== K2. the limit is per EXIT, so it is recorded on the lane ===")
-# Live proof: identical probes through six exits in the same 25 seconds gave
-# 3 x 429 and 3 x 403 -- the only variable was the exit. So a 429 says "this
-# exit hit the free tier limit", never "something is wrong with the pool".
+# Live proof: identical probes through six exits in
 lane_k = FakeLane()
 lane_k.limited_until = 0.0
 (_o13, events13, _c13, _r13) = drive(BUSY, lane=lane_k)
-# drive() runs on the fake Clock, so the deadline is in Clock terms: the
-# retry-after is 12373 and the clock starts at 1000.
+# drive() runs on the fake Clock, so the
 check("the lane is marked limited", lane_k.limited_until > 0,
       str(lane_k.limited_until))
 check("for at least the retry-after it was told",
@@ -450,7 +410,7 @@ check("the event carries it too", events13[-1]["retry_after"] == 12373,
       str(events13[-1]["retry_after"]))
 
 print("\n=== L. a pooled tunnel is reused and asked to stay open ===")# The SOCKS5 CONNECT plus TLS handshake is ~1.3s of Tor round trips (measured
-# 546ms + 723ms warm), so a reused tunnel is the single biggest latency win.
+# 546ms + 723ms warm), so a reused tunnel
 seeded = FakeSock(RESP)
 pool = FakePool((seeded, seeded._r))
 (out8, events8, _c8, relay8) = drive(RESP, pool=pool)
@@ -477,8 +437,7 @@ check("the response parsed", events9[-1]["status"] == 200)
 check("and it is not reported as reused", events9[-1]["reused"] is False)
 
 print("\n=== N. an EOF-framed response is never pooled ===")
-# Neither content-length nor chunked means the far end closed the socket to
-# mark the end of the body, so there is nothing left to reuse.
+# Neither content-length nor chunked means the far end
 EOF_FRAMED = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n"
               + b'data: {"type":"response.output_text.delta"}\n\n')
 pool2 = FakePool()
@@ -524,9 +483,7 @@ finally:
     mitm._peer_closed = real_closed
 
 print("\n=== P2. the pool cannot grow without bound ===")
-# Only `take` used to remove entries, so a lane that changed exit left every
-# earlier tunnel -- and its socket -- in the list, one per request that
-# outlived its relay. `give` now prunes anything stale or from another exit.
+# Only `take` used to remove entries, so a
 pool = mitm.TunnelPool(ttl=30.0)
 lane = FakeLane()
 lane.exit_ip = "10.0.0.1"
@@ -541,9 +498,7 @@ check("and it is dropped from the pool",
 check("the current exit's tunnel is kept",
       pool._idle[lane.index][0][2] is second)
 
-# A negative ttl expires everything regardless of the clock's resolution:
-# Windows' monotonic clock ticks in ~15ms steps, so ttl=0.0 can read as zero
-# elapsed time and never expire.
+# A negative ttl expires everything regardless of the
 old = mitm.TunnelPool(ttl=-1.0)
 lane2 = FakeLane()
 lane2.exit_ip = "10.0.0.3"
@@ -589,7 +544,7 @@ check("a dialled tunnel does not",
                                        "reused": False}))
 line = proof._render(events[-1])
 check("full callend line builds", "first" in line and "event" in line, line)
-# The word is gone from the vocabulary, not just unreachable in one branch.
+# The word is gone from the vocabulary, not
 check("no line ever says GHOST",
       all("GHOST" not in proof._render(e) for e in events + events2 + events5
           + events6 + events7),
@@ -610,10 +565,7 @@ check("a 429 is amber, not red",
       "\x1b[33m429" in line429, repr(line429[:40]))
 
 print("\n=== V. a transient upstream error buffers for a retry ===")
-# A 503 is the far end being unwell, not a client error -- a different exit
-# reaches a different edge. It must buffer like a 429 so the caller can retry,
-# instead of being handed straight to the client. Measured live: 18 of 108
-# attempts got a 503 and every one went through untouched.
+# A 503 is the far end being unwell,
 UNAVAILABLE = (b"HTTP/1.1 503 Service Unavailable\r\n"
                b"content-type: text/plain\r\ncontent-length: 3\r\n\r\n503")
 (_o15, events15, client15, _r15) = drive(UNAVAILABLE)
@@ -626,12 +578,7 @@ check("a plain 500 is not -- it may be a real error",
       500 not in mitm._RETRYABLE)
 
 print("\n=== W. a head with no body is retried, not committed ===")
-# The response head used to go to the client the moment it was parsed. That
-# committed the client to a response, so when the far end then died before its
-# first token the turn was over: nothing to retry, and a dead stream the user
-# read as a finished answer. This is the shape behind 197 of 205 exceptions,
-# which all broke with under 4 KB sent. The head must therefore wait for the
-# first body byte, and a death before it must be free.
+# The response head used to go to the
 _HEAD_ONLY = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
               b"transfer-encoding: chunked\r\n\r\n")
 (out16, events16, client16, _) = drive(
@@ -644,11 +591,7 @@ check("and it names the error", events16[-1]["err"] == "SSLEOFError",
       str(events16[-1]["err"]))
 check("the attempt is retryable", out16[3] is True, f"retryable={out16[3]}")
 
-# The case the log actually shows: the far end got as far as part of the SSE
-# opening -- the `event:` name, which is not `data:` -- then died before any
-# event body. Half of all `SSLEOFError`s look like this (`first_event_s == 0`)
-# and every `TimeoutError` but three did. Those bytes are framing, not a model
-# turn, so the attempt is still free.
+# The case the log actually shows: the far
 _PREAMBLE = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
              b"transfer-encoding: chunked\r\n\r\n"
              + chunk(b"event: response.created\n"))
@@ -658,7 +601,7 @@ check("the preamble alone is not a commitment", client18.got == b"",
       repr(client18.got[:48]))
 check("so it retries", out18[3] is True, f"retryable={out18[3]}")
 
-# And the boundary: the first real model event DOES commit.
+# And the boundary: the first real model event
 _MODEL_EVENT = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
                 b"transfer-encoding: chunked\r\n\r\n"
                 + chunk(b'event: response.output_text.delta\ndata: '
@@ -672,9 +615,7 @@ check("and that attempt is not retried", out19[3] is False,
 check("the head went out with that event",
       client19.got.startswith(b"HTTP/1.1 200"), repr(client19.got[:24]))
 
-# And the buffer the hold introduces must be bounded. A far end that streams
-# framing and never names an event would otherwise grow `_open` for the life of
-# the response. Measured preambles are 1.3 KB, so the cap is comfortable.
+# And the buffer the hold introduces must be
 _FLOOD = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
           b"transfer-encoding: chunked\r\n\r\n"
           + b"".join(chunk(b": padding comment\n") for _ in range(6000))
@@ -687,9 +628,7 @@ check("and the stream still ended cleanly", events20[-1].get("cut") is False,
       str(events20[-1].get("cut")))
 
 print("\n=== U. the crypto stack is checked at startup ===")
-# The crypto import is lazy, so a gutted `cryptography` -- no __init__.py,
-# orphaned dist-info, pip still reporting it installed -- survived boot and a
-# live soak before anything complained. Startup now says so instead.
+# The crypto import is lazy, so a gutted
 check("crypto_available() is True on a working install",
       mitm.crypto_available())
 _cli_src = open(os.path.join(os.path.dirname(mitm.__file__), "cli.py"),
@@ -697,9 +636,7 @@ _cli_src = open(os.path.join(os.path.dirname(mitm.__file__), "cli.py"),
 check("and startup acts on it", "crypto_available" in _cli_src)
 
 print("\n=== S. the log carries a session marker ===")
-# `seq` restarts at 1 every run, so without a marker the log cannot be
-# segmented and `(n, c)` collides across sessions. That is how a 55-minute
-# stall got misread as "nothing in flight".
+# `seq` restarts at 1 every run, so without
 import re as _re
 
 src = open(os.path.join(os.path.dirname(proof.__file__), "cli.py"),
@@ -714,9 +651,7 @@ check("and it is not mistaken for a request line",
       not _re.search(r"#\d+\.\d+", line_start), line_start)
 
 print("\n=== T. the log writer keeps the file open ===")
-# The old emitter opened and closed the log for every event, all serialised
-# behind one lock -- thousands of open/close cycles during a burst. Flushing
-# instead keeps the proof pane just as live for a fraction of the syscalls.
+# The old emitter opened and closed the log
 with tempfile.TemporaryDirectory() as tmp:
     log = Path(tmp) / "proof.log"
     emit = proof.make_emitter(log)

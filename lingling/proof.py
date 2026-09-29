@@ -1,5 +1,4 @@
-"""Proof pane: events append as JSON lines to ``data/proof.log``; a second
-console tails and renders them until the ``done`` sentinel."""
+"""Proof pane: events append as JSON lines to ``data/proof.log``; a second console tails and renders ..."""
 
 from __future__ import annotations
 
@@ -17,16 +16,7 @@ _LOCK = threading.Lock()
 
 
 def make_emitter(path: Path):
-    """A thread-safe event sink appending JSON lines to ``path``.
-
-    The file is opened once and flushed per event, instead of being reopened
-    for every event. Under a heavy burst the old version did thousands of
-    open/close cycles, all serialised behind one lock; flushing keeps the
-    proof pane just as live for a fraction of the syscalls.
-
-    The returned callable carries ``close``, because an open handle is a real
-    resource: the process would release it at exit, but a test that writes to
-    a temporary file cannot delete that file until it is closed."""
+    """A thread-safe event sink appending JSON lines to ``path``."""
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a", encoding="utf-8")
 
@@ -47,10 +37,7 @@ def _c(text: str, code: str) -> str:
 
 
 def _lat_bits(ev: Dict) -> str:
-    """Payload, then whichever latencies this call actually reached.
-
-    ``first_byte_s`` spans the lane's connect and TLS handshake, so it is
-    wall clock, not a server-only figure. Older events carry neither key."""
+    """Payload, then whichever latencies this call actually reached."""
     bits = [f"{ev.get('kb', 0)} KB in {ev.get('secs', 0)}s"]
     if ev.get("first_byte_s"):
         bits.append(f"first {ev['first_byte_s']}s")
@@ -62,18 +49,7 @@ def _lat_bits(ev: Dict) -> str:
 
 
 def _render(ev: Dict) -> str:
-    """One proof-pane line for one event.
-
-    A 429 renders amber rather than red: the relay hands it straight to
-    another lane, and the far end's own retry-after names when that exit comes
-    back. Rendering it red made a working proxy look like a broken one.
-
-    A call that was CUT is not called a failure once a response has been
-    delivered. A 200 carrying part of a body is a truncated answer, and
-    labelling it "failed" made a served request look like a lost one -- which
-    is exactly how the owner read it. Only an attempt that never got a head is
-    "failed", and a timeout names WHICH SIDE stalled, so a client that stopped
-    reading is not mistaken for a slow lane."""
+    """One proof-pane line for one event."""
     ts = time.strftime("%H:%M:%S", time.localtime(ev.get("t", time.time())))
     if ev.get("type") == "start":
         cc = ",".join(ev.get("countries") or [])

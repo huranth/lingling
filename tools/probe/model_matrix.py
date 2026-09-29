@@ -1,29 +1,4 @@
-"""Does the probe's model name change its verdict? Ask a real lane.
-
-    python tools/probe/model_matrix.py
-
-The health probe names a model in `PROBE_MODEL`, and that name is the ONE
-place in the package where "which model" changes behaviour. Two things were
-assumed about it and neither had been measured:
-
-  1. that a name the far end has retired turns the probe into a 401, and
-     `check_once` reads any truthy code as healthy -- so the 429 branch stops
-     firing and burnt exits are never caught. That is documented as having
-     happened once, with the placeholder `"x"`.
-  2. that the quota is per (exit, model), which would mean a probe riding one
-     model says nothing about another -- and the 403 it reports is not
-     evidence about the model actually in use.
-
-This boots one lane and asks it the same question with several names, on both
-the responses path the probe uses and the chat path the owner's traffic uses.
-That separates (1) from (2): if a real-but-different model still answers 403,
-the name does not gate the verdict and the quota is not per-model in any way
-this probe can see. If it answers anything else, wiring the probe to the model
-in use is not optional.
-
-Costs no model quota: the free-tier gate refuses a hand-rolled request, so a
-403 is the expected healthy answer and no completion is ever produced.
-"""
+"""Does the probe's model name change its verdict?"""
 import sys
 import time
 from pathlib import Path

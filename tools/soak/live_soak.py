@@ -1,30 +1,4 @@
-"""Live soak: boot the real stack, then drive the REAL opencode client through
-the relay until ~N model calls have gone upstream. AppData-only.
-
-    python tools/soak/live_soak.py [target_model_calls]
-
-Why it drives opencode instead of raw HTTP: the free tier gates on the
-client. A hand-rolled request to /zen/v1/responses returns
-
-    403 FreeTierError "OpenCode's free tier can only be used from within OpenCode"
-
-no matter which session id or headers you send. The real binary rides fine, so
-this is also the only honest way to reproduce your actual usage.
-
-**SOAK_CONCURRENCY=1 IS THE OWNER'S PATTERN. THE DEFAULT 5 IS NOT.**
-
-His requests arrive strictly sequentially, one at a time, round-robin across
-his lanes. This harness defaults to five parallel opencode processes, and five
-parallel clients re-hit a lane within seconds -- so it reported 78-94% tunnel
-reuse while his own sessions sat at **0%**, and the pool TTL that caused it
-(30s against a 98.8s minimum same-lane lap) was invisible for as long as the
-harness ran at the default. A soak that cannot reproduce the traffic cannot
-find the bug in it: **run this at concurrency 1 to study his latency.**
-
-Also: never start the lingling CLI while this is running. `setup_lanes` prunes
-any `tor-<digits>` dir the current pool does not own and `_reap_orphans` sweeps
-the whole lane port range, so a CLI boot mid-soak takes the soak's lanes down.
-"""
+"""Live soak: boot the real stack, then drive the REAL opencode client through the relay until ~N ..."""
 import json
 import os
 import shutil
@@ -48,13 +22,6 @@ PROOF_LOG = DATA_DIR / "proof.log"
 RUN_TIMEOUT = 180.0
 
 #: Two prompt pools, because the stall needs LONG reasoning answers.
-#:
-#: The first pool is the original one: one-word replies, ~1 KB of response.
-#: It cannot reproduce the owner's stall, because that arrives on answers of
-#: 48-62 KB. A soak that only ever asks for "PROOF_OK" will run for a week and
-#: never once generate the failure it is meant to study. So `--hard` swaps in
-#: prompts that force sustained reasoning, which is the only way the effort
-#: field logged by `_model_of` gets anything to correlate against.
 PROMPTS = [
     "Reply with exactly: PROOF_OK",
     "Reply with exactly: LANE_1",
@@ -94,18 +61,13 @@ def boot(wait_healthy=4, timeout=420):
     assert not err, f"setup_lanes: {err}"
     emit = proof.make_emitter(PROOF_LOG)
     #: session marker, as the CLI emits -- without it a soak run cannot be
-    #: told apart from the run before it
     emit({"type": "start", "t": time.time(), "session": os.urandom(6).hex(),
           "lanes": len(mgr.lanes), "countries": list(mgr.countries),
           "version": "soak"})
     daemon = HealthDaemon(mgr, event=emit, log=lambda *a: None)
 
     def _report_boot(lane, status) -> None:
-        """Put the launch outcome in the LOG, not just on stdout.
-
-        The soak printed `[boot] healthy lanes: N` and that was the only place
-        a failed lane showed up -- so a run that had lost five of six lanes
-        looked identical to a healthy one in `proof.log`."""
+        """Put the launch outcome in the LOG, not just on stdout."""
         if status in ("started", "already_running"):
             return
         emit({"type": "lane", "kind": "fail", "t": time.time(),
@@ -130,8 +92,7 @@ def boot(wait_healthy=4, timeout=420):
 
 
 class LogTail:
-    """Incremental reader so we can watch model calls land without re-parsing
-    a multi-megabyte log on every poll."""
+    """Incremental reader so we can watch model calls land without re-parsing a multi-megabyte log on ..."""
 
     def __init__(self, path):
         self.path = path
@@ -175,8 +136,7 @@ class LogTail:
 
 
 def kill_tree(pid):
-    """Kill children too. Killing only the launcher leaves node holding the
-    stdout pipe open, and the reap then blocks until those exit on their own."""
+    """Kill children too."""
     try:
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
                        capture_output=True, timeout=15)
@@ -192,15 +152,7 @@ def run_once(oc, env, i, pool=None):
     try:
         cmd = [oc, "run", "-m", "opencode/" + MODEL]
         if hard:
-            # Ask for the effort the owner's failing calls carry. opencode
-            # passes this through to the model path, so the relay's new
-            # `effort=` field has something real to report.
-            #
-            # The variant is settable because it CHANGES the failure rate and
-            # a soak pinned to one value cannot see that: the owner's failing
-            # calls are `xhigh`, and every soak here ran `high` or lower, which
-            # is why the time-to-first-token that breaks his traffic was never
-            # reproduced. SOAK_VARIANT=xhigh to match him.
+            # Ask for the effort the owner's failing calls
             cmd += ["--variant", os.environ.get("SOAK_VARIANT", "high")]
         cmd.append(prompt)
         proc = subprocess.Popen(
@@ -222,9 +174,7 @@ def main():
     target = int(argv[0]) if argv else 400
     conc = int(os.environ.get("SOAK_CONCURRENCY", "5"))
     budget = float(os.environ.get("SOAK_BUDGET_S", "2700"))
-    # `--hard` is what makes the soak able to reproduce the stall at all:
-    # short prompts produce ~1 KB answers, and the owner's failures arrive on
-    # 48-62 KB ones.
+    # `--hard` is what makes the soak able to
     pool = HARD_PROMPTS if "--hard" in flags else PROMPTS
     print(f"[soak] prompt pool: "
           f"{'HARD (long reasoning)' if pool is HARD_PROMPTS else 'short'}"
@@ -270,7 +220,7 @@ def main():
                       flush=True)
         for f in pending:
             f.cancel()
-        # Short drain: a long one only waits on runs we already gave up on.
+        # Short drain: a long one only waits on
         done, _ = wait(pending, timeout=30)
         for f in done:
             if not f.cancelled():
@@ -292,10 +242,7 @@ def main():
     print("=" * 60, flush=True)
     print(f"opencode rc  : {dict(rcs)}   (rc=0 = {oks}/{len(results)})")
     print(f"call statuses: {dict(codes)}")
-    # A 200 that the far end cut mid-body is NOT a success: the client got a
-    # truncated answer. `status` now reports what the client actually saw, so
-    # it reads 200 for a committed stream even when the stream then died --
-    # which is correct, and exactly why this metric has to check `err` too.
+    # A 200 that the far end cut mid-body
     ok200 = sum(1 for e in tail.ends
                 if e.get("status") == 200 and e.get("err") == "")
     tot = max(1, len(tail.ends))
@@ -307,7 +254,7 @@ def main():
     if secs:
         print(f"latency      : p50={pct(secs, 0.5):.1f}s "
               f"p90={pct(secs, 0.9):.1f}s max={secs[-1]:.1f}s")
-    # 0 means the attempt never got that far, so those drop out of the sample.
+    # 0 means the attempt never got that far,
     fbs = sorted(e.get("first_byte_s") for e in tail.ends
                  if e.get("first_byte_s"))
     fes = sorted(e.get("first_event_s") for e in tail.ends
@@ -318,7 +265,7 @@ def main():
     if fes:
         print(f"first event  : p50={pct(fes, 0.5):.2f}s "
               f"p90={pct(fes, 0.9):.2f}s max={fes[-1]:.2f}s (n={len(fes)})")
-    # A reused tunnel skips the SOCKS5 CONNECT and TLS handshake (~1.27s).
+    # A reused tunnel skips the SOCKS5 CONNECT and
     reuse = [e for e in tail.ends if e.get("reused")]
     if reuse:
         print(f"tunnel reuse : {len(reuse)} of {len(tail.ends)} calls "
@@ -332,7 +279,6 @@ def main():
         print(f"payload      : median={sorted(kbs)[len(kbs) // 2]}KB  "
               f"under 2KB={100 * small / len(kbs):.0f}%  max={max(kbs)}KB")
     #: dispatched, not finished -- a callend can be lost if the tail starts
-    #: late, and the first calls of a soak are exactly the interesting ones
     lanes_used = Counter(tail.call_lanes)
     print(f"lane spread  : {dict(sorted(lanes_used.items()))}")
     print(f"throughput   : {elapsed / max(1, tail.calls):.2f}s per model call")
@@ -341,11 +287,7 @@ def main():
     kinds = Counter(e.get("kind") for e in tail.lanes)
     print(f"lane events: {dict(kinds) if kinds else 'none'}")
     for e in tail.lanes:
-        # `probe` is included deliberately: it means the health probe got a
-        # code that is NOT a verdict (401/500/nothing), so the lane was left
-        # unasked and its quota was never checked. It is an early warning --
-        # in the first run that produced one, lane 2 answered nothing and then
-        # failed all three of its next real calls with `timed out`.
+        # `probe` is included deliberately: it means the health
         if e.get("kind") in ("limited", "rotate", "up", "fail", "probe"):
             print(f"  [{e.get('kind')}] {e.get('msg')}", flush=True)
 
@@ -353,11 +295,7 @@ def main():
     relay.stop()
     mgr.stop_all()
 
-    # Did anything survive? A straggler holds its lane's DataDirectory, and the
-    # next run then cannot boot that lane -- measured as one per run, five
-    # accumulated, and a pool that quietly ran on a single exit. Checking here
-    # is the only way to see it: the pane never mentions a process that has
-    # already outlived the run that made it.
+    # Did anything survive? A straggler holds its lane's
     import subprocess as _sp
     _tl = _sp.run(["tasklist", "/FO", "CSV", "/NH"],
                   capture_output=True, text=True).stdout

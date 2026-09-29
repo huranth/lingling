@@ -1,22 +1,4 @@
-"""The SOCKS5 handshake spends ONE window, not one per read.
-
-`socks5_open` makes two blocking reads -- the greeting reply, then the CONNECT
-reply that Tor answers once it has built the circuit. A socket timeout applies
-per read, so arming it once let a dead exit spend the window twice, and the
-module's own docstring ("one socket timeout covers the lot") was not true of
-the code.
-
-The log agrees with the measurement rather than the docstring: 86% of its
-TimeoutErrors land at 30-60s, above both the 20s body ceiling and the 30s
-window, with only one event at exactly 20.0s and one at exactly 30.0s.
-
-This drives the real `_roundtrip` against an upstream that answers the greeting
-(maybe late) and then never sends the CONNECT reply. The total must stay inside
-one window whatever the greeting costs. It fails on the unbounded version.
-
-Windows are shrunk to seconds so the proof runs quickly; the property is what
-matters, not the constant.
-"""
+"""The SOCKS5 handshake spends ONE window, not one per read."""
 import socket
 import ssl
 import sys

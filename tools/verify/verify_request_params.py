@@ -1,25 +1,4 @@
-"""The log must record what a request ASKED FOR, not just its model.
-
-Why this exists. The owner reports the stalls only happen on hard reasoning
-tasks. For a whole session that could not be checked, because the request
-body was never recorded -- the only field written was `model`. The one
-variable that would test the hypothesis was thrown away at the log site.
-
-So `_model_of` now carries the reasoning effort and the output cap through
-to the `call` record. The model path pays no extra parse: the body was
-already being handed out for the model name.
-
-Two things this pins:
-
-  * the parameters survive into the log line, in all three shapes the API
-    accepts (`reasoning.effort`, flat `reasoning_effort`, `max_output_tokens`)
-  * a body that does not parse, or has no parameters, still logs the model
-    exactly as before -- this must not become a new failure mode
-
-The correlation itself is NOT asserted here. It cannot be: it needs a soak
-with the new field, and a test that guessed the answer would be the same
-mistake as theorising without data.
-"""
+"""The log must record what a request ASKED FOR, not just its model."""
 import json
 import sys
 from pathlib import Path

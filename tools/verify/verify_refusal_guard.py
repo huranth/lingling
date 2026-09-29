@@ -1,15 +1,4 @@
-"""The health probe's 429 actually reaches the refusal handler.
-
-`verify_limit_gates` owns the two refusal rules and now tests both of them:
-section A pins that a 429 moves the lane on ONE strike with no confirm gate, and
-section B pins that a 403 moves nothing. This file covers the one path that
-suite does not reach -- the WIRING from `check_once` to `on_refused`.
-
-That wiring is worth a test of its own because it has broken twice in this
-codebase's history: a gate added to `on_refused` silently applied to the probe
-too, so a burnt exit was not moved on the first sweep. Calling `on_refused` by
-hand would not have caught it -- driving the real `check_once` does.
-"""
+"""The health probe's 429 actually reaches the refusal handler."""
 import pathlib
 import sys
 import tempfile
@@ -77,8 +66,7 @@ def sweep(reply):
     lane.exit_fingerprint = "A" * 40
     lane.process = FakeProc()
     lane.healthy = True
-    # asked to run: the daemon now leaves a lane alone until something wants
-    # it, which is what stops it racing the CLI's staggered boot
+    # asked to run: the daemon now leaves a
     lane.wanted = True
     lane.asked = False
     tor.lanes = [lane]
@@ -98,8 +86,7 @@ def main():
           f"429 did not reach the refusal handler")
 
     print("\n=== a 403 probe leaves the lane in service ===")
-    # A 403 means the exit is FINE -- the gate refused the hand-rolled probe --
-    # so the lane is marked asked and nothing moves.
+    # A 403 means the exit is FINE --
     tor, lane = sweep(403)
     print(f"  rotations={tor.rotations} restarts={tor.restarts} "
           f"asked={lane.asked}")

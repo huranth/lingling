@@ -1,22 +1,4 @@
-"""A tunnel the far end asked to close must not go back into the pool.
-
-`keep` is what puts an upstream connection back for reuse. It was set purely
-from "did the response arrive complete", and the response's own
-`Connection: close` was **never read** -- a grep for it returns nothing.
-
-So a far end that finished a response and said `close` had its connection
-pooled anyway. The next reuse then met an EOF that the pool's `_peer_closed`
-check had not seen, because the close had not finished propagating through
-Tor. That is the shape of the SSLEOF / `upstream closed` family.
-
-Also checked here: a malformed `Content-Length` from the far end. It is parsed
-unguarded, so it raised `ValueError` straight past the handler -- which caught
-only `(ssl.SSLError, OSError)`. That killed the MITM thread and left the client
-hanging on a connection nobody would ever close.
-
-This drives the shipped `_roundtrip`. It fails on the old code, where a
-`Connection: close` response is still handed to the pool.
-"""
+"""A tunnel the far end asked to close must not go back into the pool."""
 import sys
 import threading
 import time

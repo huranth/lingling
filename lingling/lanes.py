@@ -1,9 +1,4 @@
-"""Tor egress lanes: N tor.exe processes pinned to distinct exit countries
-(StrictNodes + ExitNodes {cc}), each a local SOCKS5 on 127.0.0.1:52001+.
-Missing stem/tor degrades to "Tor unavailable"; tor.exe children join a
-kill-on-close Windows Job Object so they never outlive this process.
-Heal ladder: restart_lane -> regenerate_lane.
-"""
+"""Tor egress lanes: N tor.exe processes pinned to distinct exit countries (StrictNodes + ExitNodes ..."""
 
 from __future__ import annotations
 
@@ -194,16 +189,7 @@ class TorManager:
 
     # setup
     def _load_existing(self) -> None:
-        """Re-read ports from previous torrcs so a restart keeps the same
-        lane layout; heal unbindable ports up front. A concrete country pin
-        in a torrc is a stale copy of a previous list -- the current
-        countries.txt wins. Only an unpin ({*}) survives a restart.
-
-        The port search is wider than `find_free_port`'s default because
-        Windows excludes port ranges (Hyper-V/WSL) and the default block can
-        land entirely inside one: on this machine 52301-52500 is unbindable,
-        so the stock 200-port scan found nothing and left the lane with a
-        control port tor could not use."""
+        """Re-read ports from previous torrcs so a restart keeps the same lane layout; heal unbindable ports ..."""
         seen_socks: set[int] = set()
         seen_control: set[int] = set()
         for i in range(self.count):
@@ -438,21 +424,7 @@ class TorManager:
                     on_lane(lane, status)
 
     def _reap_orphans(self) -> int:
-        """Kill our own leftover tor processes before launching any lane.
-
-        A tor that outlived its lingling holds its lane's DataDirectory, and
-        the next launch dies with "another Tor process is running with the same
-        data directory". The lane then never comes up, silently, for the whole
-        session. Measured: FIVE orphans alive with no lingling running, and
-        five of six lanes failed to boot -- the pool quietly ran on one exit
-        while `start.lanes` still advertised six.
-
-        Scoped to the LANE PORT RANGE, not to a lane's two ports, because the
-        port a leftover holds is not reliably the one this build would assign
-        it: the indexing has shifted between versions, so a lane-by-lane sweep
-        misses exactly the orphans it is meant to catch. A Tor Browser never
-        listens in this range, so nothing else can be hit -- which is why this
-        is not the `taskkill /IM tor.exe` that was rightly reverted."""
+        """Kill our own leftover tor processes before launching any lane."""
         if os.name != "nt":
             return 0
         span = range(0, _PORT_SEARCH)
@@ -466,21 +438,7 @@ class TorManager:
         return killed
 
     def _prune_lane_dirs(self) -> int:
-        """Delete the data directories of lanes this pool does not have.
-
-        A lane dir is ~47 MB, almost all of it `cached-microdescs` (36 MB) plus
-        the consensus. Nothing ever removed the dir of a lane that stopped
-        being configured, so they accumulate. Measured: **30 dirs, 1.4 GB, for a
-        pool of 5-6** -- against a 1.5 GB state directory.
-
-        Only the DEAD ones. The live lanes' dirs are Tor's descriptor cache,
-        and re-downloading ~36 MB per lane on every boot is a real delay for
-        43 MB of disk. Pruning the dead ones costs nothing at all, which is
-        why this runs at startup and nothing is wiped at exit.
-
-        Scoped hard: only `tor-<digits>` directly under `lanes_dir`, and only
-        indices the current pool does not use. A live lane's dir is never
-        touched, and nothing outside `lanes_dir` is looked at."""
+        """Delete the data directories of lanes this pool does not have."""
         live = {lane.index for lane in self.lanes}
         try:
             entries = list(self.lanes_dir.iterdir())
@@ -499,19 +457,7 @@ class TorManager:
         return pruned
 
     def _launch_lane(self, lane: Lane) -> str:
-        """Launch one tor.exe, marked in-flight for the whole attempt.
-
-        `healing` is what stops the health daemon restarting a lane that is
-        still coming up. A launch takes tens of seconds, and `_launch_lane`
-        sets `healthy = False` at the start -- so without this flag the daemon
-        sees "down" and kills the very launch it is waiting on. The flag was
-        declared and read by `healthy_lanes()` but NEVER written anywhere, so
-        it was inert and there was no way to tell "booting" from "broken".
-
-        `wanted` is set here too: being asked to run is what tells the daemon
-        it may bring the lane back if the launch fails. Without it the daemon
-        cannot tell a lane whose launch failed from one the CLI has simply not
-        reached yet, and it skipped both forever."""
+        """Launch one tor.exe, marked in-flight for the whole attempt."""
         lane.wanted = True
         lane.healing = True
         try:
@@ -596,12 +542,7 @@ class TorManager:
 
     def _launch_tor_process(self, stem: Any, lane: Lane,
                             config: Dict[str, str], msg_handler) -> Any:
-        """stem's timeout uses SIGALRM (POSIX only), so we race its launcher
-        thread against ``boot_timeout`` ourselves. stem returns as soon as
-        tor prints its first bootstrap line (completion_percent=0): a tor
-        that bootstraps slowly must NOT be killed here -- the boot gate
-        tracks progress and escalates. This race only guards against a tor
-        that never starts at all."""
+        """stem's timeout uses SIGALRM (POSIX only), so we race its launcher thread against ``boot_timeout`` ..."""
         result_q: "queue.Queue" = queue.Queue()
 
         def _do_launch() -> None:
@@ -636,28 +577,7 @@ class TorManager:
         return payload
 
     def stop_all(self) -> None:
-        """Stop every lane we started.
-
-        Deliberately scoped to our own lanes. This used to finish with
-        ``taskkill /F /IM tor.exe``, which force-kills **every** tor.exe on
-        the machine -- including an unrelated Tor Browser.
-
-        It also claimed `winjob` "already guarantees the children die with this
-        process". Measured, that is not enough: `winjob` works -- the job is
-        created, our process is in it, and an assigned child reports as in it
-        -- and ONE tor still survived a run. Five had accumulated, holding five
-        lane DataDirectories, and the next run could only boot one lane. So the
-        sweep is not redundant and it is now the whole lane range.
-
-        Idempotent: the second call returns at once. Callers now reach here
-        both by hand and through a `finally`, and the sweep costs seconds.
-
-        Lane data directories are NOT deleted here. They are Tor's descriptor
-        cache -- ~36 MB per lane -- and wiping them means re-downloading it on
-        the next boot. The owner asked for the disk back, then said what he
-        actually wanted was no delay at startup; the startup prune gives him
-        both, because it only ever removes dirs for lanes the pool does not
-        have. Nothing accumulates either way."""
+        """Stop every lane we started."""
         if self._stopping:
             return
         self._stopping = True
@@ -689,18 +609,7 @@ class TorManager:
         lane.wanted = False
 
     def lane_bootstrap_pct(self, lane: Lane) -> int:
-        """Best-known bootstrap percent from the lane's boot.log; -1 = no
-        evidence of progress recorded. -1 is treated as 0% progress by the
-        boot gate: a lane that never even logged 0% hasn't started.
-
-        boot.log is a separate plain-notice sink, and the reason it exists is
-        a cold-start trap found on a wiped data dir: the [circ,edge] sink
-        records circuit noise, but bootstrap progress is a NOTICE in the
-        general domain -- it went to stdout only, so tor.log never showed a
-        percent and the gate read a healthy, mid-download tor as STUCK. On a
-        warm cache the download is instant and the gate never had to look;
-        cold, every fresh user paid a restart loop that reset the download
-        each cycle. The notice sink makes the gate's input exist."""
+        """Best-known bootstrap percent from the lane's boot.log; -1 = no evidence of progress recorded."""
         try:
             lines = lane.data_dir.joinpath("boot.log").read_text(
                 encoding="utf-8", errors="replace").splitlines()
@@ -715,14 +624,7 @@ class TorManager:
         return -1
 
     def cache_mtime(self, lane: Lane) -> float:
-        """When the descriptor cache was last touched, or 0.0 with none.
-
-        The boot gate's evidence that a cold tor is DOWNLOADING rather than
-        dead: on a wiped data dir the download takes minutes, and a gate that
-        restarts on silence resets it every cycle -- the fresh user's boot
-        loop. File mtimes are the honest signal: tor rewrites these files as
-        it fetches, so a moving mtime is progress, silence after a move is
-        a stall, and the files exist whether or not any log line does."""
+        """When the descriptor cache was last touched, or 0.0 with none."""
         latest = 0.0
         try:
             for name in ("cached-microdesc-consensus", "cached-microdescs",
@@ -735,11 +637,7 @@ class TorManager:
         return latest
 
     def unpin_lane(self, lane: Lane) -> bool:
-        """Drop the ExitNodes country pin and relaunch. A pinned lane needs
-        the exit descriptors for exactly one country; when the directory
-        network is missing them, unpinning lets tor build any path. The pin
-        is not sticky: a country that cannot bootstrap re-rolls to the next
-        quiet pool entry instead of staying stuck."""
+        """Drop the ExitNodes country pin and relaunch."""
         if self._stopping:
             return False
         if self._geoip_path() is None or not lane.torrc_path().exists():
@@ -760,30 +658,13 @@ class TorManager:
             return False
 
     def _drain(self, lane: Lane, timeout: float = _DRAIN_S) -> None:
-        """Let in-flight requests finish before the lane is torn down.
-
-        A request riding a lane that is torn down loses its upstream mid-body
-        and the client is left waiting with nothing in the log to show for it.
-        Measured over the log: six teardowns happened with traffic in the
-        preceding 25 seconds, and the ones that hurt most -- a lane pulled with
-        21 calls in flight, another with 25 -- were followed by 24 and 8 minutes
-        of silence. This is a small, cheap guard against a costly event."""
+        """Let in-flight requests finish before the lane is torn down."""
         deadline = time.time() + timeout
         while lane.active > 0 and time.time() < deadline:
             time.sleep(0.2)
 
     def restart_lane(self, lane: Lane, repin: bool = False) -> bool:
-        """Re-cook a lane, re-pinning it first if its relay was limited.
-
-        With a pin in the torrc a plain restart would come back on the very
-        same limited exit, so a limited lane has to be re-pinned to a
-        relay -- that is the whole point of the pin.
-
-        `repin` asks for a fresh exit on a lane that is NOT limited. The
-        timeout tally needs that: a circuit that keeps timing out is bad
-        without being rate-limited, and re-pinning it must not be expressed
-        by writing a fake expiry into `limited_until`, which means "quota
-        spent until T" and feeds country rotation."""
+        """Re-cook a lane, re-pinning it first if its relay was limited."""
         if self._stopping:
             return False
         # live requests
@@ -839,27 +720,7 @@ class TorManager:
         return self._score.get(country, 0)
 
     def note_timeout(self, lane: Lane) -> Optional[str]:
-        """A lane's own timeout tally: 3 without a 200 and it is demolished.
-
-        The tally is per lane and only a 200 clears it. Other lanes succeeding
-        in between does NOT clear it -- that is the whole point. Measured over
-        the log: lane 1 times out, lanes 2-5 return 200, lane 1 times out
-        again, and the run keeps climbing while every neighbour stays healthy.
-
-        Replayed over the owner's 615 callends: the longest run any of his
-        lanes reached was **2**, so this escalation has never fired on his
-        traffic -- it is a backstop, not a routine path. (The 6-lane soak
-        harness, which runs far hotter, reached 3 three times.) A run only
-        starts being charged at all now that the transport does the charging.
-
-        Two strikes, escalating:
-
-            3rd timeout, no 200 since  ->re-pin a fresh exit, same country
-            3rd timeout after a re-pin ->a fresh country as well
-
-        Same country first because a fresh country means a cold tor boot and a
-        young circuit, which is the exact condition that produces the SSLEOFs.
-        Returns a description of what moved, or None if nothing did."""
+        """A lane's own timeout tally: 3 without a 200 and it is demolished."""
         lane.timeout_run += 1
         if lane.timeout_run < _TIMEOUT_RUN:
             return None
@@ -877,15 +738,7 @@ class TorManager:
                 f"moved to {{{moved or lane.exit_country}}}")
 
     def _rebuild_async(self, lane: Lane, repin: bool = False) -> None:
-        """Re-cook a lane on its own thread, tracked so shutdown can join it.
-
-        `restart_lane` drains live requests and re-launches tor, so it can sit
-        for seconds. The request that tripped the counter must not wait on
-        that -- it is already retrying elsewhere.
-
-        Tracked, because a rebuild already past its `_stopping` check can
-        launch tor AFTER `stop_all` has swept: that is how a straggler survives
-        a run and accumulates until the next run cannot boot a lane."""
+        """Re-cook a lane on its own thread, tracked so shutdown can join it."""
         t = threading.Thread(
             target=self.restart_lane, args=(lane,), kwargs={"repin": repin},
             name=f"rebuild-{lane.index}", daemon=True)
@@ -899,22 +752,7 @@ class TorManager:
         lane.repins = 0
 
     def note_result(self, country: str, status: int) -> None:
-        """Score a country by what the EXIT did: a 200, or a 429. Nothing else.
-
-        The docstring always claimed "200s are the only thing that counts",
-        but the code subtracted for every non-200. That charged a country for
-        things it does not control: a 403 is the free tier gating on the
-        CLIENT, which this codebase treats as not-a-lane-signal everywhere
-        else, and a 500 is upstream capacity -- the same footing as the 503s
-        that never reach here at all. Measured over the log, 70 callends
-        decremented a country and 63 of them were 403s, every one a GET
-        `/api.json` from the soak harness. Only 2 were the owner's.
-
-        Both a real request and the health probe route their verdict through
-        here. The probe used to call the re-pinner directly, so a lane that
-        arrived on a spent exit charged the relay but never the country -- and
-        since rotation reads the country's record, the same country kept being
-        walked back into the same spent range."""
+        """Score a country by what the EXIT did: a 200, or a 429."""
         if not country or country == "*":
             return
         if status not in (200, 429):
@@ -925,19 +763,11 @@ class TorManager:
         self._save_score()
 
     def _save_score(self) -> None:
-        """Best effort: a restart should not forget which countries worked.
-
-        Written as integer counts, not the float expiries `_save_stamps` is
-        built for -- reading one back as the other silently zeroes the map.
-        Routed through `_write_json` so the same seam covers both."""
+        """Best effort: a restart should not forget which countries worked."""
         self._write_json(SCORE_PATH, self._score)
 
     def _load_score(self) -> Dict[str, int]:
-        """Integer running totals, so a restart keeps the ranking.
-
-        Separate from `_load_stamps` on purpose: those are expiries and drop
-        themselves when stale, while a score is a plain tally that only ever
-        moves by one. Reading one as the other would silently zero the map."""
+        """Integer running totals, so a restart keeps the ranking."""
         try:
             raw = json.loads((self.root / SCORE_PATH).read_text(encoding="utf-8"))
         except (OSError, ValueError, AttributeError):
@@ -969,13 +799,7 @@ class TorManager:
         return bool(self._by_country)
 
     def _pin(self, lane: Lane) -> bool:
-        """Give a lane its own relay so no two lanes share an exit.
-
-        True when the country is usable at all, which includes the
-        country-only fallback used before any relay list exists -- returning
-        False there would make the first ever boot skip every country and land
-        on "*". False means the relay list is available and this country has
-        nothing to give, i.e. every relay there is currently limited."""
+        """Give a lane its own relay so no two lanes share an exit."""
         if not self._load_exits():
             lane.exit_fingerprint = ""
             return True  # country-only
@@ -995,24 +819,7 @@ class TorManager:
         return True
 
     def note_limited(self, lane: Lane, retry_after: float = 0.0) -> float:
-        """Record that this lane's exit has hit the free tier, and until when.
-
-        **The single place that decides an exit is out.** A 429 is the
-        evidence. Every path funnels through here so the lane's own deadline,
-        the pool's map and the picker can never disagree. They used to: three
-        different callers set the deadline with different rules, and an unnamed
-        429 left the exit looking healthy.
-
-        `retry-after` is NOT taken as the deadline. Measured over the log: 72
-        of the 87 429s carry a `retry-after`, and they collapse onto just three
-        instants -- 05:30:03 and 05:30:04 on two consecutive days -- a spread of
-        four seconds within each. All 8 of the owner's own 429s land on
-        05:30:03. So it is the far end's global window reset, not a cooldown
-        for this exit. And the exit is plainly not out: 17 of 23 exits that
-        429'd served a 200 afterwards, four of them within 12s, and one lane
-        returned 429 then 200 one second apart on the same IP. Writing that
-        window onto the exit retires healthy relays for the rest of the day, so
-        the bounded local cooldown is what we use."""
+        """Record that this lane's exit has hit the free tier, and until when."""
         if not lane.exit_fingerprint:
             return 0.0
         # window reset
@@ -1026,15 +833,7 @@ class TorManager:
         return until
 
     def _load_stamps(self, name: str) -> Dict[str, float]:
-        """``{fingerprint: valid_until}`` from disk, dropping expired entries.
-
-        Both pieces of relay bookkeeping are the same shape -- a fingerprint
-        with a moment after which it stops mattering -- so they share this.
-        For a limited relay that moment is the far end's own reset; for a used
-        one it is how long the exit is considered "not fresh". Keeping the
-        limited map on disk matters because a reset runs to hours while a
-        session lasts minutes: without it every restart re-pins relays we
-        already know are limited and pays a 429 to learn it again."""
+        """``{fingerprint: valid_until}`` from disk, dropping expired entries."""
         try:
             raw = json.loads((self.root / name).read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1053,10 +852,7 @@ class TorManager:
         return fresh
 
     def _write_json(self, name: str, payload) -> None:
-        """Best effort: never let bookkeeping break a run.
-
-        One write path, so a caller with no disk -- the verifier builds the
-        manager with `__new__` -- has a single method to stub."""
+        """Best effort: never let bookkeeping break a run."""
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text(
@@ -1069,24 +865,7 @@ class TorManager:
         self._write_json(name, stamps)
 
     def rotate_exit_country(self, lane: Lane) -> Optional[str]:
-        """Move the lane to the best country that still has an exit to give.
-
-        Ladder: preferred -> quiet -> fallback -> expansion pool. A country is
-        skipped when it is in the rotation cursor, when another lane holds it,
-        or when every relay there is currently limited -- and that last test
-        comes from `_limited`, which carries the far end's own reset, so it
-        expires by itself.
-
-        The cursor is a *rotation* aid, not a blacklist: it exists so a lane
-        walks its ladder instead of bouncing between two countries, it is kept
-        in memory only, and it is fed by nothing but a successful rotation.
-        When it covers everything it is cleared and the walk starts again, so
-        a country always comes back. `*` is reserved for an empty ladder.
-
-        The previous design persisted a country blacklist in the torrc and fed
-        it from 429s, so hitting the free tier limit removed a country for
-        good. It had already banned `fr,us,no,hu` on lane 1, and a lane that
-        had walked its whole ladder fell to `*` permanently."""
+        """Move the lane to the best country that still has an exit to give."""
         leaving = lane.exit_country
         ladders = (self._preferred, self._quiet, self._fallback,
                    self._expand)

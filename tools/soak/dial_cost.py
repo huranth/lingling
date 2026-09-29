@@ -1,60 +1,4 @@
-"""What dial failures cost, and whether a lane that dial-fails is really sick.
-
-    python tools/soak/dial_cost.py
-
-Two open policy questions, both the owner's to decide. This is the evidence:
-
-  1. should `'timed out'` / `ConnectionRefusedError` count toward a lane's
-     timeout tally? The charge gate needs `err.endswith("TimeoutError")`, so
-     the string `'timed out'` is NOT counted today;
-  2. should dial failures score a country, so rotation deprioritises nl on its
-     own? `note_result` scores only 200 and 429 today.
-
-PAIRING TRAP. Retries keep the same `(n, c)` and fire back-to-back, so keying
-callends by `(session, n, c)` in a DICT keeps only the LAST attempt -- usually
-the successful retry -- and erases the failure underneath it. The first version
-of this analysis reported **0 dial failures** for exactly that reason, against
-a log that holds 114. Pair sequentially: a callend attaches to the oldest
-un-ended call with the same `(n, c)`.
-
-WHAT IT FOUND (2026-09-22, whole log):
-
-    114 dial failures, 30.4 min of wall lost
-    nl  676 calls   59 fails   8.7%    9.0m      se  696   27   3.9%   9.8m
-    lu  894 calls   11 fails   1.2%    5.5m      no   11    8  72.7%   4.0m  (n=11, ignore)
-    worst exits: nl 192.42.116.13 15/20   se 88.80.26.3 10/16   lu 104.244.74.51 10/22
-
-    immediate retry after a dial failure : ALWAYS another lane (0 of 114),
-                                           succeeds 72.8% vs 76.0% baseline
-    next use of the SAME lane, later     : 7.0% success
-    control (next use after a clean 200) : 84.7%
-    and 86 of those 100 repeats are the SAME dial failure again
-
-So the immediate retry already copes -- it always goes elsewhere and lands at
-baseline. The lane itself is what is sick: 7% against an 84.7% control, and it
-fails the same way next time. That argues for counting `'timed out'`.
-
-**But about 6 in 10 of those repeats happen in the first 2 minutes of the
-session** (median 1.5m) and 4 in 10 later, out to 25 minutes in. (Timestamping
-the call rather than its failure moves the split by ~30s, the length of a timed
-out dial, so read it as "most are early, a substantial minority are not".)
-The early share is a
-lane still bringing circuits up; retiring THAT lane is the exact bug the owner
-warns about -- inventing a failure state for a healthy lane. So the rule, if he
-adopts it, is: count a dial failure only once the lane is not still coming up
-(`healing` already separates "booting" from "broken"). A bare tally would retire
-booting lanes and make things worse.
-
-**Section 4 sharpens it: the tally may be the wrong instrument.** Runs of 3+
-consecutive dial failures are only 10 in number yet hold **90 of the 114
-failures (79%)**, and **all 10 start within the first 1.6 minutes** of their
-session (spans up to 5.6m; the longest is 23 failures over 5.6m). Retiring at 3
-would reclaim 17.3m of the 30.4m; today's rule reaches 3 in just 2 of 129 runs
-(1.6m), i.e. it is near-inert for this. So this looks less like a timeout-tally
-question and more like a lane that never came up being handed traffic anyway --
-the win is to stop routing to a lane that has not come up, not to count its
-failures. A lane still failing after ~2 minutes is broken, not booting.
-"""
+"""What dial failures cost, and whether a lane that dial-fails is really sick."""
 import collections
 import json
 import pathlib
@@ -81,13 +25,7 @@ def load():
 
 
 def pair(recs):
-    """Attempts in order, each callend attached to its own call.
-
-    Also returns each session's START time from its `start` record -- the first
-    attempt's timestamp is not the same thing, and using it understates how
-    long the lanes had been booting, which inflated the "still coming up" share
-    of the repeats from 53% to 64%.
-    """
+    """Attempts in order, each callend attached to its own call."""
     sess, seq, pending, t0s = None, collections.defaultdict(list), {}, {}
     for r in recs:
         k = r.get("type")
@@ -214,10 +152,7 @@ def main():
         print("  the lane not still booting (`healing` already tells you).")
 
     print("\n=== 4. would a tally ever FIRE? ===")
-    # Even if he decides to count dial failures, the tally only retires a lane
-    # at 3 IN A ROW, and no owner lane has ever reached 3 on the current rule
-    # (max run 2). A rule that cannot fire is not a rule, so measure the run
-    # lengths before adopting it.
+    # Even if he decides to count dial failures,
     per_lane = collections.defaultdict(list)
     for s, lst in seq.items():
         for a in sorted(lst, key=lambda x: x["t"]):

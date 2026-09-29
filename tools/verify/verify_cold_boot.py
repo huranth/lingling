@@ -1,32 +1,4 @@
-"""The boot gate must not restart a tor that is still downloading.
-
-    python tools/verify/verify_cold_boot.py
-
-Why this exists. On a fresh install the data dir holds no descriptor cache,
-and fetching it takes minutes. The gate could not see that happening: the
-lane's Log sink was [circ,edge], whose lines carry circuit noise but never a
-bootstrap percent -- so `lane_bootstrap_pct` read -1 forever and a healthy,
-mid-download tor looked exactly like a stuck one. The gate restarted it every
-30s, the download reset every time, and the user sat in a loop that ended in
-"the kitchen stayed cold -- going direct". Found on the owner's own machine
-after a 430 MB data-dir wipe: two manual runs, one KeyboardInterrupt inside
-the gate's probe, then "tor not responding -- restarting" on loop.
-
-Two evidence sources fix it, and both are driven here through the REAL
-`_boot_gate` -- the suite holds it in a fake clock, so no wall time is paid:
-
-  * a MOVING `cache_mtime` re-arms the stall timer: progress is not a stall;
-  * percentages read from boot.log move it too, once the notice sink exists.
-
-And the flip side is pinned just as hard, because a gate that can never
-escalate is worse than a gate that escalates too early: a tor that is silent
-in BOTH -- no percent, no cache movement -- still gets poked, then unpinned,
-then regenerated, in that order.
-
-This fails on the old code: a moving cache ends with restart_lane called on
-a tor that was mid-download, and lane_bootstrap_pct reads -1 from a log that
-never carried a percent.
-"""
+"""The boot gate must not restart a tor that is still downloading."""
 import sys
 import itertools
 from contextlib import contextmanager

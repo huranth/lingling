@@ -1,28 +1,4 @@
-"""A client that stops reading must not get its lane retired.
-
-Found in a soak, and only visible because two fields were logged side by side:
-
-    TimeoutError  /zen/v1/responses  kb 47.6  secs 302.8  max_wait_s 2.2
-
-302.8 seconds, and the longest upstream read was 2.2s. No read was anywhere
-near the post-commit ceiling of the day, so the timeout could not have come
-from the
-upstream socket. It came from `client.sendall`: the client socket carries its
-own 300s timeout (`handle_conn`), a client that stops reading makes the send
-block for that whole window, and the resulting TimeoutError was then charged
-to the LANE.
-
-That is the one thing this codebase must never do -- invent a failure state
-for a healthy lane. A stalled reader says nothing about the relay it rode.
-
-The fix records WHICH SIDE blocked (`last_op`) and charges only when it was
-the upstream. `client_wait_s` is logged apart from `max_wait_s` so the two can
-never be confused again.
-
-This drives the shipped `_roundtrip` with a client that never reads, and
-asserts the lane is not charged. It fails on the old code, where the charge
-was gated only on `err.endswith("TimeoutError")`.
-"""
+"""A client that stops reading must not get its lane retired."""
 import socket
 import ssl
 import sys
@@ -103,12 +79,7 @@ def chunk(c, body):
 
 
 class StalledClient:
-    """A client socket that accepts the first bytes, then never reads again.
-
-    The first send has to succeed or nothing commits, so the budget is spent
-    on the SECOND send -- which is exactly what a client that stops consuming
-    mid-stream does to the relay.
-    """
+    """A client socket that accepts the first bytes, then never reads again."""
 
     def __init__(self, budget=2000, stall_for=30.0):
         self.budget = budget
@@ -122,7 +93,7 @@ class StalledClient:
         if self.got < self.budget:
             self.got += len(data)
             return
-        # the client has stopped reading: block like a full window would
+        # the client has stopped reading: block like a
         t = time.monotonic()
         time.sleep(self.stall_for)
         waited = time.monotonic() - t
@@ -148,11 +119,7 @@ def run(port, client, upstream_sets_timeout=True):
 
     ssl.create_default_context = lambda *a, **k: RawCtx()
     mitm._STREAM_IDLE_TIMEOUT = 3.0
-    # BOTH windows, explicitly. This used to leave the pre-commit one at its
-    # shipped value, which was 20s and made the mute-upstream case fail in
-    # about 20s. That value is now 1800s -- deliberately, because the head
-    # read is the model's time-to-first-token -- so a test that leans on it
-    # hangs instead of failing, which is the worst way for a test to break.
+    # BOTH windows, explicitly. This used to leave the
     mitm._READ_TIMEOUT = 3.0
 
     class Lane:
@@ -191,7 +158,7 @@ def main():
     def case_streams_then_idles(c):
         socks_hello(c)
         c.sendall(HEAD)
-        # commit, then keep sending so the relay has to push to the client
+        # commit, then keep sending so the relay has
         for _ in range(200):
             chunk(c, EVENT)
         c.sendall(b"0\r\n\r\n")
@@ -211,14 +178,7 @@ def main():
           (rec.get("client_wait_s") or 0) > (rec.get("max_wait_s") or 0),
           f"client_wait_s={rec.get('client_wait_s')} vs "
           f"max_wait_s={rec.get('max_wait_s')}")
-    # `client_kb` is what the CLIENT received, against `kb` which is what the
-    # far end sent. It exists to answer the one question the pane's
-    # `200 cut (SSLEOFError) [client stalled]` line cannot: did the client
-    # leave with the whole answer, or half of it? 166 of those exist in the log
-    # with `client_wait_s` of 0.0 -- the write never waited, so the client had
-    # already gone -- and `cut=True` cannot be read either way without this.
-    # A field that answers that has to be exact, so it is checked against the
-    # client's own count. Fails on the old code, where the key is absent.
+    # `client_kb` is what the CLIENT received, against `kb`
     check("client_kb records what the client actually received",
           abs((rec.get("client_kb") or -1) - client.got / 1024) < 1.0,
           f"client_kb={rec.get('client_kb')!r} against the client's own count "
@@ -226,10 +186,7 @@ def main():
     check("the LANE IS NOT CHARGED for the client's stall",
           charged == [],
           f"charged={charged} -- a healthy lane would be retired")
-    # The error path runs AFTER the head was parsed, so the record must carry
-    # the real status. It used to hardcode 0, which counted a delivered 200 as
-    # a total miss -- 151 such calls on the real log, all of them truncated
-    # answers that looked like connection failures.
+    # The error path runs AFTER the head was
     check("the error path reports the status the head carried",
           rec.get("status") == 200,
           f"status={rec.get('status')!r} -- a delivered 200 counted as a miss")
@@ -238,7 +195,7 @@ def main():
 
     def case_upstream_mute(c):
         socks_hello(c)
-        # never send anything: the upstream is the one stalling
+        # never send anything: the upstream is the one
         time.sleep(60)
 
     class FineClient:

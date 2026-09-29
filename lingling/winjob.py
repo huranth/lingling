@@ -1,8 +1,4 @@
-"""Windows Job Object with KILL_ON_JOB_CLOSE so tor.exe children die with
-this process instead of orphaning and holding their ports. No-op on POSIX.
-Gotcha: kernel32 HANDLEs are 64-bit and ctypes defaults truncate them --
-``_kernel()`` sets explicit restypes/argtypes so handles round-trip intact.
-"""
+"""Windows Job Object with KILL_ON_JOB_CLOSE so tor.exe children die with this process instead of ..."""
 
 from __future__ import annotations
 

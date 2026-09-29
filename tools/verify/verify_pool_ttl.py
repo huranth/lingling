@@ -1,24 +1,4 @@
-"""An idle tunnel must outlive one round-robin lap, or reuse is zero.
-
-The pool TTL shipped at 30s, and that number was never checked against the
-traffic it had to serve. The owner's requests arrive strictly sequentially,
-one at a time, round-robin across five lanes -- so two requests land on the
-SAME lane one full lap apart. Measured over his log that lap has a median of
-70.2s and a p75 of 150s; in the session that produced 34 calls at **0% reuse**
-the MINIMUM lap was 98.8s.
-
-Against a 30s TTL that is not a tuning problem, it is arithmetic: no tunnel
-can survive to be reused, every request pays the full SOCKS CONNECT plus TLS
-handshake, and the 0% was the TTL doing exactly what it was told. That dial is
-546ms + 723ms of Tor round trips on a warm circuit and worse on a cold one --
-and a cold circuit is where the SSLEOFs and SOCKS build failures live.
-
-So the invariant is: **the shipped TTL must cover a lap, and still bound
-staleness.** Case A is the lap. Case B is the bound. Case C is the two fields
-that made this readable from the log at all.
-
-It fails on the old code, where `_KEEPALIVE_S` is 30s and case A returns None.
-"""
+"""An idle tunnel must outlive one round-robin lap, or reuse is zero."""
 import socket
 import sys
 import threading
@@ -89,8 +69,6 @@ def idle_for(pool, seconds):
     return got
 
 
-# --------------------------------------------------------------------------
-# case C harness: drive the shipped `_roundtrip` and read its callend
 # --------------------------------------------------------------------------
 
 EVENT = b'data: {"type":"response.output_text.delta","delta":"x"}\n\n'

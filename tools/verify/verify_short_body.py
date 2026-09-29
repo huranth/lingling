@@ -1,22 +1,4 @@
-"""A request body that did not arrive whole must not be forwarded.
-
-`_read_exact` returns whatever it managed to read when the peer stops early.
-The caller used to take that short body and forward it -- with a matching
-`Content-Length`, so the far end receives a complete-but-truncated request.
-An upload path that tries to ingest that is entitled to refuse it, and the
-provider's words for exactly that refusal are
-
-    [invalid_request_error] Invalid upload request
-
-which is a 400 the owner saw on a request that took 100 seconds to fail. It
-burns a lane and a slice of the free tier on something that cannot succeed.
-
-The client is the thing that closed, so nobody is listening by then. Dropping
-the request is the only honest outcome.
-
-This drives the shipped `_read_body`, and also shows what the old inline logic
-did with the same input, so the regression is on the record rather than implied.
-"""
+"""A request body that did not arrive whole must not be forwarded."""
 import sys
 from pathlib import Path
 

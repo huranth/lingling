@@ -1,5 +1,4 @@
-"""Loopback + SOCKS5 network helpers. Raw-socket by design: httpx cannot be
-trusted to bound the SOCKS5 handshake, so one socket timeout covers the lot."""
+"""Loopback + SOCKS5 network helpers."""
 
 from __future__ import annotations
 
@@ -19,15 +18,7 @@ SOCKS_SLOTS = int(os.environ.get("LINGLING_SOCKS_SLOTS", "8"))
 
 
 def slot_cred(lane_index: int, slot: int) -> Tuple[str, str]:
-    """Username for one of a lane's isolated circuits.
-
-    Tor keys circuit isolation on the SOCKS **username** -- ``IsolateSOCKSAuth``
-    is on by default and a bare no-auth greeting gives every stream the same
-    empty key. So without a credential a whole lane shares one circuit, and one
-    ``RELAY_END`` takes every concurrent stream on it down together. One
-    username per slot buys one circuit per slot, which is what bounds that
-    blast radius. The password is never part of the key; it only has to be
-    non-empty."""
+    """Username for one of a lane's isolated circuits."""
     return f"L{lane_index}s{slot % SOCKS_SLOTS}", "x"
 
 
@@ -48,8 +39,7 @@ def port_is_open(host: str, port: int, timeout: float = 0.2) -> bool:
 
 
 def bindable(port: int, host: str = "127.0.0.1") -> bool:
-    """True if a fresh socket can bind+listen -- catches Windows' excluded
-    port ranges (Hyper-V/WSL), which report free but fail bind (WSAEACCES)."""
+    """True if a fresh socket can bind+listen -- catches Windows' excluded port ranges (Hyper-V/WSL) ..."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -66,13 +56,7 @@ def bindable(port: int, host: str = "127.0.0.1") -> bool:
 def find_free_port(start_port: int, host: str = "127.0.0.1",
                    max_offset: int = 200,
                    reserved: Optional[Container[int]] = None) -> int:
-    """First port near ``start_port`` that is free and bindable.
-
-    ``bindable`` is checked first on purpose. It is a local bind, so it is
-    instant, while ``port_is_open`` pays a connect timeout on every port that
-    black-holes -- and a Windows-excluded range (Hyper-V/WSL) black-holes all
-    of them. Testing open-first cost ~0.2s per port, so a 200-port scan took
-    ~40s and then failed anyway. The predicate is unchanged; only the order."""
+    """First port near ``start_port`` that is free and bindable."""
     taken = reserved or frozenset()
     for offset in range(max_offset):
         port = start_port + offset
@@ -134,12 +118,7 @@ def kill_pid(pid: int, grace_s: float = 2.0) -> bool:
 
 
 def pids_on_ports(ports: Container[int]) -> dict:
-    """``{port: pid}`` for the given ports that something is LISTENING on.
-
-    One `netstat` for the lot. `pid_on_port` shells out per port, which is
-    fine for the two ports a lane owns and hopeless for a sweep across the
-    whole lane range -- that ran `netstat` thousands of times and took minutes.
-    """
+    """``{port: pid}`` for the given ports that something is LISTENING on."""
     if platform.system().lower() != "windows":
         return {}
     want = set(ports)
@@ -171,11 +150,7 @@ def pids_on_ports(ports: Container[int]) -> dict:
 
 
 def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
-    """Exactly ``n`` bytes, or None if the peer closed early.
-
-    A timeout is deliberately NOT caught here: it has to reach the caller's
-    ``except socket.timeout`` so a stalled handshake still reports "timed out"
-    rather than being relabelled a malformed reply."""
+    """Exactly ``n`` bytes, or None if the peer closed early."""
     buf = b""
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -187,35 +162,7 @@ def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
 
 def socks5_open(sock: socket.socket, host: str, port: int,
                 cred: Optional[Tuple[str, str]] = None) -> str:
-    """SOCKS5 CONNECT on a connected socket; "" on success, else a reason.
-
-    ``cred`` selects username/password auth instead of no-auth. That is not
-    access control: Tor's ``IsolateSOCKSAuth`` is on by default and the
-    username is the circuit's isolation key, so a credential is how one lane
-    gets many circuits instead of one. Omitting it keeps the old no-auth
-    greeting, which every existing caller and verify suite still relies on.
-
-    Two blocking reads: the greeting reply, then the CONNECT reply, which is
-    where Tor actually builds the circuit. A socket timeout is per read, not a
-    budget, so arming it once let a dead exit spend the window TWICE -- measured
-    against a stalled upstream, a 3s window failed in 3.0s when the greeting was
-    prompt and 4.5s when the greeting itself was 1.5s late. That is why the
-    log's cold-connect timeouts land at 30-60s rather than at 30s, and it is
-    worth knowing before reading any timeout number as a single window.
-
-    So the second read gets only what is LEFT of the window, which is what this
-    module always claimed: one socket timeout covers the lot. A handshake that
-    needs longer than one window fails here, and the caller retries on another
-    lane -- the window is not shortened, because the log's successful attempts
-    have a p99 of 26.8s to their first byte, so it is doing real work.
-
-    The CONNECT reply is variable length: VER REP RSV ATYP, then a BND.ADDR
-    whose size ATYP decides, then BND.PORT. Reading a flat 10 bytes is right
-    only for ATYP=0x01. Tor does return 0x01 with 0.0.0.0:0 today -- verified
-    on a live lane -- so this was latent rather than live, but a domain or IPv6
-    BND.ADDR would leave 12+ bytes in the buffer and the TLS handshake that
-    follows would read them as its own first bytes. `relay._dial` has always
-    parsed all three; this now matches it."""
+    """SOCKS5 CONNECT on a connected socket; "" on success, else a reason."""
     # one window
     window = sock.gettimeout()
     deadline = (time.time() + window) if window else None
@@ -284,9 +231,7 @@ def https_via_socks(proxy_port: int, host: str, method: str, path: str,
                     extra_headers: Optional[dict] = None,
                     timeout: float = 15.0,
                     max_body: int = 8 * 1024 * 1024) -> Tuple[int, bytes]:
-    """HTTPS request through a Tor lane's SOCKS5 port; returns (status, body).
-    Raises on transport failure (lane-dead); status 429 means the exit IP
-    has hit opencode's free tier limit for this window."""
+    """HTTPS request through a Tor lane's SOCKS5 port; returns (status, body)."""
     sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=timeout)
     try:
         err = socks5_open(sock, host, 443)

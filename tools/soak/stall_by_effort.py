@@ -1,25 +1,4 @@
-"""Does the stall track reasoning effort? Answer it from the log, not by feel.
-
-    python tools/soak/stall_by_effort.py [proof.log]
-
-What this is for. The owner's report is that the timeouts only land on hard
-reasoning tasks. Until `_model_of` started carrying effort, that could not be
-checked at all -- the request body was never recorded, so the correlation had
-no data behind it. This reads the field and cross-tabulates.
-
-It reports and never asserts. A tool that decided the answer would be the same
-mistake as theorising without data: with a handful of stalls, any split looks
-like a pattern. So the output leads with the COUNTS, states whether they are
-enough to conclude anything, and refuses to print a verdict when they are not.
-
-The two shapes are kept apart on purpose, because they are different bugs:
-
-  never spoke   kb == 0 and first_byte_s == 0   -- a cold circuit
-  spoke, slowed kb > 0  and TimeoutError        -- the owner's stall
-
-Mixing them is what made an earlier pass of this session report numbers that
-described neither.
-"""
+"""Does the stall track reasoning effort?"""
 import collections
 import json
 import pathlib
@@ -62,17 +41,7 @@ def parse_params(model_field):
 
 
 def pair(recs):
-    """(params, rows): every callend joined to its call's effort and cap.
-
-    Keyed by (session, n, c), and the session MUST be tracked as we walk. A
-    first version looked up `(None, n, c)` against params stored under a
-    session tuple -- it matched nothing and reported every attempt as "?". A
-    second version fixed the store but reused the `sess` left over from the
-    collecting pass, which is the LAST session, so callends were matched
-    against one session's params; because (n, c) repeats across sessions that
-    invented buckets -- 886 "high" attempts out of 1701 when the real figure
-    was 28. Both bugs were invisible to a single-session test, which is why
-    `--selftest` uses two sessions sharing the same (n, c) values."""
+    """(params, rows): every callend joined to its call's effort and cap."""
     params = {}
     rows = []
     sess = None

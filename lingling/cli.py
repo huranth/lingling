@@ -1,8 +1,4 @@
-"""lingling -- official OpenCode, riding rotating Tor lanes.
-
-CLI entrypoint: boots Tor lanes, starts the local relay, then execs opencode
-with HTTPS_PROXY pointed at it; all other args pass through untouched.
-"""
+"""lingling -- official OpenCode, riding rotating Tor lanes."""
 
 from __future__ import annotations
 
@@ -28,12 +24,7 @@ DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
 
 def load_countries(path: Optional[Path] = None) -> tuple:
-    """Country override: <data dir>/countries.txt, line 1 primary, line 2
-    fallback, line 3 preferred. Falls back to DEFAULT_COUNTRIES.
-
-    ``#`` starts a comment, and a comment-only line disappears entirely -- it
-    must not count as one of the three pools. A blank line still does: that is
-    how you skip a pool."""
+    """Country override: <data dir>/countries.txt, line 1 primary, line 2 fallback, line 3 preferred."""
     path = path or (DATA_DIR / "countries.txt")
     if path.exists():
         try:
@@ -90,11 +81,7 @@ class _Loader:
             self._detail = detail
 
     def steady(self, msg: str) -> None:
-        """Pin one line from second zero: a cold first run never gets the
-        kitchen phrases. They are warm-boot flavour, and on a machine that
-        is still fetching tor they read as "this tool is slow" -- the one
-        false impression a new user can form before the real message
-        arrives. The pinned line holds until real progress replaces it."""
+        """Pin one line from second zero: a cold first run never gets the kitchen phrases."""
         with self._lock:
             self._first = msg
             self._detail = msg
@@ -175,27 +162,7 @@ def _parse_args(argv: list[str]) -> dict:
 def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
                download_limit: float = 120, quick_limit: float = 30,
                deep_limit: float = 90, deadline_s: float = 600) -> bool:
-    """Wait for the first lane, escalating only at genuine dead air.
-
-    A cold cache makes this gate different from a warm one: fetching the
-    relay descriptors takes minutes on a fresh install, and tor writes them
-    incrementally -- so a MOVING cache is progress, not a stall, and a
-    restart over it resets the download each cycle. That restart loop was
-    every fresh user's first boot before this gate could see what tor was
-    doing: the [circ,edge] sink never carried a percent, so a healthy
-    mid-download tor read as stuck at 0%.
-
-    Two evidence sources now feed it, both cheap:
-
-      * ``boot.log`` -- a plain-notice sink written by the lane config, and
-        the only place bootstrap percentages are visible at all;
-      * ``cache_mtime`` -- descriptor file mtimes, which move exactly while
-        tor is fetching. Log lines can be suppressed; a growing 36 MB cache
-        cannot.
-
-    Escalation holds off while either moves, and a tor that is silent in
-    BOTH is the only thing that gets poked. Returns True once the lane
-    answers, False when the deadline passed without one."""
+    """Wait for the first lane, escalating only at genuine dead air."""
     deadline = time.time() + deadline_s
     last_pct = -1
     last_pct_at = time.time()
@@ -243,11 +210,7 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
 
 
 def _cache_is_cold(data_dir: Path) -> bool:
-    """True when no lane holds a descriptor cache yet.
-
-    Read from the filesystem alone, BEFORE the spinner starts: which line
-    a first run shows cannot wait on a manager, or the flavour lines get
-    their frame in first and the user reads the wait as slowness."""
+    """True when no lane holds a descriptor cache yet."""
     try:
         return not any((data_dir / "lanes").glob("tor-*/cached-microdesc*"))
     except OSError:
@@ -337,15 +300,7 @@ def main(argv: list[str]) -> int:
                                       log=lambda *a: None)
 
                 def _report_boot(lane, status) -> None:
-                    """Say so when a lane did not come up.
-
-                    `start_lanes` has always computed this status per lane and
-                    then called `on_lane` only `if on_lane` -- and no caller
-                    ever passed one, so the whole outcome was discarded. A lane
-                    whose launch failed therefore produced no event at all: the
-                    pane stayed silent and `start.lanes` still advertised the
-                    full pool. Found as a soak that ran **all 46 calls on lane
-                    6** with no lane events anywhere."""
+                    """Say so when a lane did not come up."""
                     if status in ("started", "already_running"):
                         return
                     emit({"type": "lane", "kind": "fail", "t": time.time(),

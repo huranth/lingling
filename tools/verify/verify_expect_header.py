@@ -1,25 +1,4 @@
-"""The relay answers `Expect: 100-continue` itself, so it must not forward it.
-
-`handle_conn` reads the client's headers and, if they carry a 100-continue
-expectation, sends the client a local `HTTP/1.1 100 Continue` so it will go
-ahead and send its body. The body is then read and the request is re-issued
-upstream.
-
-But `expect` was never in the outbound `skip` set, so the header went upstream
-too -- while the body was sent immediately. That is a protocol violation:
-RFC 7231 5.1.1 says a proxy that responds to the expectation itself must not
-pass it on. The upstream is then entitled to refuse the request WITHOUT reading
-the body, and the provider's own words for that are
-
-    [invalid_request_error] Invalid upload request
-
--- an upload path bailing before it ingests anything, which is what the owner
-saw on one request that took 100 seconds to be refused.
-
-This drives the shipped `_roundtrip` with a client that sends the expectation
-and captures the bytes the relay puts on the wire. It fails on the old code,
-where `expect: 100-continue` appears in the forwarded head.
-"""
+"""The relay answers `Expect: 100-continue` itself, so it must not forward it."""
 import sys
 import threading
 from pathlib import Path
@@ -127,10 +106,7 @@ def main():
     for line in head.splitlines():
         print("     " + line)
 
-    # NOTE: the local `100 Continue` to the CLIENT is sent by `handle_conn`, one
-    # level up -- this function only re-issues the request. Asserting it here
-    # was wrong and failed. What matters at THIS level is that the header does
-    # not ride along upstream, which is the violation.
+    # NOTE: the local `100 Continue` to the CLIENT
     check("and it did NOT forward the expectation upstream",
           "expect" not in head.lower(),
           "the upstream is told to expect a 100-continue it will never get, "

@@ -4,12 +4,11 @@ import os
 import sys
 from pathlib import Path
 
-__version__ = "2.1.20.post5"
+__version__ = "2.1.20.post6"
 
 
 def data_dir() -> Path:
-    """Per-user runtime state (tor, lanes, proof log). Lives outside the
-    package -- a pip install must never write into site-packages."""
+    """Per-user runtime state (tor, lanes, proof log)."""
     override = os.environ.get("LINGLING_DATA_DIR")
     if override:
         return Path(override)

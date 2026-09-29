@@ -1,31 +1,4 @@
-"""The 503/504 session, proven offline. No network, no tor.
-
-    python tools/verify/verify_5xx_delivery.py
-
-What the owner's proof log showed, and what this suite pins shut:
-
-  * A retryable verdict was buffered WITHOUT its head. The head went into
-    `_open`, which only flushes when a response streams out -- and a held
-    429/503/504 never streams out. So when the retries stopped, the client
-    was sent a headless body: no status line, nothing opencode can parse.
-    The exhaustion fallback then covered it with an invented
-    `502 Bad Gateway` -- a lie about who failed. The held buffer must be a
-    COMPLETE response, head first, because it is what the caller delivers.
-
-  * A 5xx was retried on every lane. One 503 in the log (#70) spent four
-    attempts and four ~3.4 MB uploads on four different exits inside three
-    minutes; the next call (#71) did it again with 504s. A 5xx is the far
-    EDGE, which every exit rides -- another exit cannot route around an
-    unwell edge, it can only re-roll it. Two attempts cover the single-exit
-    bad moment; an edge-wide one must stop there.
-
-  * The error body -- the far end's own words about why -- was buffered for
-    the retry and then thrown away. The pane could only say `503 0.2 KB`.
-    The first 512 bytes now ride the callend as `note`.
-
-It fails on the old code: case A's held buffer has no head, case D retries
-past the cap and delivers an invented 502, and the callends carry no `note`.
-"""
+"""The 503/504 session, proven offline."""
 import io
 import sys
 import threading
@@ -46,8 +19,6 @@ def check(name, ok, detail=""):
         FAILS.append(name)
 
 
-# --------------------------------------------------------------------------
-# harness: the same stand-ins verify_call_outcome uses, trimmed to this file
 # --------------------------------------------------------------------------
 
 BODY = b'{"model":"muse-spark-1.3-contributor-free"}'
@@ -201,7 +172,7 @@ class FakeRelay:
         self.refused.append((lane.index, status))
 
     def any_unlimited(self, exclude):
-        # every lane is limited, so the pool is exhausted
+        # every lane is limited, so the pool is
         return False
 
 

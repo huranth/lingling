@@ -1,24 +1,4 @@
-"""A probe 429 must actually reach the refusal handler.
-
-`health.reachable()` returns whatever status the far end gave on the MODEL
-path, and `check_once` acts on `code == 429` by calling `on_refused`. The claim
-that a 429 is one of the probe's possible answers is **inferred**, not measured:
-a hand-rolled probe sends no reachable request, so it can never spend quota and
-can never make an exit 429 by itself. What can be tested offline is the part
-that actually matters to us -- that when the far end DOES answer 429, the code
-propagates it and the lane moves, instead of the status being flattened to
-"healthy".
-
-`verify_probe_status.py` is the live companion: it boots a real lane and shows
-the shipped body getting 403 (exit fine) or 429. It accepts 429 as a permitted
-outcome but never exercises that branch. This test does, by stubbing the single
-transport function `reachable()` calls, so no Tor and no network are needed and
-it can run in the audit.
-
-The tests are written to fail on the old code. Reverting either
-`reachable()`'s `return code` to a bare truthy constant, or `check_once`'s
-`if code == 429` guard to `if code`, turns them red.
-"""
+"""A probe 429 must actually reach the refusal handler."""
 import contextlib
 import sys
 from pathlib import Path
@@ -136,11 +116,7 @@ def main():
           f"exit_ip={tor.lanes[0].exit_ip!r}")
 
     print("\n=== a non-verdict is NOT a verdict about the lane ===")
-    # The rule used to be `if code:`, so any truthy status marked the lane up
-    # and set `asked` -- and it was never probed again. A probe whose model the
-    # far end rejects answers 401; a model/path mismatch answers 500. Both are
-    # truthy, so under the old rule either one silently disabled the 429 branch
-    # for the life of the session. Measured: see tools/probe/model_matrix.py.
+    # The rule used to be `if code:`, so
     for status in (401, 500):
         events = []
         with daemon(status, events) as (tor, d):

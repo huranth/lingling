@@ -1,25 +1,4 @@
-"""Does the 20s ceiling kill a long think?
-
-Scenario under test, stated by the owner:
-
-    first token at 19s, then the model thinks for 60s more
-
-If the ceiling were a total budget, that call dies at 20s. If it is an idle
-ceiling, every byte re-arms it and the call runs for 19 + 60 = 79s.
-
-The fake upstream below sends bytes on a real socket on a real schedule, so
-this measures the shipped code rather than a description of it. A plain socket
-stands in for the TLS connection: the relay codes deals in sendall/read/
-settimeout/close, all of which it has. `socks5_open` is stubbed to "" so the
-dial lands straight on the fake server.
-
-There are TWO ceilings now, and this suite keeps both honest. Before the
-stream commits, the window is 20s and a stall must fail fast -- the client has
-seen nothing and a retry is free. After commit the client already has bytes,
-a retry is impossible, and cutting only truncates the answer, so the window is
-generous (1800s shipped). A gap under it is a think-pause; a gap over it is
-still caught. See `verify_committed_stream.py` for the full case.
-"""
+"""Does the 20s ceiling kill a long think?"""
 
 from __future__ import annotations
 
@@ -50,11 +29,7 @@ class Tap:
 
 def _serve_slow(first_at: float, gap0: float, think_for: float,
                 gap: float) -> tuple[socket.socket, int]:
-    """Upstream that pauses, opens the head, pauses, then streams.
-
-    Silence for `first_at`; SSE head; silence `gap0` (the first token lands at
-    the end of it); then one data: event every `gap` seconds for `think_for`.
-    """
+    """Upstream that pauses, opens the head, pauses, then streams."""
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
@@ -62,10 +37,7 @@ def _serve_slow(first_at: float, gap0: float, think_for: float,
     port = srv.getsockname()[1]
 
     def run() -> None:
-        # A client that hangs up is normal here: the case that SHOULD die does
-        # so at the ceiling, mid-stream. Every send has to tolerate that, or the
-        # daemon thread prints a traceback into stderr and the audit reads the
-        # crash as the test failing.
+        # A client that hangs up is normal here:
         conn, _ = srv.accept()
         try:
             time.sleep(first_at)                 # think before the head
@@ -101,15 +73,7 @@ def _serve_slow(first_at: float, gap0: float, think_for: float,
 def _run_case(first_at: float, gap0: float, think_for: float,
               gap: float, ceiling: float, post: float = 300.0
               ) -> tuple[bool, float, int, int, str]:
-    """Drive _roundtrip against the fake upstream.
-
-    `ceiling` is the PRE-commit read ceiling; `post` is the ceiling that
-    applies once the stream has committed. They are separate on purpose --
-    see `verify_committed_stream.py` for why, and this is the suite that has
-    to keep both honest.
-
-    Returns (ok, secs, kb, first_event_s, err).
-    """
+    """Drive _roundtrip against the fake upstream."""
     srv, port = _serve_slow(first_at, gap0, think_for, gap)
     old = mitm._READ_TIMEOUT
     old_post = mitm._STREAM_IDLE_TIMEOUT
@@ -161,13 +125,7 @@ def main() -> int:
     print("  head at 1s, first token at 19s, then bytes every 1.0s for 60s")
     print(f"  result: ok={ok}  wall={secs:.1f}s  bytes={kb} KB  "
           f"first_event={fes}s  err={err!r}")
-    # The claim is that the ceiling is IDLE, not a total budget: a stream that
-    # keeps arriving outlives it. Wall time well past the ceiling, with real
-    # bytes delivered, is that claim. `ok` is deliberately NOT required here --
-    # the fake upstream races its own FIN against the harness's clock, so a
-    # clean 200 is not something this rig can promise, and demanding it made
-    # the suite fail on correct behaviour. The other two cases below are the
-    # ones that assert death, and they still require `not ok`.
+    # The claim is that the ceiling is IDLE,
     survived = secs >= 75 and fes >= 18 and kb >= 2
     print(f"  [{'PASS' if survived else 'FAIL'}] survived all 79s"
           f"  (needed >=75s and >=2KB, got {secs:.1f}s / {kb}KB)")
@@ -183,9 +141,7 @@ def main() -> int:
           f"  (needed <24s, got {secs2:.1f}s)")
 
     print("\n=== a silence past the POST-commit ceiling still cuts it ===")
-    # `post` is set below the 25s gap on purpose: the post-commit window is
-    # generous (300s shipped) because a committed stream cannot be retried,
-    # but it is still a ceiling and a genuine post-commit stall must trip it.
+    # `post` is set below the 25s gap on
     ok3, secs3, kb3, fes3, err3 = _run_case(first_at=1.0, gap0=1.0,
                                             think_for=1.0, gap=25.0,
                                             ceiling=20.0, post=10.0)
@@ -197,8 +153,7 @@ def main() -> int:
           f"  (needed first_event>0, got {fes3}s)")
 
     print("\n=== but a gap UNDER the post-commit ceiling is a think-pause ===")
-    # The owner's actual failure: a committed stream that pauses, where the
-    # old single ceiling cut it mid-answer.
+    # The owner's actual failure: a committed stream that
     ok4, secs4, kb4, fes4, err4 = _run_case(first_at=1.0, gap0=1.0,
                                             think_for=1.0, gap=8.0,
                                             ceiling=20.0, post=10.0)

@@ -1,31 +1,4 @@
-"""A committed stream must not be cut for pausing to think.
-
-The owner's report:
-
-    01:14:38  #3.1 failed (TimeoutError) 62.1 KB in 184.1s  first 13.84s
-
-The stream had committed -- `first_event_s` 14.16s, bytes on the wire -- and
-then went quiet. The relay cut it, the attempt was not retryable (the client
-had already seen bytes), so `handle_conn` returned and the client's connection
-closed mid-answer. That is the failure: not a failed request, a TRUNCATED one.
-
-The ceiling was firing on the natural pause of a reasoning model. Measured
-over the log, the 11 committed stalls delivered 48-62 KB at 0.3-1.8 KB/s, and
-healthy streams send their first event within 4.28s of the head -- so a gap
-after commit is a think-pause, not a dead socket.
-
-The fix splits the ceiling at the moment of commit:
-
-    before commit  _READ_TIMEOUT (20s)       retry is free, fail fast
-    after commit   _STREAM_IDLE_TIMEOUT      no retry possible, so cutting
-                   (1800s)                   only destroys the answer
-
-A genuinely closed peer is caught by EOF either way, so the generous
-post-commit window costs nothing on the failure that actually happens.
-
-This drives the shipped `_roundtrip` against real sockets. It fails on the old
-code: with one ceiling for both phases, case A dies where it must survive.
-"""
+"""A committed stream must not be cut for pausing to think."""
 import socket
 import ssl
 import sys
@@ -167,7 +140,7 @@ def run(port, pre=2.0, post=8.0):
 
 
 def main():
-    # Short windows so the proof runs in seconds; the RATIO is the claim.
+    # Short windows so the proof runs in seconds;
     pre, post = 2.0, 8.0
     gap = 5.0                      # > pre, < post -- the owner's shape
 
@@ -227,9 +200,7 @@ def main():
     check("a closed peer is not mistaken for a stall",
           err != "TimeoutError" and secs < post,
           f"err={err!r} wall={secs:.1f}s -- EOF should end it at once")
-    # The head was a 200 and bytes reached the client, so the record must say
-    # 200. It used to hardcode 0 on every error path, which counted a
-    # truncated answer as a total miss -- 151 such calls on the real log.
+    # The head was a 200 and bytes reached
     check("a truncated 200 is recorded as 200, not as a failure",
           rec.get("status") == 200,
           f"status={rec.get('status')!r} -- a delivered 200 counted as a miss")

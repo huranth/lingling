@@ -1,21 +1,4 @@
-"""A 429's `retry-after` is a global window reset, not this exit's cooldown.
-
-Two claims, both measured against the shipped code and the real log:
-
-  * The far end reports the SAME instant for every 429 it hands out, on every
-    lane and every country. Over the log's 72 429s that instant is 05:30:03
-    local, spread four seconds. So the number is a window reset for the whole
-    free tier, and carries nothing about which exit was refused.
-  * The exit is demonstrably not out afterwards: 17 of the 23 exits that 429'd
-    went on to serve a 200, four of them within 12 seconds.
-
-Therefore `note_limited` must NOT write that window onto the exit as its
-deadline. Doing so retired healthy relays for 8-14 hours, which is the same
-mistake the health daemon's docstring says was already purged: an inference
-about an exit we never measured, retiring healthy ones.
-
-The check below fails on the old formula, and passes on the bounded one.
-"""
+"""A 429's `retry-after` is a global window reset, not this exit's cooldown."""
 import json
 import os
 import pathlib
@@ -56,7 +39,7 @@ def main():
     print("=== the far end's window reset is not taken as an exit cooldown ===")
     mgr = make_manager(tmp)
     lane = make_lane(tmp)
-    # 43677s is a real value from the log -- 12.1 hours, the window reset.
+    # 43677s is a real value from the log
     until = mgr.note_limited(lane, 43677)
     span = until - time.time()
     print(f"  note_limited(43677) -> the exit is out for {span/60:.1f} min")
@@ -76,25 +59,7 @@ def main():
           115 < span2 < 125, f"{span2:.0f}s")
 
     print("\n=== the log: the resets cluster at one time of day, across days ===")
-    # `retry_after` counts down to the far end's NEXT window reset. So the
-    # property that proves "global reset, not per-exit cooldown" is that every
-    # 429 across the log resolves to a reset at the SAME TIME OF DAY -- which is
-    # only visible with the date kept.
-    #
-    # The old check folded with `% 86400` first. Measured against the log that
-    # is not a wrong answer (a real global reset folds to one bucket either
-    # way), but it is the wrong SHAPE: the fold throws away the day boundary,
-    # so a log spanning several days reports "one instant" when it is really
-    # one instant per day. It now reports the wall span, which is what makes
-    # the claim readable, and the print says how many days were covered.
-    #
-    # Both checks were tried against synthetic logs before being trusted:
-    #   - truly scattered per-exit cooldowns (1 day, 11.1h) are rejected -- and
-    #     the old fold rejected them too, so this is not a regression fix;
-    #   - a single-day log says so out loud instead of implying a daily repeat.
-    # A crafted case where resets share a time of day across two days is NOT
-    # rejected, and should not be: that data is genuinely indistinguishable
-    # from a global reset by this evidence alone.
+    # `retry_after` counts down to the far end's NEXT
     log = pathlib.Path(os.environ.get("LOCALAPPDATA", "")) / "lingling" / "proof.log"
     if not log.exists():
         check("the log is present to replay", False, f"missing {log}")
@@ -121,7 +86,7 @@ def main():
             in_day = max(tod) - min(tod)
             wall = max(resets) - min(resets)
             span_tod = max(tod) - min(tod)
-            # midnight wrap: a small negative gap is a same-instant cluster
+            # midnight wrap: a small negative gap is a
             if span_tod > 43200:
                 span_tod = 86400 - span_tod
             print(f"  {len(resets)} 429s over {len(days)} day(s) -> "

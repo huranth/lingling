@@ -1,13 +1,4 @@
-"""Repo hygiene: does the tree still meet every standard we set?
-
-    python tools/verify/verify_audit.py
-
-Run this before any push. It checks the things that are easy to regress and
-hard to notice: comment length, dead code, duplicated logic, stale vocabulary,
-files nothing accounts for, and whether the local-only paths are actually
-excluded from git. Every check names the standard it enforces, so a failure
-says what to fix rather than just that something is wrong.
-"""
+"""Repo hygiene: does the tree still meet every standard we set?"""
 import ast
 import io
 import pathlib
@@ -41,19 +32,7 @@ FAIL = []
 
 
 def check(name, cond, detail=""):
-    """Print a verdict, and label the detail as a note or a reason.
-
-    Some checks pass an informational detail ("found 6 callend emits") and
-    some pass the reason they would fail ("the ceiling behaved like a total
-    budget"). This used to print both identically, so a PASSING line read as a
-    contradiction:
-
-        PASS  a slow stream outlives the ceiling   the ceiling behaved like a
-                                                    total budget
-
-    That is the same failure this whole file exists to prevent -- output that
-    says one thing and means another. A parenthesised note is a fact; a bare
-    reason after FAIL is a reason."""
+    """Print a verdict, and label the detail as a note or a reason."""
     if not cond:
         print(f"  FAIL  {name}" + (f"   {detail}" if detail else ""))
         FAIL.append(name)
@@ -106,11 +85,6 @@ def main():
                                  ast.ClassDef)):
                 defs.setdefault(node.name, []).append(p.name)
     #: Walked, not just module level -- the old check read `ast.parse(...).body`,
-    #: so no METHOD was ever examined and dead methods were invisible. And the
-    #: search is the PACKAGE only: a function called solely by its own test
-    #: suite is dead in the product, and searching src_all hid exactly that.
-    #: A mention counts, not just a call, because callbacks are passed by name
-    #: (`target=self._loop`) and classes are used as annotations (`lane: Lane`).
     pkg_only = blob(PKG)
     dead = []
     for name in sorted(defs):
@@ -137,8 +111,6 @@ def main():
     print("\n=== the limit decision is single-sourced ===")
     pkg_src = blob(PKG)
     #: the invariant, not a count: the recorder sets it, and the one path that
-    #: hands the lane a fresh relay clears it. A count has to be edited on every
-    #: refactor and then it stops meaning anything -- this names the owners.
     owners = set()
     for p in PKG:
         lines = p.read_text(encoding="utf-8").splitlines()
@@ -154,20 +126,7 @@ def main():
     check("one recorder owns it", pkg_src.count("def note_limited") == 1)
 
     print("\n=== a loaded lane is never benched ===")
-    # A lane that is healthy carries its request however loaded it is. Two
-    # designs were rejected for breaking that: a `_LANE_CAP` that held a
-    # request when N lanes looked busy, and a first-strike pull that retired a
-    # lane after one timeout. Both blamed our own arithmetic on a live lane and
-    # idled paid-for capacity, and both spiralled: pull one, load the rest,
-    # pull them too. A name blacklist would not catch them -- the cap was a
-    # brand-new constant and a brand-new emit, so nothing was unreferenced and
-    # no removed word appeared.
-    #
-    # So this is structural, and read from the AST rather than the text --
-    # a text scan cannot tell `pick_lane`'s own return from the `key()` helper's.
-    # `pick_lane` may *rank* a lane by how much it is carrying; it may never
-    # *drop* one for it. Narrow on purpose: `busy` and `wait` are honest words
-    # about a live socket, so they are not evidence of anything.
+    # A lane that is healthy carries its request
     tree = ast.parse(pkg_src)
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
@@ -180,13 +139,7 @@ def main():
     own = [n for n in (fn.body if fn else []) if not isinstance(n, ast.FunctionDef)]
     own_src = "\n".join(ast.unparse(n) for n in own)
 
-    # `l.active` is how we *rank*. The rejected designs read it to *decide*: a
-    # comprehension that keeps only busy lanes, an `if` that consults a load
-    # count, a threshold. The two are distinguishable by the frame that holds
-    # the read. Clean: `Tuple -> Return -> key()`, i.e. the value goes back to
-    # `min(..., key=...)` to be compared against other lanes. Rejected:
-    # `Compare -> comprehension`, i.e. the count is tested and lanes are
-    # dropped. So the rule is on the enclosing statement, not the comparison.
+    # `l.active` is how we *rank*. The rejected designs
     def judges(node):
         up = getattr(node, "parent", None)
         while up is not None:
@@ -212,8 +165,6 @@ def main():
           not re.search(r"(max_active|_LANE_CAP|_CAP\b|>= *cap|busy *at *)",
                         own_src), "a cap is back")
     #: the verdict, not the prose about it. A docstring may explain that the
-    #: cap was removed -- that is the one honest place an "at cap" can live.
-    #: Everything else that is a string and carries those words is an emit.
     prose = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
@@ -234,18 +185,7 @@ def main():
           "holding this request" not in own_src)
 
     print("\n=== the timeout tally is a counter, not a verdict ===")
-    # `note_timeout` is the one piece of per-lane state we keep, and it is a
-    # reintroduction of exactly the machinery the section above removed. So it
-    # is pinned to the shape that made it defensible:
-    #
-    #   * it counts ONE measured event -- a TimeoutError -- and nothing else
-    #   * a 200 clears it, so a lane that recovers is never held to its past
-    #   * it lies dormant below the threshold; it may not emit, delay or drop
-    #     anything until the counter is full
-    #
-    # What must never come back: a strike on any other event, a tally a success
-    # does not clear, or an action taken below the threshold. Without this the
-    # feature can regrow into the sidelining ladder by one small edit.
+    # `note_timeout` is the one piece of per-lane state
     lsrc = (ROOT / "lingling" / "lanes.py").read_text(encoding="utf-8")
     lfns = {n.name: n for n in ast.walk(ast.parse(lsrc))
             if isinstance(n, ast.FunctionDef)}
@@ -262,12 +202,6 @@ def main():
     check("the threshold is single-sourced",
           lsrc.count("_TIMEOUT_RUN") >= 3, f"{lsrc.count('_TIMEOUT_RUN')}")
     #: only a TimeoutError may charge it. A strike on 403/503/SSLEOF is the
-    #: revoked design: 403 is a client gate and cannot be fixed by moving. The
-    #: check reads the AST, because "does the file contain these two words"
-    #: passes even after the gate is deleted -- the call site and the word both
-    #: survive; only the `if` around the call is gone. The charge lives in the
-    #: transport, where the timeout actually happens, so the search is over
-    #: every function rather than a named one.
     msrc = (ROOT / "lingling" / "mitm.py").read_text(encoding="utf-8")
     gated = False
     for fn in ast.walk(ast.parse(msrc)):
@@ -288,11 +222,7 @@ def main():
           "ungated _note_timeout call")
 
     print("\n=== ctypes structs match the Windows ABI ===")
-    # A field declared one width too wide makes the whole struct too big, and
-    # the API call then fails with ERROR_BAD_LENGTH -- quietly, because the
-    # return value was discarded. That is how the kill job was dead for the
-    # life of the project: tor children orphaned on a hard kill, held their
-    # ports and lane data dirs, and broke the next run.
+    # A field declared one width too wide makes
     import ctypes
     from lingling import winjob
     basic = ctypes.sizeof(winjob._JOBOBJECT_BASIC_LIMIT_INFORMATION)
@@ -342,7 +272,6 @@ def main():
                     "data/", ".env", ".venv/"):
         check(f".gitignore excludes {pattern}", pattern in ignore)
     #: bytecode regenerates whenever anything runs, so the guarantee is that
-    #: git ignores it, not that it is absent from disk
     present = len(list(ROOT.rglob("*.pyc")))
     check("bytecode is ignored, not tracked", "*.pyc" in ignore,
           f"{present} on disk")
@@ -365,16 +294,9 @@ def main():
     check("live package is this workspace", here == ROOT, str(here))
 
     print("\n=== the 20s ceiling is an idle ceiling, not a total budget ===")
-    # The one claim the owner asked to see measured rather than asserted: a
-    # call whose first token lands at 19s and then thinks for another 60s must
-    # run to completion. This drives the real `_roundtrip` against a fake
-    # upstream that keeps that exact schedule, so it is a measurement of the
-    # shipped code -- ~101s of real wall clock for the three cases.
+    # The one claim the owner asked to see
     proof = ROOT / "tools" / "verify" / "verify_idle_ceiling.py"
-    # This one drives a 79s wall-clock schedule for real (122s for all three
-    # cases), so a loaded machine can cut it short before it prints a verdict.
-    # A missing verdict is not a code failure and is retried once; a real
-    # [FAIL] line is never retried, because that IS a code failure.
+    # This one drives a 79s wall-clock schedule for
     out = ""
     for _attempt in (1, 2):
         try:
@@ -397,10 +319,7 @@ def main():
               "[PASS] abandoned at the ceiling" in out
               and "[FAIL] abandoned at the ceiling" not in out,
               "the ceiling stopped biting")
-        # The ceiling splits at the moment of commit: a pre-commit stall must
-        # still fail fast (a retry is free), while a post-commit pause is a
-        # think-pause and must be tolerated. Both halves are checked, so
-        # neither can be collapsed back into one window unnoticed.
+        # The ceiling splits at the moment of commit:
         check("a silence past the POST-commit ceiling is caught",
               "[PASS] the post-commit silence was caught" in out
               and "[FAIL] the post-commit silence was caught" not in out,
@@ -414,10 +333,7 @@ def main():
               out.strip().splitlines()[-1] if out.strip() else "no output")
 
     print("\n=== the per-lane timeout tally can see a timeout ===")
-    # Charged in the caller's retry loop, the tally never fired: over the real
-    # log, 0 times across the owner's 615 callends while 95 timeouts passed it
-    # by, because the transport absorbs an uncommitted timeout and a different
-    # lane carries the retry. The charge now happens in the transport.
+    # Charged in the caller's retry loop, the tally
     tally = ROOT / "tools" / "verify" / "verify_timeout_tally.py"
     try:
         res = subprocess.run([sys.executable, str(tally)], cwd=str(ROOT),
@@ -434,10 +350,7 @@ def main():
         check("timeout tally proof completes", False, "timed out")
 
     print("\n=== a late first token is not a timeout ===")
-    # A socket timeout is per blocking read, so the ceiling is idle, not a
-    # total budget. A stream that keeps arriving can run far past it -- which
-    # is why the owner saw a 25s first token on a lane that was fine. Only a
-    # single gap longer than the ceiling trips it.
+    # A socket timeout is per blocking read, so
     grace = ROOT / "tools" / "verify" / "verify_first_token_grace.py"
     try:
         res = subprocess.run([sys.executable, str(grace)], cwd=str(ROOT),
@@ -458,11 +371,7 @@ def main():
         check("first token grace proof completes", False, "timed out")
 
     print("\n=== a 429's retry-after is a window reset, not an exit cooldown ===")
-    # 72 of the log's 87 429s carry a retry-after, and they resolve to resets at
-    # one instant per day (05:30 local, +/-4s) on two consecutive days -- so the
-    # number says nothing about which exit was refused. Writing it onto the exit
-    # retired healthy relays for 8-14h. The suite also reports the wall span, so
-    # "one instant" cannot silently mean "one instant on each of N days".
+    # 72 of the log's 87 429s carry a
     lim = ROOT / "tools" / "verify" / "verify_limited_window.py"
     try:
         res = subprocess.run([sys.executable, str(lim)], cwd=str(ROOT),
@@ -487,11 +396,7 @@ def main():
         check("limited window proof completes", False, "timed out")
 
     print("\n=== the probe's refusal reaches the handler ===")
-    # The two refusal RULES live in verify_limit_gates, which the audit now runs
-    # as well: section A pins one strike with no confirm gate, section B pins
-    # that a 403 moves nothing. This covers the WIRING from check_once to
-    # on_refused, which has broken before -- a gate added to on_refused silently
-    # applied to the probe too, so a burnt exit was not moved on the first sweep.
+    # The two refusal RULES live in verify_limit_gates, which
     guard = ROOT / "tools" / "verify" / "verify_refusal_guard.py"
     try:
         res = subprocess.run([sys.executable, str(guard)], cwd=str(ROOT),
@@ -512,10 +417,7 @@ def main():
         check("probe refusal wiring proof completes", False, "timed out")
 
     print("\n=== the cold-connect handshake spends one window, not two ===")
-    # socks5_open makes two blocking reads. A socket timeout is per read, so
-    # arming it once let a dead exit spend the window twice -- which is where
-    # the log's 30-60s cold-connect timeouts came from. The second read now
-    # gets only the remainder.
+    # socks5_open makes two blocking reads. A socket timeout
     cold = ROOT / "tools" / "verify" / "verify_cold_connect.py"
     try:
         res = subprocess.run([sys.executable, str(cold)], cwd=str(ROOT),
@@ -537,12 +439,7 @@ def main():
         check("cold connect proof completes", False, "timed out")
 
     print("\n=== the health probe asks with a real model name ===")
-    # The model name is validated BEFORE the limit check and before the client
-    # gate, so a placeholder makes every lane answer 401. `check_once` reads any
-    # truthy code as healthy, so the 429 branch could never fire and burnt exits
-    # were never caught -- their first real request paid the 429. The live half
-    # of this proof needs Tor and lives in verify_probe_status.py; this is the
-    # offline half that the audit can always run.
+    # The model name is validated BEFORE the limit
     import json as _json
     try:
         from lingling.health import PROBE_MODEL, PROBE_PATH, _scan_body
@@ -553,9 +450,7 @@ def main():
           len(model) > 8 and "-" in model,
           f"PROBE_MODEL={model!r} is a placeholder, so every probe "
           f"would return 401")
-    # The model and the path are a PAIR: crossing them answers 500, which is
-    # not a verdict, so the lane would never be marked up. Measured in
-    # tools/probe/model_matrix.py.
+    # The model and the path are a PAIR:
     check("the probe's model and path are a known-good pair",
           (PROBE_MODEL, PROBE_PATH) in (
               ("muse-spark-1.3-contributor-free", "/zen/v1/responses"),
@@ -564,23 +459,13 @@ def main():
           f"to answer a verdict -- it will get a 500")
 
     print("\n=== reachable() hands back the far end's status ===")
-    # Every other suite stubs `reachable` out, so its own return value was never
-    # tested: it could collapse to a truthy constant and everything else would
-    # still pass. The probe's 429 is INFERRED (a hand-rolled request spends no
-    # quota, so a probe cannot make an exit 429 itself) -- what is testable is
-    # that a 429 arriving from the far end survives to on_refused, and that a
-    # 403 does not. Both regressions were shown to fail the suite.
+    # Every other suite stubs `reachable` out, so its
     try:
         src = (ROOT / "lingling" / "health.py").read_text(encoding="utf-8")
         check("the 429 branch compares the status, not just truthiness",
               "if code == 429:" in src,
               "a 403 would be treated as a refusal and move a healthy lane")
-        # The other half of the same bug, and the one that was left behind: the
-        # verdict branch used to be `if code:`, so ANY truthy status marked the
-        # lane up and set `asked` -- and it was never probed again. A rejected
-        # model name answers 401 and a model/path mismatch answers 500, so
-        # either one silently disables the 429 branch for the whole session.
-        # Fixing the model NAME once did not fix this; the guard is here now.
+        # The other half of the same bug, and
         check("only a verdict marks a lane asked, not any truthy code",
               "if code in PROBE_VERDICTS:" in src,
               "a 401 or 500 from the probe reads as a healthy lane, so that "
@@ -589,23 +474,10 @@ def main():
         check("health.py is readable", False, repr(exc))
 
     print("\n=== every callend carries the fields a reader groups by ===")
-    # A key written on only SOME emit paths makes a query silently wrong
-    # rather than obviously broken. Counting `reused` across errors reported
-    # "0 of 149 SSLEOFs on reused tunnels", because the error path never wrote
-    # the key at all -- the answer looked like evidence and was an absence.
-    # This is the third time this session a partial schema produced a
-    # meaningless number, so it is now checked structurally.
+    # A key written on only SOME emit paths
     try:
         tree = ast.parse((ROOT / "lingling" / "mitm.py").read_text("utf-8"))
-        # A key supplied through `**helper()` is invisible to a walk that reads
-        # only `ast.Dict.keys`. That is how `send_s` and `peer_close` first
-        # "went missing": the six emit sites were correct and this check could
-        # not see them. It is also why `first_byte_s` and `first_event_s` were
-        # never named in `universal` -- they have come from the `_lat` splat
-        # since the tail was factored out, so the check was blind to them and
-        # passed while saying nothing about them. Resolving one level of splat
-        # closes both, and the two read fields are named below now that it can
-        # actually see them.
+        # A key supplied through `**helper()` is invisible to
         raw, splats = {}, {}
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef):
@@ -640,9 +512,7 @@ def main():
             if not node.args or not isinstance(node.args[0], ast.Dict):
                 continue
             d = node.args[0]
-            # "callend" is the VALUE of the "type" key, not a key itself --
-            # matching on keys found zero emits and the check passed
-            # vacuously, which is the exact failure it exists to prevent.
+            # "callend" is the VALUE of the "type" key,
             pairs = {k.value: v for k, v in zip(d.keys, d.values)
                      if isinstance(k, ast.Constant)}
             kind = pairs.get("type")
@@ -660,13 +530,6 @@ def main():
                      "client_wait_s", "send_s", "peer_close",
                      "first_byte_s", "first_event_s", "client_kb")
         #: keys that mean something on only one outcome, by design.
-        #: `retry_after` needs a 429. `stalled` is emitted on the transport
-        #: error path; the cold-connect failures return before the transport
-        #: and carry `err='timed out'` instead, which is unambiguous. `note`
-        #: carries the far end's error body on 4xx/5xx and is empty on 200s.
-        #: Declared here so an accidental NEW partial key fails the audit
-        #: rather than passing as a shrug -- a partial key has produced a
-        #: confident wrong answer five times on this log.
         specific = {"retry_after", "stalled", "note"}
         gaps = [(ln, sorted(set(universal) - keys)) for ln, keys in emits
                 if set(universal) - keys]
@@ -681,9 +544,7 @@ def main():
         check("mitm.py is parseable", False, repr(exc))
 
     print("\n=== the remaining suites, so none can break silently ===")
-    # The audit used to invoke only SOME of the suites. A change to
-    # `on_refused` then broke `verify_limit_gates` -- five checks -- and nothing
-    # in the audit noticed, because that suite was never run here. Run them all.
+    # The audit used to invoke only SOME of
     for suite in ("verify_limit_gates", "verify_country_expand",
                   "verify_call_outcome", "verify_probe_branch",
                   "verify_request_params", "verify_committed_stream",
@@ -692,21 +553,13 @@ def main():
                   "verify_expect_header", "verify_short_body",
                   "verify_close_honoured", "verify_pool_ttl",
                   "verify_send_window", "verify_torrc",
-                  # a cold data dir must not turn the first boot into a
-                  # restart loop: the gate waits out a moving descriptor
-                  # download and escalates only on true silence
+                  # a cold data dir must not turn the
                   "verify_cold_boot",
-                  # the 503/504 session: a retryable verdict must reach the
-                  # client whole, a 5xx must stop after two attempts, and the
-                  # far end's error body must land on the callend
+                  # the 503/504 session: a retryable verdict must reach
                   "verify_5xx_delivery",
-                  # floors the three windows that no suite was guarding: every
-                  # suite touching them pins its own value, so they could be
-                  # set to nonsense with the whole set still green
+                  # floors the three windows that no suite was
                   "verify_window_floors",
-                  # the owner's FIRST rule -- never invent a failure state for
-                  # a healthy lane -- was guarded by review alone, and a
-                  # re-added `_LANE_CAP` still passed AUDIT CLEAN
+                  # the owner's FIRST rule -- never invent a
                   "verify_no_lane_cap"):
         path = ROOT / "tools" / "verify" / f"{suite}.py"
         try:
@@ -722,12 +575,7 @@ def main():
             check(f"{suite} completes", False, "timed out")
 
     print("\n=== the post-commit window is generous enough ===")
-    # The window only ever measures SILENCE. A stream that is emitting is
-    # unaffected at ANY value, so a small window has no upside and exactly one
-    # downside: cutting an answer whose pause happened to be long. The longest
-    # gap measured on a healthy stream is 16.6s, which is why even the old 20s
-    # ceiling was cutting real answers. A future edit that shrinks this back is
-    # a regression, so the floor is checked rather than trusted.
+    # The window only ever measures SILENCE. A stream
     try:
         src = (ROOT / "lingling" / "mitm.py").read_text("utf-8")
         line = next((ln for ln in src.splitlines()
@@ -743,11 +591,6 @@ def main():
 
     print("\n=== the stall analyzer's join is session-aware ===")
     # tools/soak/stall_by_effort.py correlates stalls with reasoning effort by
-    # joining each callend to its call on (session, n, c). Two versions of that
-    # join silently produced wrong buckets -- one matched nothing, the next
-    # reused the last session's key -- and a single-session test cannot see
-    # either, because (n, c) only collides ACROSS sessions. Its selftest uses
-    # two sessions sharing the same (n, c) values.
     tool = ROOT / "tools" / "soak" / "stall_by_effort.py"
     try:
         res = subprocess.run([sys.executable, str(tool), "--selftest"],

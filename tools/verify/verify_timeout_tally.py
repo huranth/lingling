@@ -1,19 +1,4 @@
-"""The per-lane timeout tally has to see every timeout.
-
-A lane that times out three times running is a bad circuit and must be
-rebuilt. The counter only works if the timeouts reach it. They do not
-reach a tally charged in the caller's retry loop, because a timeout on
-an uncommitted attempt is absorbed inside the transport and a *different*
-lane carries the retry -- so the only lane that would ever accumulate
-three is one that is tried three times inside a single request, which
-never happens.
-
-Measured over the real log: the tally fired 0 times on all 615 of the
-owner's callends and 4 times across 1269 soak callends, while 95 timeouts
-went unnoticed. This drives the real transport against a silent upstream
-and asserts each silent attempt was charged. It fails on the old
-placement, where nothing in the transport charged anything.
-"""
+"""The per-lane timeout tally has to see every timeout."""
 import socket
 import ssl
 import sys
@@ -37,11 +22,7 @@ def check(name, ok, detail=""):
 
 
 def silent_socks_upstream(port_holder, ready):
-    """Speak the SOCKS5 handshake, then never say anything more.
-
-    The connection carries whatever the client sends; no HTTP reply is
-    ever produced, so every read runs into the idle ceiling.
-    """
+    """Speak the SOCKS5 handshake, then never say anything more."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
@@ -57,13 +38,7 @@ def silent_socks_upstream(port_holder, ready):
 
 
 def _hold(c):
-    """Answer the SOCKS5 greeting and CONNECT, then say ONE byte and stop.
-
-    The byte matters: it puts the timeout after the handshake, which is the
-    only kind of stall that charges the tally. `silent_socks_upstream`
-    (below) is the no-byte-at-all case, and that one must NOT charge -- it
-    is a cold circuit, not a bad lane.
-    """
+    """Answer the SOCKS5 greeting and CONNECT, then say ONE byte and stop."""
     try:
         c.settimeout(30)
         c.recv(3)
@@ -125,9 +100,7 @@ def main():
     ready.wait(5)
     up_port = holder[0]
 
-    # the transport points at lane.socks_port, so make the lane port the
-    # fake server's port: a real connect, a real SOCKS5 exchange, a real
-    # silence on the other end
+    # the transport points at lane.socks_port, so make the
     real_socks = netutil.socks5_open
     real_ctx = ssl.create_default_context
     real_ceiling = mitm._READ_TIMEOUT
@@ -224,12 +197,7 @@ def main():
     mute_port = holder2[0]
     charged_mute = []
     try:
-        # BOTH windows, and this block needs them set for itself. It used to
-        # lean on the value the block above left behind -- except that block's
-        # `finally` restores it, so this one was really running on the SHIPPED
-        # ceiling. At 20s that failed fast enough to look right; at 1800s it
-        # waits out the fake upstream, which closes first and turns the
-        # expected TimeoutError into a ConnectionResetError.
+        # BOTH windows, and this block needs them set
         mitm._READ_TIMEOUT = 1.5
         mitm._FIRST_BYTE_TIMEOUT = 5.0
         relay = Relay()
@@ -255,16 +223,7 @@ def main():
           f"charged={charged_mute} -- a cold circuit would be retired")
 
     print("\n=== the cold connect cannot reach the tally at all ===")
-    # This is structural, and it is the whole reason the mute case above
-    # passes: the SOCKS dial and the TLS handshake sit in their own `try`,
-    # whose handlers emit a callend and return -- so a dial timeout leaves
-    # _roundtrip before the streaming try, the only place that charges, is
-    # ever entered. Asserted on the AST so a future edit that folds the dial
-    # into the charging try trips this instead of quietly re-arming the
-    # retirement of cold circuits. The shape used to be checked as "two
-    # nested tries containing the dial", which only matched the era when the
-    # dial try sat INSIDE the streaming try; it is a sibling now, and the
-    # guarantee is about reachability, not nesting.
+    # This is structural, and it is the whole
     import ast
     tree = ast.parse((ROOT / "lingling" / "mitm.py").read_text("utf-8"))
     fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)

@@ -1,23 +1,4 @@
-"""Where the first-byte latency goes: tunnel stages, measured separately.
-
-    python tools/probe/probe_tunnel.py
-
-A bare SOCKS5 CONNECT plus TLS handshake sends no API request, so this needs
-no model quota at all. It is the only way to see how much of
-`first_byte_s` is the tunnel and how much is the upstream.
-
-Reference numbers from 2026-09-19, on a warm circuit:
-
-    connect (localhost) :     7ms
-    SOCKS5 CONNECT      :   546ms   <- one Tor circuit round trip
-    TLS handshake       :   723ms   <- one or two more
-    TOTAL               :  1275ms
-
-Live `first_byte_s` p50 was ~2.9s, so the tunnel was ~44% of it. Both stages
-are pure per-request overhead, which is why `mitm.TunnelPool` reuses the
-socket. Each lane is measured twice: the first handshake may build a circuit,
-the second should reuse it.
-"""
+"""Where the first-byte latency goes: tunnel stages, measured separately."""
 import socket
 import ssl
 import sys

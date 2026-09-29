@@ -1,12 +1,4 @@
-"""Offline proof that country rotation walks the pool and then widens it, and
-that live lane picking uses the same record.
-
-    python tools/verify/verify_country_expand.py
-
-No tor, no network. Builds a TorManager shell and drives rotation and the
-picker directly, so it exercises the real ladder without touching the runtime
-directory.
-"""
+"""Offline proof that country rotation walks the pool and then widens it, and that live lane picking ..."""
 import json
 import sys
 import tempfile
@@ -72,10 +64,7 @@ check("expansion reached after the fallback pool", picks[5:8] == ["ff", "gg", "h
 check("eight fresh countries, zero repeats", len(set(picks)) == 8)
 
 print("\n=== C. an exhausted walk starts over instead of giving up ===")
-# The old design persisted a country blacklist in the torrc and fed it from
-# 429s, so hitting the free tier limit removed a country for good. Lane 1 had
-# already banned fr,us,no,hu that way, and a lane that had walked its whole
-# ladder fell to "*" and abandoned the user's config permanently.
+# The old design persisted a country blacklist in
 mgr = build()
 lane = mgr.lanes[0]
 picks = [mgr.rotate_exit_country(lane) for _ in range(10)]
@@ -109,11 +98,7 @@ mgr.note_result("", 200)
 check("no phantom score entries", mgr._score == {}, f"score={mgr._score}")
 
 print("\n=== E2. only the exit's own signals score ===")
-# A 403 is the free tier gating on the CLIENT -- not a lane signal anywhere
-# else in this codebase, so it must not charge the country either. A 500 is
-# upstream capacity, on the same footing as the 503s that never get here.
-# Measured over the log: 70 callends decremented a country and 63 were 403s,
-# every one a GET /api.json.
+# A 403 is the free tier gating on
 mgr = build()
 mgr.note_result("aa", 403)
 mgr.note_result("aa", 500)
@@ -143,8 +128,7 @@ def live_mgr(scores):
 
 
 print("\n=== G. a losing country is picked last, not never ===")
-# Live proof this guards: one 25-call lane ran 8% while five others ran 85-88%,
-# because the picker only ever looked at load.
+# Live proof this guards: one 25-call lane ran
 mgr = live_mgr({"aa": -3, "bb": 3})
 relay = Relay(mgr)
 picks = [relay.pick_lane().exit_country for _ in range(4)]
@@ -166,10 +150,7 @@ check("falls back to the losing lane instead of stalling",
       f"pick={getattr(pick, 'exit_country', None)}")
 
 print("\n=== H2. a burst diverges evenly across the whole pool ===")
-# The pool is a load balancer, not a queue. `active` is compared first, so each
-# request goes to whichever healthy lane is carrying least: 24 requests over six
-# lanes land four apiece. No lane is left idle while another holds traffic, and
-# there is no cap to wait behind -- a loaded lane still carries more.
+# The pool is a load balancer, not a
 mgr = live_mgr({})
 relay = Relay(mgr)
 counts = {l.index: 0 for l in mgr.lanes}
@@ -191,10 +172,7 @@ check("a single failure outranks a losing record",
       pick.exit_country == "aa", f"pick={pick.exit_country}")
 
 print("\n=== J. a thin pool spreads instead of playing favourites ===")
-# Below _LOSING_MIN_POOL the losing rule is off on purpose. Concentrating on
-# the last good lane means the pool cannot see the others recover, so it never
-# comes back -- measured live as a six-lane pool collapsing to one lane that
-# then ran at 4%.
+# Below _LOSING_MIN_POOL the losing rule is off on
 mgr = build()
 for l in mgr.lanes[:3]:
     l.healthy = True
@@ -207,10 +185,7 @@ check("a thin pool still uses the losing lane", "aa" in picks,
       f"picks={picks}")
 
 print("\n=== K. an exit the far end limited is picked last ===")
-# Live proof the rule exists: identical probes through six exits inside the
-# same 25 seconds returned 3 x 429 and 3 x 403, so the only variable was the
-# exit. A 429 means "this exit is limited", and opencode's retry-after says for
-# how long -- measured ~3.4 hours.
+# Live proof the rule exists: identical probes through
 mgr = live_mgr({})
 relay = Relay(mgr)
 mgr.lanes[0].limited_until = time.time() + 12000
@@ -233,18 +208,13 @@ check("a fully limited pool still hands out a lane", pick is not None,
       str(pick))
 
 print("\n=== M. every lane gets its own pinned exit ===")
-# Live proof the pin holds: ExitNodes $FP + StrictNodes 1 came out of exactly
-# that relay's address (83.217.9.73, 2026-09-19). Pinning is what makes "no two
-# lanes share an exit" a guarantee instead of a hope.
+# Live proof the pin holds: ExitNodes $FP +
 LANES = Path(r"C:\Users\W\AppData\Local\lingling\lanes")
 GEO = Path(r"C:\Users\W\AppData\Local\lingling\tools\data\geoip")
 
 
 def pinned_mgr(countries=("tr", "ua", "is", "hr", "bg", "hk")):
-    """A real TorManager, built normally, pointed at the on-disk relay list.
-
-    Unlike `build()` this uses the actual constructor, so it exercises the real
-    object rather than a hand-assembled shell."""
+    """A real TorManager, built normally, pointed at the on-disk relay list."""
     mgr = TorManager(DATA_DIR, count=len(countries),
                      exit_countries=list(countries), log=lambda *a: None)
     return mgr
@@ -303,7 +273,7 @@ if loaded:
         mgr3._pin(l)
     hk = len([l for l in mgr3.lanes if l.exit_fingerprint])
     check("it pins as many as it can", hk > 0, f"{hk}/6")
-    # retire every HK relay there is, not just the ones we took
+    # retire every HK relay there is, not just
     for exit_ in (mgr3._by_country or {}).get("HK", []):
         mgr3._limited[exit_.fingerprint] = time.time() + 12000
     mgr3._pin(mgr3.lanes[0])
@@ -317,9 +287,7 @@ else:
     check("relay list unavailable -- pinning degrades to country only", True)
 
 print("\n=== Q. countries.txt parsing ===")
-# A comment line must vanish rather than count as a pool, and a commented-out
-# list must not leak its countries in -- "#de,nl" splits to ["#de", "nl"] and
-# "nl" survives a naive two-letter filter.
+# A comment line must vanish rather than count
 sample = """# a comment line
 de,nl  # trailing note
 # fallback next
@@ -347,9 +315,7 @@ check("a real blank line still skips a pool",
       f"{primary} / {fallback} / {preferred}")
 
 print("\n=== R. limited exits survive a restart ===")
-# A retry-after runs to hours while a session lasts minutes. Without this every
-# restart re-pins relays already known to be limited and pays a 429 to learn it
-# again -- the exact waste the pinning is meant to remove.
+# A retry-after runs to hours while a session
 LIMITED = "AA" * 20
 EXPIRED = "BB" * 20
 with tempfile.TemporaryDirectory() as tmp:
@@ -357,9 +323,7 @@ with tempfile.TemporaryDirectory() as tmp:
     first = TorManager(root, count=1, exit_countries=["de"],
                        log=lambda *a: None)
     lane = first.lanes[0]
-    # Windows-excluded ranges swallow whole blocks. The defaults (socks 52001,
-    # control 52301) land in one on this machine, so a lane must be moved to
-    # ports that actually bind -- and the search must not stall.
+    # Windows-excluded ranges swallow whole blocks. The defaults (socks
     check("the lane's ports are bindable",
           netutil.bindable(lane.socks_port)
           and netutil.bindable(lane.control_port),
@@ -390,8 +354,7 @@ with tempfile.TemporaryDirectory() as tmp:
           str(fourth._limited))
 
 print("\n=== S. restarting a limited lane re-pins it ===")
-# The pin lives in the torrc, so a plain restart returns on the same limited
-# relay. Everything here is stubbed so nothing touches a live lane.
+# The pin lives in the torrc, so a
 mgr5 = build()
 mgr5._by_country = {}
 mgr5._limited = {}
@@ -425,10 +388,7 @@ check("a lane that is merely dead is NOT re-pinned", pinned["n"] == 0,
       f"pins={pinned['n']}")
 
 print("\n=== T. a lane with a live request is not torn down mid-flight ===")
-# Tearing a lane down while it is carrying a request is not: the request loses
-# its upstream mid-body and the client waits with nothing in the log. Measured
-# live: three lanes were pulled in the same second that seven requests were
-# dispatched onto them, and the session then went silent for 55 minutes.
+# Tearing a lane down while it is carrying
 mgr6 = build()
 mgr6._by_country = {}
 mgr6._limited = {}
@@ -464,8 +424,7 @@ check("an idle lane restarts without waiting for a drain", idle < elapsed,
       f"idle={idle:.2f}s vs busy={elapsed:.2f}s")
 
 print("\n=== U. a fully limited pool stops retrying instead of amplifying ===")
-# Live: 3.5 attempts per request with 71% of them on exits the far end had
-# already refused -- guaranteed 429s, multiplied by 30 parallel subagents.
+# Live: 3.5 attempts per request with 71% of
 mgr7 = build()
 relay7 = Relay(mgr7)
 for l in mgr7.lanes:
@@ -481,9 +440,7 @@ mgr7.lanes[2].limited_until = 0.0
 check("one unlimited lane is enough", relay7.any_unlimited(set()))
 
 print("\n=== V. a lane already carrying traffic is still used ===")
-# There is no concurrency cap. A healthy lane carries the request even when it
-# is carrying others: holding traffic while capacity sat idle, and describing
-# our own limit as the lane being "at cap", was withdrawn.
+# There is no concurrency cap. A healthy lane
 mgr8 = live_mgr({})
 for l in mgr8.lanes:
     l.active = 5
@@ -501,10 +458,7 @@ mgr9.lanes[3].active = 0
 check("the least loaded lane wins", Relay(mgr9).pick_lane().index == 4)
 
 print("\n=== W. every exit handed out is fresh and distinct ===")
-# A lane must not get the same top-bandwidth relay on every boot -- that relay
-# is also the most heavily shared one. Freshness outranks bandwidth, and
-# bandwidth only breaks ties. The two candidates are chosen so freshness and
-# bandwidth disagree; otherwise the checks would prove nothing.
+# A lane must not get the same top-bandwidth
 small = exits.Exit("A" * 40, "10.0.0.1", "small", 1)
 big = exits.Exit("B" * 40, "10.0.0.2", "big", 999)
 pool = {"DE": [big, small]}

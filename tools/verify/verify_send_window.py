@@ -1,48 +1,4 @@
-"""The send window must clear the uploads that actually happen.
-
-`_SEND_TIMEOUT` shipped at 30s. It was raised to 300s, **reverted to 30s on a
-bad reading of the log**, and is now 120s. This pins the value to a
-measurement so the next argument is about data rather than mechanism.
-
-What the log says. The owner's request bodies run 4.5 MB and grow (median
-4.7 MB on 09-21, 5.4 MB on 09-22 -- the whole conversation going back up on
-every turn). Over the 107 successful 200s carrying a body of 1 MB or more:
-
-    send_s   p50 = 10.8s    p90 = 20.8s    max = 29.8s
-    send_s > 30s:  0 of 107
-
-Zero above 30, with 13 of 107 in the 20-30s band. **A ceiling is only marginal
-if the successes approach it, and these pile up against it.** The truncation at
-29.8 is what proves the window is a TOTAL budget rather than a per-wait gap: a
-per-wait timeout would let a 40s upload with short waits through, and no such
-call exists in the sample. The 10 cuts are then the uploads that needed a
-little more, and they are ALL on 4.5-5.6 MB bodies across lanes 1, 2, 4 and 5
--- a size effect, not one bad exit.
-
-Reproduced on this machine (2026-09-22), so the 29.8s is not an outlier:
-`upload_probe.py --concurrency 6 --lanes 1` pushed six 4.5 MB uploads through
-one lane at once and `send_s` reached **21.5s with 3 of 12 in the 20-30s
-band** -- 72% of the old wall on bodies 20% smaller than his current 5.4 MB
-median. That is what this shape produces.
-
-The trap this test exists to prevent: `max_wait_s` is NOT the send. It wraps
-the whole `sendall` in one `_timed` call but only one chunk of a body read, so
-it reaches 257.5s on this log -- impossible for a send once the ceiling is 30s.
-Those are reads. Judging the send ceiling by `max_wait_s` is what argued the
-window back down to the value that was cutting real traffic.
-
-Case B fails on the old 30s default (`LINGLING_SEND_S=30` reproduces it), and
-so does the GATE -- demonstrated 2026-09-22, not assumed:
-
-    LINGLING_SEND_S=30 python tools/verify/verify_audit.py
-    -> exit 1, `FAILURES: 1`: verify_send_window passes -- the window keeps
-       headroom over every upload that has succeeded
-
-That matters because `verify_audit.py` runs each suite as a SUBPROCESS with
-captured output, so this one's banner never appears in a clean run. The only
-way to know it is wired in is to break the value and watch the gate fail;
-otherwise "AUDIT CLEAN" would be claiming coverage it does not have.
-"""
+"""The send window must clear the uploads that actually happen."""
 import sys
 import threading
 import time
