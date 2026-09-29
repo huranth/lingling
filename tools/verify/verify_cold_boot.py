@@ -117,6 +117,29 @@ def fresh_lane(tmp: Path) -> Lane:
     return ln
 
 
+_TMP_DIRS = []
+
+
+def _tmpdir(prefix: str) -> Path:
+    """A scratch data dir the suite deletes when it ends."""
+    import tempfile as _tf
+    d = Path(_tf.mkdtemp(prefix=prefix))
+    _TMP_DIRS.append(d)
+    return d
+
+
+def _cleanup() -> None:
+    """Every scratch dir this suite ever made, gone."""
+    import shutil
+    import tempfile as _tf
+    for d in _TMP_DIRS:
+        shutil.rmtree(d, ignore_errors=True)
+    base = Path(_tf.gettempdir())
+    for pattern in ("ll-cold*", "ll-fresh-*"):
+        for d in base.glob(pattern):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def main():
     tf = Path(__file__).parent
     import tempfile as _tf
@@ -128,7 +151,7 @@ def main():
     class M:
         pass
 
-    d = Path(_tf.mkdtemp(prefix="ll-coldpct-"))
+    d = _tmpdir("ll-coldpct-")
     ln = fresh_lane(d)
     (ln.data_dir / "tor.log").write_text(
         "info [circ] circuit opened\ninfo [edge] bytes moved\n",
@@ -147,7 +170,7 @@ def main():
           reader(M(), ln) == -1, f"pct={reader(M(), ln)}")
 
     print("\n=== cache_mtime reads the descriptor files the gate watches ===")
-    d2 = Path(_tf.mkdtemp(prefix="ll-coldcache-"))
+    d2 = _tmpdir("ll-coldcache-")
     ln2 = fresh_lane(d2)
     check("no cache files -> 0.0, the cold signal",
           TorManager.cache_mtime(M(), ln2) == 0.0)
@@ -163,7 +186,7 @@ def main():
     tor = FakeTor(0.0, mtime_fn=lambda _ln: float(next(moves)))
     daemon = FakeDaemon()
     loader = FakeLoader()
-    tmp = Path(_tf.mkdtemp(prefix="ll-coldmove-"))
+    tmp = _tmpdir("ll-coldmove-")
     ln3 = fresh_lane(tmp)
     with fake_clock() as clock:
         tor.clock = clock
@@ -185,7 +208,7 @@ def main():
     tor = FakeTor(1_000_000.0)
     daemon = FakeDaemon()
     loader = FakeLoader()
-    tmp = Path(_tf.mkdtemp(prefix="ll-colddead-"))
+    tmp = _tmpdir("ll-colddead-")
     ln4 = fresh_lane(tmp)
     with fake_clock() as clock:
         tor.clock = clock
@@ -204,7 +227,7 @@ def main():
                   boot_pct=0, pct_at=1_000_000.0 + 190)
     daemon = FakeDaemon(good_at=1_000_000.0 + 200)
     loader = FakeLoader()
-    tmp = Path(_tf.mkdtemp(prefix="ll-coldok-"))
+    tmp = _tmpdir("ll-coldok-")
     ln5 = fresh_lane(tmp)
     with fake_clock() as clock:
         tor.clock = clock
@@ -223,7 +246,7 @@ def main():
     tor = FakeTor(1_000_000.0, boot_pct=0, pct_at=1_000_000.0 + 18)
     daemon = FakeDaemon(good_at=1_000_000.0 + 20)
     loader = FakeLoader()
-    tmp = Path(_tf.mkdtemp(prefix="ll-coldfast-"))
+    tmp = _tmpdir("ll-coldfast-")
     ln6 = fresh_lane(tmp)
     with fake_clock() as clock:
         tor.clock = clock
@@ -237,7 +260,7 @@ def main():
     tor = FakeTor(1_000_000.0, boot_pct=100)
     daemon = FakeDaemon()
     loader = FakeLoader()
-    tmp = Path(_tf.mkdtemp(prefix="ll-colddie-"))
+    tmp = _tmpdir("ll-colddie-")
     ln7 = fresh_lane(tmp)
     with fake_clock() as clock:
         tor.clock = clock
@@ -256,8 +279,10 @@ def main():
         print("COLD BOOT: FAILED")
         for f in FAILS:
             print("  - " + f)
+        _cleanup()
         return 1
     print("COLD BOOT: CONFIRMED")
+    _cleanup()
     return 0
 
 
