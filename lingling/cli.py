@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 from . import __version__, data_dir, proof
 from .health import HealthDaemon
@@ -26,15 +27,25 @@ PROOF_LOG = DATA_DIR / "proof.log"
 DEFAULT_COUNTRIES = ["us", "de", "nl", "fr", "ro", "gb", "ca", "se", "pl", "ch"]
 
 
-def load_countries() -> tuple:
+def load_countries(path: Optional[Path] = None) -> tuple:
     """Country override: <data dir>/countries.txt, line 1 primary, line 2
-    fallback, line 3 preferred. Falls back to DEFAULT_COUNTRIES."""
-    path = DATA_DIR / "countries.txt"
+    fallback, line 3 preferred. Falls back to DEFAULT_COUNTRIES.
+
+    ``#`` starts a comment, and a comment-only line disappears entirely -- it
+    must not count as one of the three pools. A blank line still does: that is
+    how you skip a pool."""
+    path = path or (DATA_DIR / "countries.txt")
     if path.exists():
         try:
-            # Physical line positions matter: blank lines stay blank so a
-            # skipped pool can't shift the lines below it.
-            raw = path.read_text(encoding="utf-8").splitlines()
+            # line order
+            text = path.read_text(encoding="utf-8")
+            raw = []
+            for line in text.splitlines():
+                if "#" in line:
+                    line = line.split("#", 1)[0]
+                    if not line.strip():
+                        continue  # comment only
+                raw.append(line)
             raw += [""] * (3 - len(raw))
             pools = [[c.strip().lower() for c in raw[i].split(",")
                       if len(c.strip()) == 2 and c.strip().isalpha()]
@@ -171,6 +182,13 @@ def main(argv: list[str]) -> int:
         print("Install it first (https://opencode.ai) and re-run.")
         return 1
 
+    # fail early
+    from . import mitm
+    if not mitm.crypto_available():
+        print("lingling: the `cryptography` package is missing or broken.")
+        print("Reinstall it:  pip install --force-reinstall cryptography")
+        return 1
+
     loader = _Loader()
     loader.start()
     manager: TorManager | None = None
@@ -200,31 +218,47 @@ def main(argv: list[str]) -> int:
                 daemon = HealthDaemon(manager, event=emit,
                                       log=lambda *a: None)
 
-                # Boot order: only lane 1 cooks in the foreground; the rest follow in background.
-                first = manager.lanes[0]
-                manager.start_lanes([first])
+                def _report_boot(lane, status) -> None:
+                    """Say so when a lane did not come up.
 
-                # Gate: wait until lane 1 provably carries traffic. A slow
-                # boot is NOT a dead boot -- track progress, poke on stall.
+                    `start_lanes` has always computed this status per lane and
+                    then called `on_lane` only `if on_lane` -- and no caller
+                    ever passed one, so the whole outcome was discarded. A lane
+                    whose launch failed therefore produced no event at all: the
+                    pane stayed silent and `start.lanes` still advertised the
+                    full pool. Found as a soak that ran **all 46 calls on lane
+                    6** with no lane events anywhere."""
+                    if status in ("started", "already_running"):
+                        return
+                    emit({"type": "lane", "kind": "fail", "t": time.time(),
+                          "lane": lane.index, "cc": lane.exit_country,
+                          "ip": "",
+                          "msg": f"lane {lane.index} {{{lane.exit_country}}} "
+                                 f"did not come up ({status}) -- the health "
+                                 f"daemon will keep trying"})
+
+                # first lane
+                first = manager.lanes[0]
+                manager.start_lanes([first], on_lane=_report_boot)
+
+                # boot gate
                 deadline = time.time() + 600
                 last_pct = -1
                 last_pct_at = time.time()
                 pokes = 0
                 while time.time() < deadline:
-                    verdict = daemon.probe_lane(first)
-                    if verdict == "healthy":
+                    code = daemon.reachable(first)
+                    if code == 429:
+                        daemon.on_refused(first, code)
+                    elif code:
                         first.healthy = True
-                        first.unhealthy_cycles = 0
                         break
                     pct = manager.lane_bootstrap_pct(first)
                     if pct > last_pct:
                         last_pct = pct
                         last_pct_at = time.time()
                         loader.set(f"tor {pct}%")
-                    # Stuck signatures: 0-10% (never reached the network)
-                    # pokes at 30s; >10% (no path through the pinned country)
-                    # pokes at 90s. Ladder: restart, unpin, re-cook; a second
-                    # unpin is a no-op so >10% re-cooks on poke 2.
+                    # stuck signatures
                     stall = time.time() - last_pct_at
                     limit = 30 if pct <= 10 else 90
                     if pct == last_pct and stall > limit and pokes < 3:
@@ -241,9 +275,6 @@ def main(argv: list[str]) -> int:
                             manager.regenerate_lane(first)
                         last_pct = -1
                         last_pct_at = time.time()
-                    if verdict == "burned":
-                        first.burned_cycles += 1
-                        daemon._heal_burn(first)
                     time.sleep(2)
                 if first.healthy is not True:
                     loader.stop(_c(" !! the kitchen stayed cold -- "
@@ -260,15 +291,20 @@ def main(argv: list[str]) -> int:
             return _run_opencode(opencode, opts["passthrough"], None)
 
         emit = proof.make_emitter(PROOF_LOG)
+        # session marker
+        emit({"type": "start", "t": time.time(),
+              "session": os.urandom(6).hex(), "lanes": len(manager.lanes),
+              "countries": list(manager.countries), "version": __version__})
         relay = Relay(manager, event=emit)
         port = relay.start()
 
-        # Per-request proof via local TLS termination; best-effort, falls back to blind tunnels.
+        # mitm proof
         ca_pem = None
         if os.environ.get("LINGLING_NO_MITM", "").lower() not in ("1", "true"):
             try:
                 from . import mitm
                 relay.cert_shop = mitm.CertShop(DATA_DIR / "mitm")
+                relay.tunnels = mitm.TunnelPool()
                 ca_pem = relay.cert_shop.ca_pem_path
             except Exception:  # noqa: BLE001
                 pass
@@ -278,7 +314,7 @@ def main(argv: list[str]) -> int:
         if not opts["no_proof"]:
             proof.spawn_proof_window(PROOF_LOG)
 
-        # Remaining lanes bootstrap in background; health probes join them to rotation as they come up.
+        # background boot
         rest = manager.lanes[1:]
         if rest:
             def _cook_rest() -> None:
@@ -288,7 +324,7 @@ def main(argv: list[str]) -> int:
                           "ip": "",
                           "msg": f"lane {lane.index} {{{lane.exit_country}}} "
                                  f"registering in the background ..."})
-                manager.start_lanes(rest)
+                manager.start_lanes(rest, on_lane=_report_boot)
 
             threading.Thread(target=_cook_rest, name="lane-cook",
                              daemon=True).start()
@@ -298,7 +334,7 @@ def main(argv: list[str]) -> int:
             env[var] = f"http://127.0.0.1:{port}"
         env["NO_PROXY"] = env["no_proxy"] = "localhost,127.0.0.1"
         if ca_pem:
-            # Let opencode trust our local CA so we can log each model call.
+            # trust CA
             env["NODE_EXTRA_CA_CERTS"] = str(ca_pem)
         return _run_opencode(opencode, opts["passthrough"], env)
     finally:

@@ -39,8 +39,8 @@ class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
         ("MaximumWorkingSetSize", ctypes.c_size_t),
         ("ActiveProcessLimit", wintypes.DWORD),
         ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", ctypes.c_size_t),
-        ("SchedulingClass", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
     ]
 
 
