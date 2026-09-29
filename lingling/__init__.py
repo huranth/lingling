@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-__version__ = "2.1.20.post2"
+__version__ = "2.1.20.post3"
 
 
 def data_dir() -> Path:
