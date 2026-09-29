@@ -138,12 +138,18 @@ def _parse_args(argv: list[str]) -> dict:
         elif a == "--demo":
             opts["demo"] = True
         elif a == "--lanes":
-            try:
-                opts["lanes"] = max(1, int(argv[i + 1]))
-                opts["lanes_explicit"] = True
-            except (IndexError, ValueError):
-                pass
-            skip = True
+            """
+            A bare --lanes must not eat the flag after it: swallowing
+            --demo or --no-proof here silently flips cold-start messaging
+            and proof spawning without the user ever passing a count.
+            """
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                try:
+                    opts["lanes"] = max(1, int(argv[i + 1]))
+                    opts["lanes_explicit"] = True
+                    skip = True
+                except ValueError:
+                    pass
         elif a == "--no-tor":
             opts["no_tor"] = True
         elif a == "--no-proof":
@@ -233,7 +239,103 @@ def _tor_present(data_dir: Path) -> bool:
         return False
 
 
+def _dir_size(path: Path) -> int:
+    """Total bytes under a path."""
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            if p.is_file():
+                total += p.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+def _human(n: float) -> str:
+    """Bytes in human form."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+UNINSTALL_HELP = """
+lingling uninstall -- wipe everything lingling put on disk
+
+Deletes lanes, tor.exe, the relay cache, MITM certs and proof logs.
+Keeps countries.txt (and its backups) so your lane pins survive.
+The pip package itself is removed the usual way, afterwards:
+
+    pip uninstall lingling
+"""
+
+
+def _uninstall(rest: list[str]) -> int:
+    """Wipe the lingling data dir, keeping the countries override."""
+    if "--help" in rest or "-h" in rest:
+        print(UNINSTALL_HELP)
+        return 0
+    if not DATA_DIR.exists():
+        print("nothing to remove -- no lingling data dir on this machine.")
+        return 0
+    keep = {"countries.txt"}
+    keep |= {p.name for p in DATA_DIR.glob("countries.txt.bak-*")}
+    entries = []
+    for entry in sorted(DATA_DIR.iterdir()):
+        if entry.name in keep:
+            continue
+        size = entry.stat().st_size if entry.is_file() else _dir_size(entry)
+        entries.append((entry, size))
+    if not entries:
+        print("nothing to remove -- only the countries override is left.")
+        return 0
+    print("lingling uninstall -- this deletes:")
+    for entry, size in entries:
+        print(f"  {entry.name:<24} {_human(size):>10}")
+    total = sum(size for _, size in entries)
+    if "--yes" not in rest:
+        if not sys.stdin.isatty():
+            print("refusing to wipe without --yes in a non-interactive shell.")
+            return 1
+        try:
+            answer = input(f"delete all of it ({_human(total)})? [y/N] ")
+        except EOFError:
+            # closed stdin
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            print("cancelled -- nothing was touched.")
+            return 1
+    freed = 0
+    stuck = []
+    for entry, size in entries:
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            freed += size
+        except OSError:
+            stuck.append(entry.name)
+    print(f"wiped {_human(freed)}.")
+    left = [p.name for p in sorted(DATA_DIR.iterdir())]
+    if left:
+        print(f"kept: {', '.join(left)}")
+    if stuck:
+        print(f"could not delete (in use? close lingling and retry): "
+              f"{', '.join(stuck)}")
+    if not left:
+        try:
+            DATA_DIR.rmdir()
+        except OSError:
+            pass
+    print("now remove the package itself:  pip uninstall lingling")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "uninstall":
+        return _uninstall(argv[1:])
     opts = _parse_args(argv)
 
     if opts["proof_tail"] is not None:
@@ -279,6 +381,13 @@ def main(argv: list[str]) -> int:
         else:
             loader.steady("first start -- downloading tor and the relay "
                           "directory (one-time, a few minutes)")
+    else:
+        """
+        Say the cache is warm: a reinstall of the package never touches
+        this data dir, and a fast boot with no explanation reads as the
+        cold-start message misfiring.
+        """
+        loader.steady("warm cache found -- lanes boot fast")
     loader.start()
     manager: TorManager | None = None
     daemon: HealthDaemon | None = None
