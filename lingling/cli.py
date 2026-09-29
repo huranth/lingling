@@ -48,16 +48,7 @@ def load_countries(path: Optional[Path] = None) -> tuple:
             pass
     return DEFAULT_COUNTRIES, [], []
 
-_KITCHEN_LINES = [
-    "cooking the lanes", "baking it", "warming the exits",
-    "glazing the tunnel", "seasoning the circuits", "proofing the dough",
-    "preheating the relays", "tasting the traffic",
-]
-
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
-_PHRASE_COLORS = ["38;5;215", "38;5;222", "38;5;180", "38;5;173",
-                  "38;5;114", "38;5;109", "38;5;139", "38;5;175"]
 
 
 def _c(text: str, code: str) -> str:
@@ -100,13 +91,7 @@ class _Loader:
             with self._lock:
                 detail = self._detail
                 first = self._first
-            if detail:
-                msg = _c(detail, "38;5;114")
-            elif first:
-                msg = _c(first, "38;5;114")
-            else:
-                idx = (t // 24) % len(_KITCHEN_LINES)
-                msg = _c(_KITCHEN_LINES[idx], _PHRASE_COLORS[idx])
+            msg = _c(detail or first or "starting", "38;5;114")
             sys.stdout.write(f"\r\x1b[K {spin} {msg}")
             sys.stdout.flush()
             time.sleep(0.09)
@@ -188,6 +173,8 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
             cache_moved = True
             last_pct_at = time.time()
             loader.set("fetching the relay directory -- first start only")
+        elif pct >= 100:
+            loader.set("checking the exit")
         # stuck checks
         stall = time.time() - last_pct_at
         limit = download_limit if (cache_moved and pct <= 10) else \
@@ -289,6 +276,7 @@ def main(argv: list[str]) -> int:
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
             )
+            loader.set("starting tor")
             err = manager.setup_lanes()
             if err:
                 loader.stop(_c(f" !! tor unavailable ({err}) -- going direct",
