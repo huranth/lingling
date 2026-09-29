@@ -275,6 +275,7 @@ def main(argv: list[str]) -> int:
     daemon: HealthDaemon | None = None
     relay: Relay | None = None
     direct = opts["no_tor"]
+    end_code: list = []
 
     try:
         if not direct:
@@ -328,7 +329,9 @@ def main(argv: list[str]) -> int:
             loader.stop()
             print(_c("lingling: no lanes -- opencode rides your own IP.\n",
                      "33"))
-            return _run_opencode(opencode, opts["passthrough"], None)
+            code = _run_opencode(opencode, opts["passthrough"], None)
+            end_code.append(code)
+            return code
 
         emit = proof.make_emitter(PROOF_LOG)
         # session marker
@@ -376,7 +379,9 @@ def main(argv: list[str]) -> int:
         if ca_pem:
             # trust CA
             env["NODE_EXTRA_CA_CERTS"] = str(ca_pem)
-        return _run_opencode(opencode, opts["passthrough"], env)
+        code = _run_opencode(opencode, opts["passthrough"], env)
+        end_code.append(code)
+        return code
     finally:
         if daemon:
             daemon.stop()
@@ -386,7 +391,21 @@ def main(argv: list[str]) -> int:
             manager.stop_all()
         if not direct:
             try:
-                proof.make_emitter(PROOF_LOG)(proof.DONE)
+                emit = proof.make_emitter(PROOF_LOG)
+                if end_code:
+                    # session verdict
+                    c = end_code[0]
+                    if c == 130:
+                        msg = "session ended by Ctrl+C"
+                    elif c:
+                        msg = (f"opencode exited on its own (code {c}) "
+                               f"while the lanes were still hot")
+                    else:
+                        msg = "opencode closed the session -- bye"
+                    emit({"type": "lane", "kind": "fail" if c not in (0, 130)
+                          else "", "t": time.time(), "lane": 0, "cc": "",
+                          "ip": "", "msg": msg})
+                emit(proof.DONE)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -394,20 +413,34 @@ def main(argv: list[str]) -> int:
 def _run_opencode(binary: str, args: list[str],
                   env: dict | None) -> int:
     """Exec opencode with stdio inherited so it owns the terminal."""
+    """
+    The TUI takes seconds to paint its first frame and says nothing while
+    it does -- a blank screen here read as a crash, and a Ctrl+C into it
+    made that true. The handoff line lands before the blank pause starts,
+    and the exit line says who ended the session when the child does.
+    """
+    print(_c(" handoff: starting opencode -- its TUI loads quietly for a "
+             "few seconds.", "90"), flush=True)
     try:
         proc = subprocess.Popen([binary, *args], env=env)
     except OSError as exc:
         print(f"lingling: couldn't launch opencode: {exc}")
         return 1
     try:
-        return proc.wait()
+        code = proc.wait()
     except KeyboardInterrupt:
+        print(_c(" Ctrl+C -- closing the kitchen.", "90"), flush=True)
         try:
             proc.terminate()
             proc.wait(timeout=5)
         except Exception:  # noqa: BLE001
             pass
         return 130
+    if code != 0:
+        print(_c(f" opencode exited (code {code}) -- the lanes stayed hot "
+                 f"the whole time; run lingling again to ride.", "33"),
+              flush=True)
+    return code
 
 
 def entry() -> None:
