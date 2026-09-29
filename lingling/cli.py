@@ -242,6 +242,27 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
     return first.healthy is True
 
 
+def _cache_is_cold(data_dir: Path) -> bool:
+    """True when no lane holds a descriptor cache yet.
+
+    Read from the filesystem alone, BEFORE the spinner starts: which line
+    a first run shows cannot wait on a manager, or the flavour lines get
+    their frame in first and the user reads the wait as slowness."""
+    try:
+        return not any((data_dir / "lanes").glob("tor-*/cached-microdesc*"))
+    except OSError:
+        return True
+
+
+def _tor_present(data_dir: Path) -> bool:
+    """True when the tor binary is already on disk."""
+    name = "tor.exe" if os.name == "nt" else "tor"
+    try:
+        return any((data_dir / "tools").rglob(name))
+    except OSError:
+        return False
+
+
 def main(argv: list[str]) -> int:
     opts = _parse_args(argv)
 
@@ -274,6 +295,20 @@ def main(argv: list[str]) -> int:
         return 1
 
     loader = _Loader()
+    if _cache_is_cold(DATA_DIR):
+        """
+        The first frame decides what a new user believes this tool is. A
+        cold data dir means minutes of fetching, so the honest line is
+        pinned before the spinner ever ticks and the flavour lines never
+        rotate on this run; the boot gate replaces it with live progress.
+        A warm machine gets the kitchen phrases as before.
+        """
+        if _tor_present(DATA_DIR):
+            loader.steady("first start -- fetching tor's relay directory "
+                          "(one-time, a few minutes)")
+        else:
+            loader.steady("first start -- downloading tor and the relay "
+                          "directory (one-time, a few minutes)")
     loader.start()
     manager: TorManager | None = None
     daemon: HealthDaemon | None = None
@@ -291,22 +326,6 @@ def main(argv: list[str]) -> int:
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
             )
-            if manager.cache_mtime(manager.lanes[0]) == 0.0:
-                """
-                A cold data dir means this machine is fetching tor's relay
-                directory for the first time, which takes minutes. The
-                kitchen phrases never rotate on this run: the honest line
-                goes up at second zero, and the boot gate replaces it with
-                live progress. A warm machine keeps the flavour.
-                """
-                if manager.tools_ready():
-                    loader.steady("first start -- fetching tor's relay "
-                                  "directory (one-time, a few minutes)")
-                else:
-                    loader.steady("first start -- downloading tor and the "
-                                  "relay directory (one-time, a few minutes)")
-            else:
-                loader.set()
             err = manager.setup_lanes()
             if err:
                 loader.stop(_c(f" !! tor unavailable ({err}) -- going direct",
