@@ -581,13 +581,19 @@ class TorManager:
         if self._stopping:
             return
         self._stopping = True
-        # drain rebuilds
-        for t in list(self._rebuilds):
-            t.join(timeout=20)
+        """
+        Tor dies first: joining rebuild threads before the kill left every
+        tor.exe visibly alive for up to a minute after Ctrl+C, which read
+        as "lingling never stops tor". Lanes go down in a second or two;
+        the threads see _stopping and bail; the port-range reap sweeps up
+        anything a mid-flight rebuild resurrected.
+        """
         for lane in self.lanes:
             self._stop_lane_process(lane)
         # whole range
         self._reap_orphans()
+        for t in list(self._rebuilds):
+            t.join(timeout=5)
 
     def _stop_lane_process(self, lane: Lane) -> None:
         if lane.process is None:

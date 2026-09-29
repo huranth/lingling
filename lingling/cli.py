@@ -277,20 +277,60 @@ def _running_children() -> list:
     """Lingling's helpers that lock the data dir, as (name, count)."""
     if os.name != "nt":
         return []
-    out = []
-    try:
-        raw = subprocess.run(
-            ["tasklist", "/fo", "csv", "/nh"], capture_output=True,
-            text=True, timeout=15).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    import csv
-    import io
+    """
+    This uninstaller is itself a lingling.exe, and so is the shim above
+    it -- count only *other* boots, by walking up the parent chain through
+    the process snapshot. One source of names, so nothing double counts.
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+    TH32CS_SNAPPROCESS = 0x2
+
+    class _PENTRY(ctypes.Structure):
+        """The real PROCESSENTRY32, byte for byte."""
+        _fields_ = [("dwSize", wt.DWORD),
+                    ("cntUsage", wt.DWORD),
+                    ("th32ProcessID", wt.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wt.DWORD),
+                    ("cntThreads", wt.DWORD),
+                    ("th32ParentProcessID", wt.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wt.DWORD),
+                    ("szExeFile", ctypes.c_char * 260)]
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateToolhelp32Snapshot.restype = wt.HANDLE
+    k.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+    k.Process32First.restype = wt.BOOL
+    k.Process32First.argtypes = [wt.HANDLE, ctypes.POINTER(_PENTRY)]
+    k.Process32Next.restype = wt.BOOL
+    k.Process32Next.argtypes = [wt.HANDLE, ctypes.POINTER(_PENTRY)]
+    k.CloseHandle.argtypes = [wt.HANDLE]
+    snap = k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    parents = {}
+    names = {}
+    if snap:
+        entry = _PENTRY()
+        entry.dwSize = ctypes.sizeof(_PENTRY)
+        if k.Process32First(snap, ctypes.byref(entry)):
+            while True:
+                parents[entry.th32ProcessID] = entry.th32ParentProcessID
+                names[entry.th32ProcessID] = (
+                    entry.szExeFile.decode("utf-8", "replace").lower())
+                if not k.Process32Next(snap, ctypes.byref(entry)):
+                    break
+        k.CloseHandle(snap)
+    mine = {os.getpid()}
+    pid = parents.get(os.getpid())
+    while pid and pid in parents and len(mine) < 8:
+        if names.get(pid, "").startswith("lingling"):
+            mine.add(pid)
+        pid = parents.get(pid)
     counts = {}
-    for row in csv.reader(io.StringIO(raw)):
-        if len(row) < 1:
+    for pid, name in names.items():
+        if pid in mine:
             continue
-        name = row[0].strip().strip('"').lower()
         if name in ("tor.exe", "opencode.exe", "lingling.exe"):
             counts[name] = counts.get(name, 0) + 1
     return sorted(counts.items())
@@ -366,7 +406,7 @@ def _uninstall(rest: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if argv and argv[0] == "uninstall":
+    if argv and argv[0] in ("uninstall", "--uninstall"):
         return _uninstall(argv[1:])
     opts = _parse_args(argv)
 

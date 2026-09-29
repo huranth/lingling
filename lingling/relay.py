@@ -103,6 +103,14 @@ class Relay:
     def _shutdown(self) -> None:
         if self._server:
             self._server.close()
+        """
+        Idle keep-alive tunnels live as pending tasks; stopping the loop
+        under them prints "Task was destroyed but it is pending" at exit,
+        so they are cancelled first.
+        """
+        for task in asyncio.all_tasks(self._loop):
+            if task is not asyncio.current_task(self._loop):
+                task.cancel()
         # stop soon
         self._loop.call_later(0.2, self._loop.stop)
 
