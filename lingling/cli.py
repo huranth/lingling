@@ -82,11 +82,22 @@ class _Loader:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._detail: str = ""
+        self._first: str = ""
         self._lock = threading.Lock()
 
     def set(self, detail: str = "") -> None:
         with self._lock:
             self._detail = detail
+
+    def steady(self, msg: str) -> None:
+        """Pin one line from second zero: a cold first run never gets the
+        kitchen phrases. They are warm-boot flavour, and on a machine that
+        is still fetching tor they read as "this tool is slow" -- the one
+        false impression a new user can form before the real message
+        arrives. The pinned line holds until real progress replaces it."""
+        with self._lock:
+            self._first = msg
+            self._detail = msg
 
     def start(self) -> None:
         if not sys.stdout.isatty():
@@ -101,8 +112,11 @@ class _Loader:
             spin = _c(_SPIN[t % len(_SPIN)], "1;38;5;220")
             with self._lock:
                 detail = self._detail
+                first = self._first
             if detail:
                 msg = _c(detail, "38;5;114")
+            elif first:
+                msg = _c(first, "38;5;114")
             else:
                 idx = (t // 24) % len(_KITCHEN_LINES)
                 msg = _c(_KITCHEN_LINES[idx], _PHRASE_COLORS[idx])
@@ -277,7 +291,22 @@ def main(argv: list[str]) -> int:
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
             )
-            loader.set()
+            if manager.cache_mtime(manager.lanes[0]) == 0.0:
+                """
+                A cold data dir means this machine is fetching tor's relay
+                directory for the first time, which takes minutes. The
+                kitchen phrases never rotate on this run: the honest line
+                goes up at second zero, and the boot gate replaces it with
+                live progress. A warm machine keeps the flavour.
+                """
+                if manager.tools_ready():
+                    loader.steady("first start -- fetching tor's relay "
+                                  "directory (one-time, a few minutes)")
+                else:
+                    loader.steady("first start -- downloading tor and the "
+                                  "relay directory (one-time, a few minutes)")
+            else:
+                loader.set()
             err = manager.setup_lanes()
             if err:
                 loader.stop(_c(f" !! tor unavailable ({err}) -- going direct",
