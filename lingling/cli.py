@@ -16,6 +16,12 @@ from . import __version__, data_dir, proof
 from .health import HealthDaemon
 from .lanes import TorManager
 from .relay import Relay
+from . import netutil
+
+
+def _other_lingling() -> int:
+    """The pid of a live lingling holding the one-session lock, else 0."""
+    return netutil.session_lock(DATA_DIR) or 0
 
 DATA_DIR = data_dir()
 PROOF_LOG = DATA_DIR / "proof.log"
@@ -289,6 +295,17 @@ def main(argv: list[str]) -> int:
         print("Reinstall it:  pip install --force-reinstall cryptography")
         return 1
 
+    """
+    One session, enforced: the teardown sweep is only safe with a single
+    owner, so a second launcher is turned away before any lane, relay,
+    or opencode exists.
+    """
+    other = _other_lingling()
+    if other:
+        print(_c(f"lingling is already running (pid {other}) -- one kitchen, "
+                 f"one session. Close that window first.", "33"))
+        return 1
+
     _migrate_countries()
     _spawn_geoip_fallback()
     """
@@ -414,6 +431,7 @@ def main(argv: list[str]) -> int:
         end_code.append(code)
         return code
     finally:
+        netutil.release_session_lock(DATA_DIR)
         if daemon:
             daemon.stop()
         if relay:

@@ -416,6 +416,18 @@ def main():
     except subprocess.TimeoutExpired:
         check("probe refusal wiring proof completes", False, "timed out")
 
+    print("\n=== one session, enforced ===")
+    lock = ROOT / "tools" / "verify" / "verify_session_lock.py"
+    try:
+        res = subprocess.run([sys.executable, str(lock)], cwd=str(ROOT),
+                             capture_output=True, text=True, timeout=120)
+        out = res.stdout + res.stderr
+        check("the one-session lock holds", "SESSION LOCK: CONFIRMED" in out
+              and "SESSION LOCK: FAILED" not in out,
+              "a second launcher was not refused")
+    except subprocess.TimeoutExpired:
+        check("the one-session lock holds", False, "the suite timed out")
+
     print("\n=== the cold-connect handshake spends one window, not two ===")
     # socks5_open makes two blocking reads. A socket timeout
     cold = ROOT / "tools" / "verify" / "verify_cold_connect.py"

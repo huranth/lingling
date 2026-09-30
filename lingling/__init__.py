@@ -4,7 +4,7 @@ import os
 import tempfile
 from pathlib import Path
 
-__version__ = "2.1.20.post16"
+__version__ = "2.1.20.post17"
 
 
 def data_dir() -> Path:

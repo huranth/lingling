@@ -27,6 +27,10 @@ Launching shows exactly one pinned line until the lanes are hot:
  served! lanes are hot -- proof is in the other window.
 ```
 
+One session at a time: launching a second `lingling` while one is running
+prints `lingling is already running (pid N) -- one kitchen, one session.`
+and exits. A crashed session leaves nothing behind — the lock self-clears.
+
 ### "Sure, but how do I know it's not lying?"
 
 Fair. That's what the proof window is for. A second console pops up next to

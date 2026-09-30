@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import platform
 import socket
 import ssl
@@ -12,6 +13,65 @@ import time
 from typing import Optional, Container, Tuple
 
 PORT_CHECK_TIMEOUT = 1.0
+
+
+def _pid_alive_local(pid: int) -> bool:
+    """Is that pid running right now, from the OS's own table."""
+    if platform.system().lower() != "windows":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    try:
+        output = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], text=True, timeout=5)
+        return str(pid) in output and "No tasks" not in output
+    except Exception:
+        return False
+
+
+def session_lock(data_dir: str) -> Optional[int]:
+    """Claim the one-session lock, or report the pid that holds it.
+
+    A lock with no live owner behind it is wreckage from a hard kill:
+    it is overwritten, not honoured. Creation is exclusive, so two
+    racers cannot both win; the loser re-reads and either sees the
+    winner's pid or takes the file once the winner releases it.
+    """
+    path = pathlib.Path(data_dir) / "session.lock"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w") as f:
+                    f.write(str(os.getpid()))
+                return None
+            except FileExistsError:
+                try:
+                    text = path.read_text(encoding="utf-8").strip()
+                    pid = int(text) if text.isdigit() else 0
+                except OSError:
+                    pid = 0
+                if pid and _pid_alive_local(pid):
+                    return pid
+                try:
+                    path.unlink()
+                except OSError:
+                    return 0
+    except OSError:
+        return 0
+
+
+def release_session_lock(data_dir: str) -> None:
+    """Drop the lock this process owns; a pid check keeps it honest."""
+    path = pathlib.Path(data_dir) / "session.lock"
+    try:
+        if path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            path.unlink()
+    except OSError:
+        pass
 
 #: circuit slots
 SOCKS_SLOTS = int(os.environ.get("LINGLING_SOCKS_SLOTS", "8"))
