@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tokenize
 
-sys.path.insert(0, r"C:\Users\W\AppData\Local\Programs\Python\Python312\Lib\site-packages")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 PKG = sorted((ROOT / "lingling").glob("*.py"))
@@ -250,7 +250,7 @@ def main():
     unknown = []
     for entry in sorted(ROOT.iterdir()):
         if entry.name.startswith("."):
-            allowed = set(EXPECTED) | {".git", ".workbuddy-ai"}
+            allowed = set(EXPECTED) | {".git", ".workbuddy-ai", ".freebuff"}
             if entry.name not in allowed:
                 unknown.append(entry.name)
             continue

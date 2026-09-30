@@ -17,14 +17,13 @@ lingling               # = opencode, but the requests ride Tor
 lingling --help        # anything after `lingling` goes to opencode untouched
 ```
 
-First run downloads the Tor Expert Bundle (~30 MB) into Lingling's per-user
-data directory (`%LOCALAPPDATA%\lingling` on Windows, `~/.local/share/lingling`
-on Linux, `~/Library/Application Support/lingling` on macOS; override with
-`LINGLING_DATA_DIR`). After that, launching looks like this — a few seconds
-of kitchen noises while the first lane cooks, then opencode opens:
+State lives under the OS temp dir (`%LOCALAPPDATA%\Temp\lingling-data` on
+Windows; override with `LINGLING_DATA_DIR`) — the OS's own cleanup owns any
+residue. The first run downloads the Tor Expert Bundle (~30 MB) there, once.
+Launching shows exactly one pinned line until the lanes are hot:
 
 ```
- ⠋ glazing the tunnel
+ ⠙ first run -- pulling the relay directory, a few minutes, once  47s
  served! lanes are hot -- proof is in the other window.
 ```
 
@@ -112,8 +111,7 @@ sweep that could catch an unrelated `tor.exe`.
 
 By default lanes rotate through a generic pool (us, de, nl, fr, ro, gb, ca,
 se, pl, ch). Want different exits? Drop a `countries.txt` into Lingling's
-data directory (`%LOCALAPPDATA%\lingling` on Windows, `~/.local/share/lingling`
-on Linux, `~/Library/Application Support/lingling` on macOS):
+data directory (`%LOCALAPPDATA%\Temp\lingling-data` on Windows):
 
 ```
 # big pools first: the six boot lanes take the first six here

@@ -191,7 +191,7 @@ def main():
     with fake_clock() as clock:
         tor.clock = clock
         daemon.clock = clock
-        ok = cli._boot_gate(tor, ln3, daemon, loader, deadline_s=600)
+        ok = cli._boot_gate(tor, ln3, daemon, deadline_s=600)
     print(f"  calls={tor.calls}  sim={clock.now - 1_000_000.0:.0f}s")
     check("a downloading tor is never restarted",
           tor.calls == [],
@@ -213,7 +213,7 @@ def main():
     with fake_clock() as clock:
         tor.clock = clock
         daemon.clock = clock
-        cli._boot_gate(tor, ln4, daemon, loader, deadline_s=600)
+        cli._boot_gate(tor, ln4, daemon, deadline_s=600)
     print(f"  calls={tor.calls}  sim={clock.now - 1_000_000.0:.0f}s")
     check("restart comes first", tor.calls[:1] == ["restart"],
           f"calls={tor.calls}")
@@ -232,7 +232,7 @@ def main():
     with fake_clock() as clock:
         tor.clock = clock
         daemon.clock = clock
-        ok = cli._boot_gate(tor, ln5, daemon, loader, deadline_s=600)
+        ok = cli._boot_gate(tor, ln5, daemon, deadline_s=600)
     print(f"  calls={tor.calls}  sim={clock.now - 1_000_000.0:.0f}s")
     check("the lane comes up and the gate says so", ok is True, f"ok={ok}")
     check("no pokes were spent on the download",
@@ -251,7 +251,7 @@ def main():
     with fake_clock() as clock:
         tor.clock = clock
         daemon.clock = clock
-        ok = cli._boot_gate(tor, ln6, daemon, loader, deadline_s=600)
+        ok = cli._boot_gate(tor, ln6, daemon, deadline_s=600)
     check("a lane that hits 100% at 18s serves by 20s",
           ok is True and clock.now - 1_000_000.0 <= 26,
           f"ok={ok} sim={clock.now - 1_000_000.0:.0f}s")
@@ -267,7 +267,7 @@ def main():
     with fake_clock() as clock:
         tor.clock = clock
         daemon.clock = clock
-        cli._boot_gate(tor, ln7, daemon, loader, deadline_s=600)
+        cli._boot_gate(tor, ln7, daemon, deadline_s=600)
     print(f"  calls={tor.calls}")
     # A bootstrapped lane with a dead exit should NOT be restarted -- a
     # restart returns to the same exit. Rotation is the right first poke,

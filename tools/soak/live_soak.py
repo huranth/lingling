@@ -7,8 +7,9 @@ import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from pathlib import Path
 
-sys.path.insert(0, r"C:\Users\W\AppData\Local\Programs\Python\Python312\Lib\site-packages")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lingling import mitm, proof
 from lingling.cli import DATA_DIR, load_countries
@@ -182,8 +183,9 @@ def main():
 
     mgr, daemon, relay, port = boot()
     ca = str(DATA_DIR / "mitm" / "ca.pem")
-    oc = shutil.which("opencode") or \
-        r"C:\Users\W\AppData\Roaming\npm\node_modules\opencode-ai\bin\opencode.exe"
+    oc = shutil.which("opencode")
+    if oc is None:
+        raise SystemExit("opencode is not on PATH -- install it first")
     env = dict(os.environ)
     env["HTTPS_PROXY"] = f"http://127.0.0.1:{port}"
     env["HTTP_PROXY"] = f"http://127.0.0.1:{port}"

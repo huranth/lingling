@@ -6,7 +6,8 @@ import threading
 import time
 from pathlib import Path
 
-sys.path.insert(0, r"C:\Users\W\AppData\Local\Programs\Python\Python312\Lib\site-packages")
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from lingling import exits, netutil
 from lingling.cli import DATA_DIR, load_countries
@@ -209,8 +210,8 @@ check("a fully limited pool still hands out a lane", pick is not None,
 
 print("\n=== M. every lane gets its own pinned exit ===")
 # Live proof the pin holds: ExitNodes $FP +
-LANES = Path(r"C:\Users\W\AppData\Local\lingling\lanes")
-GEO = Path(r"C:\Users\W\AppData\Local\lingling\tools\data\geoip")
+LANES = DATA_DIR / "lanes"
+GEO = DATA_DIR / "geoip"
 
 
 def pinned_mgr(countries=("tr", "ua", "is", "hr", "bg", "hk")):

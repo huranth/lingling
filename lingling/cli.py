@@ -159,7 +159,7 @@ def _parse_args(argv: list[str]) -> dict:
     return opts
 
 
-def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
+def _boot_gate(manager: TorManager, first, daemon: HealthDaemon,
                download_limit: float = 120, quick_limit: float = 30,
                deep_limit: float = 90, deadline_s: float = 600) -> bool:
     """Wait for the first lane: progress first, probe only when tor is done."""
@@ -174,8 +174,8 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
         Evidence before the probe. The exit probe blocks for its whole
         window against a half-booted tor, and the old order ran it first --
         so the screen froze on tor 0% while tor raced to 100% unobserved.
-        The gate never touches the loader: one pinned line owns the screen,
-        the clock beside it proves liveness, and this loop only acts.
+        The gate stays silent: one pinned line owns the screen, the clock
+        beside it proves liveness, and this loop only acts.
         """
         pct = manager.lane_bootstrap_pct(first)
         cache_at = manager.cache_mtime(first)
@@ -222,6 +222,20 @@ def _cache_is_cold(data_dir: Path) -> bool:
         return not any((data_dir / "lanes").glob("tor-*/cached-microdesc*"))
     except OSError:
         return True
+
+
+def _resolve_geoip() -> Optional[Path]:
+    """The geoip file the tor bundle ships, wherever this bundle put it."""
+    for c in (DATA_DIR / "tools" / "tor" / "data" / "geoip",):
+        if c.is_file():
+            return c
+    try:
+        for p in (DATA_DIR / "tools").rglob("geoip"):
+            if p.is_file():
+                return p
+    except OSError:
+        pass
+    return None
 
 
 def _migrate_countries() -> None:
@@ -276,6 +290,7 @@ def main(argv: list[str]) -> int:
         return 1
 
     _migrate_countries()
+    _spawn_geoip_fallback()
     """
     Two lines, that is the whole message list. Pinned before the spinner
     ticks and never replaced until the lane serves: tor refreshing its
@@ -294,6 +309,7 @@ def main(argv: list[str]) -> int:
     relay: Relay | None = None
     direct = opts["no_tor"]
     end_code: list = []
+    emit = None  # proof sink
 
     try:
         if not direct:
@@ -331,7 +347,7 @@ def main(argv: list[str]) -> int:
                 first = manager.lanes[0]
                 manager.start_lanes([first], on_lane=_report_boot)
 
-                if not _boot_gate(manager, first, daemon, loader):
+                if not _boot_gate(manager, first, daemon):
                     loader.stop(_c(" !! the kitchen stayed cold -- "
                                    "going direct", "31"))
                     direct = True
@@ -347,7 +363,8 @@ def main(argv: list[str]) -> int:
             end_code.append(code)
             return code
 
-        emit = proof.make_emitter(PROOF_LOG)
+        if emit is None:
+            emit = proof.make_emitter(PROOF_LOG)
         # session marker
         emit({"type": "start", "t": time.time(),
               "session": os.urandom(6).hex(), "lanes": len(manager.lanes),
@@ -403,9 +420,8 @@ def main(argv: list[str]) -> int:
             relay.stop()
         if manager and not direct:
             manager.stop_all()
-        if not direct:
+        if emit:
             try:
-                emit = proof.make_emitter(PROOF_LOG)
                 if end_code:
                     # session verdict
                     c = end_code[0]
@@ -420,8 +436,34 @@ def main(argv: list[str]) -> int:
                           else "", "t": time.time(), "lane": 0, "cc": "",
                           "ip": "", "msg": msg})
                 emit(proof.DONE)
+                emit.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _spawn_geoip_fallback() -> None:
+    """One background copy of the bundle geoip into the data dir's root.
+
+    Onions: country inference for the proof window reads that root, and
+    the copy must not delay the boot, so it runs after the loader is
+    already spinning. Resumability is preserved: every real geoip file
+    stays exactly where the bundle unpacked it.
+    """
+    dst = DATA_DIR / "geoip"
+    if dst.exists():
+        return
+    src = _resolve_geoip()
+    if src is None:
+        return
+
+    def _copy() -> None:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+        except OSError:
+            pass
+
+    threading.Thread(target=_copy, name="geoip-seed", daemon=True).start()
 
 
 def _run_opencode(binary: str, args: list[str],

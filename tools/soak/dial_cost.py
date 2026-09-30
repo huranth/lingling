@@ -1,9 +1,13 @@
 """What dial failures cost, and whether a lane that dial-fails is really sick."""
 import collections
 import json
+import os
 import pathlib
 
-LOG = pathlib.Path(r"C:/Users/W/AppData/Local/lingling/proof.log")
+from lingling import data_dir
+
+LOG = pathlib.Path(
+    os.environ.get("LINGLING_DATA_DIR", str(data_dir()))) / "proof.log"
 
 #: `socks5_open` returns the string; the exceptions are something else
 DIAL = ("timed out", "ConnectionRefusedError")

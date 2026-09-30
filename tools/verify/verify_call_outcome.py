@@ -7,7 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, r"C:\Users\W\AppData\Local\Programs\Python\Python312\Lib\site-packages")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lingling import mitm, proof  # noqa: E402
 

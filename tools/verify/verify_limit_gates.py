@@ -4,10 +4,9 @@ import inspect
 import io
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, r"C:/Users/W/AppData/Local/Programs/Python/Python312/Lib/site-packages")
-
-from pathlib import Path  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lingling import health as H  # noqa: E402
 from lingling import mitm  # noqa: E402
