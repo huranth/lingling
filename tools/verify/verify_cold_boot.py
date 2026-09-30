@@ -199,8 +199,8 @@ def main():
     check("the gate ran out its full budget instead of flinching early",
           clock.now - 1_000_000.0 >= 598,
           f"only {clock.now - 1_000_000.0:.0f}s of a 600s budget used")
-    check("and the user is told what is happening",
-          any("relay directory" in m for m in loader.messages),
+    check("the gate never touches the loader -- one pinned line owns the boot",
+          loader.messages == [],
           f"messages={loader.messages[:3]}")
     check("the gate reports failure honestly at the deadline", ok is False)
 
@@ -255,6 +255,8 @@ def main():
     check("a lane that hits 100% at 18s serves by 20s",
           ok is True and clock.now - 1_000_000.0 <= 26,
           f"ok={ok} sim={clock.now - 1_000_000.0:.0f}s")
+    check("and it stayed silent doing it -- no chatter on the line",
+          loader.messages == [], f"messages={loader.messages[:3]}")
 
     print("\n=== a dead exit at 100% still escalates, bounded ===")
     tor = FakeTor(1_000_000.0, boot_pct=100)

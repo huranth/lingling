@@ -58,7 +58,7 @@ def _c(text: str, code: str) -> str:
 
 
 class _Loader:
-    """Self-rewriting status line: kitchen phrase, or real boot news when set."""
+    """One pinned line for the whole boot: cold or warm, plus a ticking clock."""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
@@ -173,24 +173,21 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
         """
         Evidence before the probe. The exit probe blocks for its whole
         window against a half-booted tor, and the old order ran it first --
-        so the screen froze on tor 0% while tor raced to 100% unobserved,
-        and a boot that was 17s from serving read as a hang. Progress is
-        read every sweep; the probe runs only at 100%, briefly.
+        so the screen froze on tor 0% while tor raced to 100% unobserved.
+        The gate never touches the loader: one pinned line owns the screen,
+        the clock beside it proves liveness, and this loop only acts.
         """
         pct = manager.lane_bootstrap_pct(first)
         cache_at = manager.cache_mtime(first)
         if pct > last_pct:
             last_pct = pct
             last_pct_at = time.time()
-            loader.set(f"tor {pct}%")
         elif cache_at > last_cache:
             # downloading
             last_cache = cache_at
             cache_moved = True
             last_pct_at = time.time()
-            loader.set("fetching the relay directory -- first start only")
         if pct >= 100:
-            loader.set("checking the exit")
             code = daemon.reachable(first, probe_timeout=8)
             if code == 429:
                 daemon.on_refused(first, code)
@@ -208,13 +205,10 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon, loader,
         if stall > limit and pokes < 3:
             pokes += 1
             if pokes == 1 and pct <= 10:
-                loader.set("tor not responding -- restarting")
                 manager.restart_lane(first)
             elif pokes <= 2 and (pct <= 10 or pokes == 1):
-                loader.set(f"tor stuck at {pct}% -- unpinning country")
                 manager.unpin_lane(first)
             else:
-                loader.set("tor stuck -- re-cooking lane")
                 manager.regenerate_lane(first)
             last_pct = -1
             last_pct_at = time.time()
@@ -228,15 +222,6 @@ def _cache_is_cold(data_dir: Path) -> bool:
         return not any((data_dir / "lanes").glob("tor-*/cached-microdesc*"))
     except OSError:
         return True
-
-
-def _tor_present(data_dir: Path) -> bool:
-    """True when the tor binary is already on disk."""
-    name = "tor.exe" if os.name == "nt" else "tor"
-    try:
-        return any((data_dir / "tools").rglob(name))
-    except OSError:
-        return False
 
 
 def _migrate_countries() -> None:
@@ -291,28 +276,18 @@ def main(argv: list[str]) -> int:
         return 1
 
     _migrate_countries()
+    """
+    Two lines, that is the whole message list. Pinned before the spinner
+    ticks and never replaced until the lane serves: tor refreshing its
+    consensus on every start used to stomp these with progress chatter,
+    which is how warm boots claimed to be first starts.
+    """
     loader = _Loader()
     if _cache_is_cold(DATA_DIR):
-        """
-        The first frame decides what a new user believes this tool is. A
-        cold data dir means minutes of fetching, so the honest line is
-        pinned before the spinner ever ticks and the flavour lines never
-        rotate on this run; the boot gate replaces it with live progress.
-        A warm machine gets the kitchen phrases as before.
-        """
-        if _tor_present(DATA_DIR):
-            loader.steady("first start -- fetching tor's relay directory "
-                          "(one-time, a few minutes)")
-        else:
-            loader.steady("first start -- downloading tor and the relay "
-                          "directory (one-time, a few minutes)")
+        loader.steady("first run -- pulling the relay directory, "
+                      "a few minutes, once")
     else:
-        """
-        Say the cache is warm: a reinstall of the package never touches
-        this data dir, and a fast boot with no explanation reads as the
-        cold-start message misfiring.
-        """
-        loader.steady("warm cache found -- lanes boot fast")
+        loader.steady("warming the lanes -- under a minute")
     loader.start()
     manager: TorManager | None = None
     daemon: HealthDaemon | None = None
@@ -331,7 +306,6 @@ def main(argv: list[str]) -> int:
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
             )
-            loader.set("starting tor")
             err = manager.setup_lanes()
             if err:
                 loader.stop(_c(f" !! tor unavailable ({err}) -- going direct",
@@ -356,9 +330,6 @@ def main(argv: list[str]) -> int:
                 # first lane
                 first = manager.lanes[0]
                 manager.start_lanes([first], on_lane=_report_boot)
-                if manager.cache_mtime(first) == 0.0:
-                    loader.set("first cold start -- fetching the relay "
-                               "directory")
 
                 if not _boot_gate(manager, first, daemon, loader):
                     loader.stop(_c(" !! the kitchen stayed cold -- "
