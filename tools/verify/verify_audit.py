@@ -184,23 +184,27 @@ def main():
     check("no 'holding this request' path anywhere",
           "holding this request" not in own_src)
 
-    print("\n=== the timeout tally is a counter, not a verdict ===")
-    # `note_timeout` is the one piece of per-lane state
+    print("\n=== a timeout is a verdict now, the 429 action on the first hit ===")
+    # A timeout is a dead exit, so it takes the same
     lsrc = (ROOT / "lingling" / "lanes.py").read_text(encoding="utf-8")
     lfns = {n.name: n for n in ast.walk(ast.parse(lsrc))
             if isinstance(n, ast.FunctionDef)}
-    nt = lfns.get("note_timeout")
-    check("note_timeout exists", nt is not None)
-    nt_src = ast.unparse(nt) if nt else ""
-    nok = lfns.get("note_ok")
-    check("a 200 clears the tally",
-          nok is not None and "timeout_run = 0" in ast.unparse(nok))
-    #: nothing may act while the tally is short of the threshold
-    check("nothing happens below the threshold",
-          "return None" in nt_src, "no early return")
-    #: the threshold is one named constant, not a scattered magic number
-    check("the threshold is single-sourced",
-          lsrc.count("_TIMEOUT_RUN") >= 3, f"{lsrc.count('_TIMEOUT_RUN')}")
+    nt_src = ast.unparse(lfns["note_timeout"]) if "note_timeout" in lfns else ""
+    check("note_timeout exists", "note_timeout" in lfns)
+    #: the same action a 429 takes: write it off, move the country, re-cook
+    check("a timeout writes the exit off",
+          "note_limited" in nt_src)
+    check("a timeout moves the country",
+          "rotate_exit_country" in nt_src)
+    check("a timeout re-cooks the lane",
+          "_rebuild_async" in nt_src)
+    #: the old strike layer is gone, not merely bypassed
+    check("no strike counter is left anywhere",
+          "timeout_run" not in lsrc and "repins" not in lsrc
+          and "_TIMEOUT_RUN" not in lsrc,
+          f"timeout_run={lsrc.count('timeout_run')} "
+          f"repins={lsrc.count('repins')} "
+          f"_TIMEOUT_RUN={lsrc.count('_TIMEOUT_RUN')}")
     #: only a TimeoutError may charge it. A strike on 403/503/SSLEOF is the
     msrc = (ROOT / "lingling" / "mitm.py").read_text(encoding="utf-8")
     gated = False

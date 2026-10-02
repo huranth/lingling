@@ -91,6 +91,37 @@ def _mute(c):
             pass
 
 
+def stall_socks_upstream(port_holder, ready):
+    """Accept the TCP connection, then never answer the SOCKS5 greeting."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(16)
+    port_holder.append(srv.getsockname()[1])
+    ready.set()
+    while True:
+        try:
+            c, _ = srv.accept()
+        except OSError:
+            return
+        threading.Thread(target=_stall, args=(c,), daemon=True).start()
+
+
+def _stall(c):
+    """Read the greeting, then silence -- the dial never completes."""
+    try:
+        c.settimeout(30)
+        c.recv(64)
+        time.sleep(120)
+    except OSError:
+        pass
+    finally:
+        try:
+            c.close()
+        except OSError:
+            pass
+
+
 def main():
     print("=== the per-lane timeout tally sees absorbed timeouts ===")
 
@@ -125,9 +156,6 @@ def main():
         def note_timeout(self, lane):
             self.charged.append(lane.index)
             return ""
-
-        def note_ok(self, lane):
-            return None
 
         def note_result(self, cc, status):
             return None
@@ -222,52 +250,65 @@ def main():
           charged_mute == [],
           f"charged={charged_mute} -- a cold circuit would be retired")
 
-    print("\n=== the cold connect cannot reach the tally at all ===")
-    # This is structural, and it is the whole
-    import ast
-    tree = ast.parse((ROOT / "lingling" / "mitm.py").read_text("utf-8"))
-    fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-          and n.name == "_roundtrip"][0]
+    print("\n=== a dial that times out IS charged, so the lane can repin ===")
+    holder3, ready3 = [], threading.Event()
+    threading.Thread(target=stall_socks_upstream, args=(holder3, ready3),
+                     daemon=True).start()
+    ready3.wait(5)
+    stall_port = holder3[0]
+    charged_dial = []
+    try:
+        # One short window, so the stalled greeting is a SOCKS timeout.
+        mitm._FIRST_BYTE_TIMEOUT = 0.5
+        relay = Relay()
+        relay.tor.charged = charged_dial
+        events_d = []
+        lane_d = Lane(1)
+        lane_d.socks_port = stall_port
+        mitm._roundtrip(Client(), lane_d, "opencode.ai", 443, "POST",
+                        "/zen/v1/responses", {}, b"{}",
+                        lambda e: events_d.append(e), 1, 1, time.time(),
+                        relay, charge_timeout=True)
+    finally:
+        netutil.socks5_open = real_socks
+        ssl.create_default_context = real_ctx
+        mitm._READ_TIMEOUT = real_ceiling
+        mitm._FIRST_BYTE_TIMEOUT = real_first
+    err_d = events_d[0].get("err") if events_d else None
+    print(f"  stalled dial: err={err_d!r}  charged={charged_dial}")
+    check("a stalled dial reads as a SOCKS timeout",
+          err_d == "timed out", f"err={err_d!r}")
+    check("a dial timeout is charged to the lane",
+          charged_dial == [1],
+          f"charged={charged_dial} -- an uncharged dial leaves lane 2 stuck")
 
-    def _spans(node, line):
-        return node.lineno <= line <= node.end_lineno
-
-    def _ends_jump(stmt):
-        if isinstance(stmt, (ast.Return, ast.Raise)):
-            return True
-        if isinstance(stmt, ast.If):
-            return all(stmt.body and stmt.orelse
-                       and _ends_jump(stmt.body[-1])
-                       and _ends_jump(stmt.orelse[-1]))
-        return False
-
-    charge_calls = [n for n in ast.walk(fn)
-                    if isinstance(n, ast.Call)
-                    and getattr(n.func, "id", "") == "_note_timeout"]
-    charge_line = min(n.lineno for n in charge_calls)
-    dial_tries = [n for n in ast.walk(fn)
-                  if isinstance(n, ast.Try)
-                  and any(isinstance(s, ast.Expr)
-                          and isinstance(s.value, ast.Call)
-                          and "connect" in ast.unparse(s.value)
-                          for s in ast.walk(n))]
-    check("the dial try exists", bool(dial_tries),
-          "no try contains the SOCKS dial -- where do its errors go?")
-    if dial_tries:
-        dial = min(dial_tries, key=lambda n: n.end_lineno - n.lineno)
-        print(f"  dial try at {dial.lineno}-{dial.end_lineno}, "
-              f"charge site at {charge_line}")
-        check("the dial try cannot reach the charge site",
-              not _spans(dial, charge_line),
-              f"charge site {charge_line} sits inside the dial try "
-              f"{dial.lineno}-{dial.end_lineno} -- a dial timeout would "
-              f"charge a cold start")
-        check("the dial try owns its handlers",
-              bool(dial.handlers),
-              "no handler -- a dial timeout would escape to whoever is next")
-        check("every dial handler returns before the charge site",
-              all(_ends_jump(h.body[-1]) for h in dial.handlers),
-              "a handler that falls through runs on into the charge region")
+    print("\n=== a refused dial is NOT charged, so a cold start survives ===")
+    # A lane whose port is closed is down, not limited; the health daemon
+    # owns that, so the tally must stay clear.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()
+    charged_refused = []
+    try:
+        mitm._FIRST_BYTE_TIMEOUT = real_first
+        relay = Relay()
+        relay.tor.charged = charged_refused
+        events_r = []
+        lane_r = Lane(1)
+        lane_r.socks_port = dead_port
+        mitm._roundtrip(Client(), lane_r, "opencode.ai", 443, "POST",
+                        "/zen/v1/responses", {}, b"{}",
+                        lambda e: events_r.append(e), 1, 1, time.time(),
+                        relay, charge_timeout=True)
+    finally:
+        netutil.socks5_open = real_socks
+        ssl.create_default_context = real_ctx
+        mitm._READ_TIMEOUT = real_ceiling
+        mitm._FIRST_BYTE_TIMEOUT = real_first
+    check("a refused dial is not charged",
+          charged_refused == [],
+          f"charged={charged_refused} -- only a timeout means a dead exit")
 
     print()
     if FAILS:

@@ -135,9 +135,6 @@ class FakeTor:
     def note_result(self, country, status):
         pass
 
-    def note_ok(self, lane):
-        pass
-
     def note_timeout(self, lane):
         return ""
 
