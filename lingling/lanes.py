@@ -46,9 +46,6 @@ _ROTATION_MEMORY = 8
 #: conflux legs
 CONFLUX = os.environ.get("LINGLING_CONFLUX", "0")
 
-#: strike threshold
-_TIMEOUT_RUN = 3
-
 #: drain grace
 _DRAIN_S = 5.0
 
@@ -104,10 +101,6 @@ class Lane:
     last_real_at: float = 0.0
     #: server reset
     limited_until: float = 0.0
-    #: timeout run
-    timeout_run: int = 0
-    #: repin stage
-    repins: int = 0
     #: pinned relay
     exit_fingerprint: str = ""
     #: rotation cursor
@@ -726,22 +719,17 @@ class TorManager:
         return self._score.get(country, 0)
 
     def note_timeout(self, lane: Lane) -> Optional[str]:
-        """A lane's own timeout tally: 3 without a 200 and it is demolished."""
-        lane.timeout_run += 1
-        if lane.timeout_run < _TIMEOUT_RUN:
-            return None
-        lane.timeout_run = 0
-        if lane.repins == 0:
-            # fresh exit
-            lane.repins = 1
-            self._rebuild_async(lane, repin=True)
-            return f"lane {lane.index} timed out {_TIMEOUT_RUN}x -- fresh exit"
-        # fresh country
-        lane.repins = 0
+        """A timeout means a dead exit: write it off and move the lane at once.
+
+        The same action a real 429 takes in ``health.on_refused`` -- retire the
+        exit, pin a fresh relay, change the country -- with no second strike.
+        """
+        if lane.limited_until <= time.time():
+            self.note_limited(lane)
         moved = self.rotate_exit_country(lane)
         self._rebuild_async(lane)
-        return (f"lane {lane.index} timed out {_TIMEOUT_RUN}x again -- "
-                f"moved to {{{moved or lane.exit_country}}}")
+        return (f"lane {lane.index} timed out -- moved to "
+                f"{{{moved or lane.exit_country}}}")
 
     def _rebuild_async(self, lane: Lane, repin: bool = False) -> None:
         """Re-cook a lane on its own thread, tracked so shutdown can join it."""
@@ -751,11 +739,6 @@ class TorManager:
         self._rebuilds = [x for x in self._rebuilds if x.is_alive()]
         self._rebuilds.append(t)
         t.start()
-
-    def note_ok(self, lane: Lane) -> None:
-        """A 200 clears the lane's tallies, and nothing else does."""
-        lane.timeout_run = 0
-        lane.repins = 0
 
     def note_result(self, country: str, status: int) -> None:
         """Score a country by what the EXIT did: a 200, or a 429."""

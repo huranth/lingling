@@ -255,7 +255,7 @@ def _grab_lane(relay, tried: set):
 
 
 def _note_timeout(relay, lane, emit, seq: int, call_n: int) -> None:
-    """Charge a timeout to its lane and demolish it on the third."""
+    """A timeout means a dead exit: move the lane at once, as a 429 does."""
     moved = relay.tor.note_timeout(lane)
     if not moved:
         return
@@ -389,8 +389,6 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                 continue
             # score it
             relay.tor.note_result(lane.exit_country, status)
-            if status == 200:
-                relay.tor.note_ok(lane)
             break
 
 
@@ -515,6 +513,9 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
             if err:
                 # lane dead
                 _close_quiet(sock)
+                if err == "timed out" and charge_timeout:
+                    # dead exit
+                    _note_timeout(relay, lane, emit, seq, call_n)
                 emit({"type": "callend", "t": time.time(), "n": seq,
                       "c": call_n, "lane": lane.index,
                       "cc": lane.exit_country, "status": 0, "kb": 0,
