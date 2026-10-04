@@ -3,9 +3,11 @@ import json
 import socket
 import ssl
 import sys
+import sysconfig
 import time
 
-sys.path.insert(0, r"C:\Users\W\AppData\Local\Programs\Python\Python312\Lib\site-packages")
+#: the console script's own copy, resolved per machine
+sys.path.insert(0, sysconfig.get_paths()["purelib"])
 
 from lingling import netutil  # noqa: E402
 from lingling.cli import DATA_DIR, load_countries  # noqa: E402

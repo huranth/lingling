@@ -5,8 +5,11 @@ import pathlib
 import re
 import sys
 
-DEFAULT = (pathlib.Path.home() / "AppData" / "Local" / "lingling" /
-           "proof.log")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
+from lingling import data_dir  # noqa: E402
+
+DEFAULT = data_dir() / "proof.log"
 
 #: enough stalls per bucket before a split means anything
 MIN_PER_BUCKET = 8

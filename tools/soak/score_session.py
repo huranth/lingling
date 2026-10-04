@@ -16,8 +16,9 @@ try:
 except Exception:  # noqa: BLE001
     SEND_WINDOW = 0.0
 
-DEFAULT = (pathlib.Path.home() / "AppData" / "Local" / "lingling" /
-           "proof.log")
+from lingling import data_dir  # noqa: E402
+
+DEFAULT = data_dir() / "proof.log"
 
 
 def load(path: pathlib.Path) -> list:

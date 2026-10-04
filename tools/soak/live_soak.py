@@ -158,7 +158,7 @@ def run_once(oc, env, i, pool=None):
         cmd.append(prompt)
         proc = subprocess.Popen(
             cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, cwd=r"C:\Users\W")
+            text=True, cwd=str(Path.home()))
     except Exception as exc:  # noqa: BLE001
         return i, -2, time.monotonic() - t0, type(exc).__name__
     try:
