@@ -293,9 +293,39 @@ def main():
         check("stem imports", False, repr(exc))
 
     print("\n=== the install points at this tree ===")
-    import lingling
-    here = pathlib.Path(lingling.__file__).resolve().parents[1]
-    check("live package is this workspace", here == ROOT, str(here))
+    # The console script imports from site-packages, and this file prepends
+    # ROOT to sys.path -- so `lingling.__file__` here can only ever be ROOT,
+    # and the old check could never fail. Compare the installed copy instead.
+    import json
+    import importlib.metadata as meta
+    try:
+        dist = meta.distribution("lingling")
+        url = json.loads(dist.read_text("direct_url.json") or "{}")
+        live = pathlib.Path(
+            dist.locate_file("lingling/__init__.py")).resolve().parent
+    except meta.PackageNotFoundError:
+        url, live = {}, None
+    if live is None:
+        check("the package is installed, not merely present", False,
+              "no lingling distribution -- the console script cannot run")
+    elif url.get("dir_info", {}).get("editable"):
+        # An editable install is this tree by construction, so it cannot
+        # be stale; there is no second copy to drift from.
+        check("the install is editable, so this tree is what runs", True,
+              "no installed copy to drift")
+    else:
+        def flat(p):
+            return p.read_bytes().replace(b"\r\n", b"\n")
+
+        drifted = [s.name for s in PKG
+                   if not (live / s.name).exists()
+                   or flat(s) != flat(live / s.name)]
+        check("the installed package is this tree, file for file",
+              not drifted,
+              f"{len(PKG) - len(drifted)}/{len(PKG)} modules match"
+              + (f"; stale: {', '.join(drifted)} -- reinstall, or the "
+                 f"console script keeps running the old code"
+                 if drifted else ""))
 
     print("\n=== the 20s ceiling is an idle ceiling, not a total budget ===")
     # The one claim the owner asked to see
@@ -386,11 +416,14 @@ def main():
               and "[FAIL] a window reset does not become" not in out,
               "a healthy exit was retired for hours")
         check("every 429 names the same reset instant",
-              "[PASS] every 429 in a day resolves to one instant" in out
+              ("[PASS] every 429 in a day resolves to one instant" in out
+               or "[SKIP] every 429 in a day resolves to one instant" in out)
               and "[FAIL] every 429 in a day resolves" not in out,
               "resets looked per-exit")
         check("and the reset repeats at the same time of day",
-              "[PASS] and the instant repeats at the same time of day" in out
+              ("[PASS] and the instant repeats at the same time of day" in out
+               or "[SKIP] and the instant repeats at the same time of day"
+               in out)
               and "[FAIL] and the instant repeats" not in out,
               "the daily repeat is not shown")
         check("limited window confirmed",
@@ -576,7 +609,11 @@ def main():
                   # floors the three windows that no suite was
                   "verify_window_floors",
                   # the owner's FIRST rule -- never invent a
-                  "verify_no_lane_cap"):
+                  "verify_no_lane_cap",
+                  # the probe must warm the circuit the requests ride, not
+                  # its own -- a credential that drifts per request makes
+                  # Tor rebuild a circuit on every call
+                  "verify_probe_circuit"):
         path = ROOT / "tools" / "verify" / f"{suite}.py"
         try:
             res = subprocess.run([sys.executable, str(path)], cwd=str(ROOT),

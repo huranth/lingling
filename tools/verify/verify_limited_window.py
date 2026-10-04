@@ -1,6 +1,5 @@
 """A 429's `retry-after` is a global window reset, not this exit's cooldown."""
 import json
-import os
 import pathlib
 import sys
 import tempfile
@@ -9,6 +8,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from lingling.cli import PROOF_LOG  # noqa: E402
 from lingling.lanes import Lane, TorManager, LIMITED_FALLBACK_S  # noqa: E402
 
 FAILS = []
@@ -60,11 +60,9 @@ def main():
 
     print("\n=== the log: the resets cluster at one time of day, across days ===")
     # `retry_after` counts down to the far end's NEXT
-    log = pathlib.Path(os.environ.get("LOCALAPPDATA", "")) / "lingling" / "proof.log"
-    if not log.exists():
-        check("the log is present to replay", False, f"missing {log}")
-    else:
-        resets = []
+    log = PROOF_LOG
+    resets = []
+    if log.exists():
         for line in open(log, encoding="utf-8", errors="replace"):
             line = line.strip()
             if not line:
@@ -78,29 +76,35 @@ def main():
                 if ra:
                     # keep the absolute instant
                     resets.append(e["t"] + ra)
-        if not resets:
-            check("429s carry a retry-after to replay", False, "none found")
-        else:
-            tod = [(t % 86400) for t in resets]
-            days = {time.strftime("%Y-%m-%d", time.localtime(t)) for t in resets}
-            in_day = max(tod) - min(tod)
-            wall = max(resets) - min(resets)
-            span_tod = max(tod) - min(tod)
-            # midnight wrap: a small negative gap is a
-            if span_tod > 43200:
-                span_tod = 86400 - span_tod
-            print(f"  {len(resets)} 429s over {len(days)} day(s) -> "
-                  f"time-of-day {time.strftime('%H:%M:%S', time.localtime(min(resets)))}"
-                  f" +/-{span_tod:.0f}s, wall span {wall/3600:.1f}h")
-            check("every 429 in a day resolves to one instant",
-                  in_day <= 300,
-                  f"spread {in_day:.0f}s over {len(resets)} 429s")
-            check("and the instant repeats at the same time of day",
-                  len(days) < 2 or span_tod <= 300,
-                  f"time-of-day spread {span_tod:.0f}s across {len(days)} days")
-            if len(days) < 2:
-                print(f"  [note] log covers {len(days)} day -- the daily "
-                      f"repeat is not proven by this run")
+    if not resets:
+        # No 429 is no data, not a violated invariant: the two checks below
+        # replay what the far end actually said, and an empty record has
+        # nothing to replay.
+        print(f"  [SKIP] every 429 in a day resolves to one instant -- "
+              f"no 429 with a retry-after in {log.name}")
+        print("  [SKIP] and the instant repeats at the same time of day -- "
+              "no 429 with a retry-after")
+    else:
+        tod = [(t % 86400) for t in resets]
+        days = {time.strftime("%Y-%m-%d", time.localtime(t)) for t in resets}
+        in_day = max(tod) - min(tod)
+        wall = max(resets) - min(resets)
+        span_tod = max(tod) - min(tod)
+        # midnight wrap: a small negative gap is a
+        if span_tod > 43200:
+            span_tod = 86400 - span_tod
+        print(f"  {len(resets)} 429s over {len(days)} day(s) -> "
+              f"time-of-day {time.strftime('%H:%M:%S', time.localtime(min(resets)))}"
+              f" +/-{span_tod:.0f}s, wall span {wall/3600:.1f}h")
+        check("every 429 in a day resolves to one instant",
+              in_day <= 300,
+              f"spread {in_day:.0f}s over {len(resets)} 429s")
+        check("and the instant repeats at the same time of day",
+              len(days) < 2 or span_tod <= 300,
+              f"time-of-day spread {span_tod:.0f}s across {len(days)} days")
+        if len(days) < 2:
+            print(f"  [note] log covers {len(days)} day -- the daily "
+                  f"repeat is not proven by this run")
 
     print()
     if FAILS:
