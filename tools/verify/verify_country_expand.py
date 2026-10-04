@@ -199,6 +199,24 @@ picks = [relay.pick_lane().index for _ in range(3)]
 check("and it returns once its deadline passes", 1 in picks,
       f"picks={picks}")
 
+print("\n=== K2. a warm circuit is picked before a cold one ===")
+# A lane that just booted or rotated listens on its SOCKS port before its
+# first probe, so it is healthy but its circuit is unbuilt. Preferring the
+# asked lane keeps the first call off that cold three-hop build.
+mgr = live_mgr({})
+relay = Relay(mgr)
+for l in mgr.lanes:
+    l.asked = True
+mgr.lanes[3].asked = False
+pick = relay.pick_lane()
+check("the unasked lane is not picked while warm lanes are free",
+      pick.index != 4, f"pick={getattr(pick, 'index', None)}")
+
+for l in mgr.lanes:
+    l.asked = True
+picks = [relay.pick_lane().index for _ in range(6)]
+check("and it is used once every lane is warm", 4 in picks, f"picks={picks}")
+
 print("\n=== L. every lane limited -> still no deadlock ===")
 mgr = live_mgr({})
 relay = Relay(mgr)
