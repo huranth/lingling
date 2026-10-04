@@ -174,6 +174,38 @@ def main():
           (tmp / "keepme").exists() and (tmp / "tor-notanumber").exists(),
           f"left={left}")
 
+    print("\n=== a smaller pool must not wipe the other lanes' caches ===")
+    # A lane dir is ~47 MB of guard and consensus state that came over the
+    # network. Any tool that builds a one-lane pool -- a probe, a verify
+    # suite, a REPL -- used to delete a real install's other lanes, which
+    # is both slow to rebuild and invisible until the next boot.
+    tmp2 = Path(tempfile.mkdtemp(prefix="lingling-keep-"))
+    for n in range(1, 6):
+        d = tmp2 / "lanes" / f"tor-{n}"
+        d.mkdir(parents=True)
+        (d / "cached-microdescs").write_text("x" * 100, encoding="utf-8")
+
+    probe = _TM(tmp2, count=1, exit_countries=["de"], log=lambda *a: None)
+    # setup_lanes() is the destructive path; its gate is this flag, so
+    # checking the flag is checking the gate itself.
+    check("a fresh manager does not opt into pruning",
+          probe.prune_orphans is False,
+          "prune_orphans defaulted to True -- a probe would delete lanes")
+
+    kept = sorted(p.name for p in (tmp2 / "lanes").iterdir())
+    check("and so the other lanes are still on disk",
+          kept == [f"tor-{n}" for n in range(1, 6)],
+          f"kept={kept} -- a smaller pool wiped a bigger install")
+
+    # The product opts in, so reclaiming disk on a shrink still works.
+    owner = _TM(tmp2, count=2, exit_countries=["de"], log=lambda *a: None,
+                prune_orphans=True)
+    check("the product can still opt in", owner.prune_orphans is True)
+    owner._prune_lane_dirs()
+    after = sorted(p.name for p in (tmp2 / "lanes").iterdir())
+    check("an opted-in shrink reclaims the extra lanes",
+          after == ["tor-1", "tor-2"], f"after={after}")
+
     print()
     if FAILS:
         print("LANE REVIVE: FAILED")

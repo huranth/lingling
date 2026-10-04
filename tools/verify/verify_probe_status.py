@@ -43,6 +43,22 @@ def send(port, body, path=PROBE_PATH):
         return 0, f"{type(exc).__name__}: {exc}"
 
 
+def live_session() -> bool:
+    """True when a lingling or opencode process is already running.
+
+    The live half boots a lane on the real data dir, and a boot reaps the
+    orphan tor processes holding lane ports. Against a live session that
+    is not a reap, it is a kill.
+    """
+    import subprocess
+    try:
+        out = subprocess.check_output(["tasklist"], text=True, timeout=15)
+    except Exception:  # noqa: BLE001
+        return False
+    low = out.lower()
+    return "lingling.exe" in low or "opencode.exe" in low
+
+
 def main():
     print("=== offline: the shipped probe body names a real model ===")
     model = json.loads(BODY.decode())["model"]
@@ -54,6 +70,10 @@ def main():
           BODY != PLACEHOLDER, "shipped body is the placeholder")
 
     print("\n=== live: boot a lane and ask it both ways ===")
+    if live_session():
+        print("  [SKIP] a lingling/opencode session is running -- refusing "
+              "to touch the lane ports.")
+        return finish()
     countries, fallback, preferred = load_countries()
     mgr = TorManager(DATA_DIR, count=1, exit_countries=countries,
                      fallback_countries=fallback,

@@ -14,6 +14,22 @@ from lingling.cli import DATA_DIR, load_countries  # noqa: E402
 from lingling.lanes import USED_PATH, TorManager  # noqa: E402
 
 
+def live_session() -> bool:
+    """True when a lingling or opencode process is already running.
+
+    This suite boots lanes on the real data dir, and a boot reaps the
+    orphan tor processes holding lane ports. Against a live session that
+    is not a reap, it is a kill -- so refuse rather than steal the ports.
+    """
+    import subprocess
+    try:
+        out = subprocess.check_output(["tasklist"], text=True, timeout=15)
+    except Exception:  # noqa: BLE001
+        return False
+    low = out.lower()
+    return "lingling.exe" in low or "opencode.exe" in low
+
+
 def exit_ip(port):
     """What address one lane's traffic comes out of."""
     for host in ("api.ipify.org", "icanhazip.com"):
@@ -42,6 +58,10 @@ def exit_ip(port):
 
 
 def main():
+    if live_session():
+        print("a lingling/opencode session is running -- refusing to touch "
+              "the lane ports. Close it and re-run.")
+        return
     used_before = {}
     if (DATA_DIR / USED_PATH).exists():
         used_before = json.loads((DATA_DIR / USED_PATH).read_text(encoding="utf-8"))

@@ -135,6 +135,7 @@ class TorManager:
         tor_exe: str = "",
         boot_timeout: int = 120,
         log: Optional[Log] = None,
+        prune_orphans: bool = False,
     ) -> None:
         self.root = Path(root_dir)
         self.tools_dir = self.root / "tools"
@@ -169,6 +170,8 @@ class TorManager:
         self.tor_exe_override = tor_exe
         self.boot_timeout = boot_timeout
         self.log: Log = log or (lambda *a, **k: None)
+        #: prune opt-in
+        self.prune_orphans = prune_orphans
         self.lanes: List[Lane] = []
         #: limit hook
         self.limit_hook: Optional[Callable[[Lane], None]] = None
@@ -384,8 +387,14 @@ class TorManager:
             return err
         # own ports
         self._reap_orphans()
-        # dead lanes
-        self._prune_lane_dirs()
+        """
+        Lane dirs are deleted only when the caller asked for it. Booting a
+        one-lane pool must never wipe the caches of a five-lane install, so
+        the product opts in and everything else -- a probe, a verify suite,
+        a stray REPL -- is read-only by construction.
+        """
+        if self.prune_orphans:
+            self._prune_lane_dirs()
         # own relay
         for lane in self.lanes:
             self._pin(lane)
@@ -431,7 +440,13 @@ class TorManager:
         return killed
 
     def _prune_lane_dirs(self) -> int:
-        """Delete the data directories of lanes this pool does not have."""
+        """Delete the data directories of lanes this pool does not have.
+
+        Destructive on purpose: a lane dir holds ~47 MB of guard and
+        consensus state that came over the network. Only the product calls
+        this, via `prune_orphans=True`; a smaller pool built by a probe or
+        a verify suite leaves the other lanes' caches alone.
+        """
         live = {lane.index for lane in self.lanes}
         try:
             entries = list(self.lanes_dir.iterdir())
