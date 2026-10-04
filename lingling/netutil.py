@@ -82,6 +82,17 @@ def slot_cred(lane_index: int, slot: int) -> Tuple[str, str]:
     return f"L{lane_index}s{slot % SOCKS_SLOTS}", "x"
 
 
+def lane_cred(lane_index: int) -> Tuple[str, str]:
+    """The one circuit a lane's probe and its live traffic share.
+
+    Tor keys a circuit to the SOCKS username, so a credential that changes
+    per request makes Tor rebuild a three-hop circuit every call. Judging
+    the lane and then riding a different circuit spends the probe's warmth
+    on a circuit no request ever uses.
+    """
+    return slot_cred(lane_index, 0)
+
+
 #: SOCKS5 replies
 SOCKS_REPLY_CODES = {
     1: "general SOCKS server failure", 2: "connection not allowed",
@@ -290,11 +301,13 @@ def https_via_socks(proxy_port: int, host: str, method: str, path: str,
                     user_agent: str, body: bytes = b"",
                     extra_headers: Optional[dict] = None,
                     timeout: float = 15.0,
-                    max_body: int = 8 * 1024 * 1024) -> Tuple[int, bytes]:
+                    max_body: int = 8 * 1024 * 1024,
+                    cred: Optional[Tuple[str, str]] = None
+                    ) -> Tuple[int, bytes]:
     """HTTPS request through a Tor lane's SOCKS5 port; returns (status, body)."""
     sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=timeout)
     try:
-        err = socks5_open(sock, host, 443)
+        err = socks5_open(sock, host, 443, cred=cred)
         if err:
             raise ConnectionError(f"socks5: {err}")
         ctx = ssl.create_default_context()

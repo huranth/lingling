@@ -93,7 +93,8 @@ class HealthDaemon:
             code, _ = netutil.https_via_socks(
                 lane.socks_port, UPSTREAM_HOST, "POST", PROBE_PATH,
                 UPSTREAM_UA, body=_scan_body(PROBE_MODEL, PROBE_PATH),
-                timeout=probe_timeout)
+                timeout=probe_timeout,
+                cred=netutil.lane_cred(lane.index))
         except Exception:  # noqa: BLE001
             return 0
         try:

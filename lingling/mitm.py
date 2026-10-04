@@ -509,7 +509,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
             sock.connect(("127.0.0.1", lane.socks_port))
             err = netutil.socks5_open(
                 sock, host, port,
-                cred=netutil.slot_cred(lane.index, seq + call_n))
+                cred=netutil.lane_cred(lane.index))
             if err:
                 # lane dead
                 _close_quiet(sock)
