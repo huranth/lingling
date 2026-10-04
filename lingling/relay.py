@@ -217,10 +217,12 @@ class Relay:
         def key(l: Lane):
             # server said
             limited = 1 if l.limited_until > now else 0
+            # cold circuit
+            cold = 0 if l.asked else 1
             # last resort
             losing = (1 if self.tor.score_of(l.exit_country) <= _LOSING
                       else 0) if strict else 0
-            return (limited, l.active, losing, l.last_used_at)
+            return (limited, cold, l.active, losing, l.last_used_at)
 
         lane = min(candidates, key=key)
         lane.last_used_at = time.perf_counter_ns()
@@ -306,7 +308,7 @@ class Relay:
                 try:
                     upstream_r, upstream_w = await self._dial(
                         lane, host, port,
-                        cred=netutil.slot_cred(lane.index, seq))
+                        cred=netutil.lane_cred(lane.index))
                     break
                 except Exception as exc:  # noqa: BLE001
                     err_note = str(exc)
