@@ -613,7 +613,11 @@ def main():
                   # the probe must warm the circuit the requests ride, not
                   # its own -- a credential that drifts per request makes
                   # Tor rebuild a circuit on every call
-                  "verify_probe_circuit"):
+                  "verify_probe_circuit",
+                  # pip cannot clean the data dir -- it only knows the 18
+                  # files in site-packages -- so the uninstaller must,
+                  # and must never touch the hand-written countries file
+                  "verify_uninstall"):
         path = ROOT / "tools" / "verify" / f"{suite}.py"
         try:
             res = subprocess.run([sys.executable, str(path)], cwd=str(ROOT),

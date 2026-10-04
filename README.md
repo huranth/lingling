@@ -15,7 +15,15 @@ pip install lingling
 
 lingling               # = opencode, but the requests ride Tor
 lingling --help        # anything after `lingling` goes to opencode untouched
+lingling uninstall     # wipe the lanes, Tor bundle and logs (keeps countries.txt)
 ```
+
+`pip uninstall lingling` removes the package only — the 18 files in
+site-packages. The lanes, the Tor bundle, the geoip database and the proof
+logs live in the data dir, which pip does not know exists, so a plain pip
+uninstall leaves a few hundred megabytes and a stale relay cache behind.
+Run `lingling uninstall` first for a clean slate (it keeps your
+`countries.txt`), then `pip uninstall lingling`.
 
 State lives under the OS temp dir (`%LOCALAPPDATA%\Temp\lingling-data` on
 Windows; override with `LINGLING_DATA_DIR`) — the OS's own cleanup owns any
@@ -147,6 +155,7 @@ move. If a country does run out, that lane falls back to letting Tor choose.
 | `--no-tor` | skip the lanes, run opencode on your own IP like a civilian |
 | `--no-proof` | no proof window (coward's mode) |
 | `--demo [question]` | fire one real Muse Spark request through a lane, show receipts |
+| `uninstall [--yes]` | wipe the lanes, Tor bundle, geoip and logs (keeps `countries.txt`) |
 
 Everything else is handed to opencode byte-for-byte. We don't touch it,
 we don't parse it, we don't want to know.
@@ -165,7 +174,7 @@ lingling/netutil.py  raw SOCKS5 / HTTPS-over-SOCKS primitives
 lingling/demo.py     lingling --demo
 lingling/winjob.py   Windows Job Object so tor.exe dies with us
 
-tools/verify/        the three offline suites, a boot check, and a repo audit
+tools/verify/        the offline suites, a boot check, and a repo audit
 tools/soak/          live soak: drives the real opencode client
 tools/probe/         tunnel latency probe (no quota)
 ```
