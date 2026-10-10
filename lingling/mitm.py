@@ -27,6 +27,8 @@ _SEND_TIMEOUT = float(os.environ.get("LINGLING_SEND_S", "120"))
 _READ_TIMEOUT = float(os.environ.get("LINGLING_STREAM_TIMEOUT", "1800"))
 #: post-commit idle
 _STREAM_IDLE_TIMEOUT = float(os.environ.get("LINGLING_STREAM_IDLE_S", "1800"))
+#: slow exit
+_SLOW_EXIT_S = float(os.environ.get("LINGLING_SLOW_EXIT_S", "20"))
 #: first event
 _FIRST_EVENT = b"data:"
 #: idle tunnel
@@ -250,16 +252,78 @@ def _dump_cut(seq: int, call_n: int, lane, err: str, cap: bytes,
 
 
 def _grab_lane(relay, tried: set):
-    """The least-loaded lane we have not tried yet."""
+    """The sticky favorite, else the least-loaded lane we have not tried."""
+    sticky = getattr(relay.tor, "sticky", None)
+    if sticky is not None:
+        lane = sticky.next_lane(tried)
+        if lane is not None:
+            return lane
     return relay.pick_lane(exclude=tried)
+
+
+def _sticky_ceiling(relay, lane) -> float:
+    """While stuck on a lane, its release ceiling replaces the slow one."""
+    sticky = getattr(relay.tor, "sticky", None)
+    if sticky is not None and sticky.stuck_on(lane.index):
+        return sticky.release_s
+    return _SLOW_EXIT_S
+
+
+def _sticky_verdict(relay, lane) -> None:
+    """A verdict on the stuck lane wakes the others."""
+    sticky = getattr(relay.tor, "sticky", None)
+    if sticky is not None:
+        sticky.on_verdict(lane.index)
+
+
+def _sticky_sample(relay, lane, t0: float, first_byte_at, first_event_at,
+                   model: str = "") -> None:
+    """Donate this attempt's latency to the round -- model calls only.
+
+    Only an answer to a real model call may elect a lane. opencode fetches
+    its models registry (``GET /api.json`` on models.opencode.ai) the moment
+    it starts, and that fast metadata fetch used to win the round before the
+    user typed anything -- so the proof pane announced a lane had "answered"
+    a request nobody made.
+    """
+    sticky = getattr(relay.tor, "sticky", None)
+    if sticky is None or not model:
+        return
+    stamp = first_event_at or first_byte_at
+    if stamp is not None:
+        sticky.record(lane.index, round(stamp - t0, 2))
 
 
 def _note_timeout(relay, lane, emit, seq: int, call_n: int) -> None:
     """A timeout means a dead exit: move the lane at once, as a 429 does."""
     moved = relay.tor.note_timeout(lane)
+    _sticky_verdict(relay, lane)
     if not moved:
         return
     emit({"type": "lane", "kind": "timeout", "t": time.time(),
+          "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
+          "msg": moved})
+
+
+def _note_ssl(relay, lane, emit, seq: int, call_n: int) -> None:
+    """An SSL cut means a dead exit: the timeout verdict, at once."""
+    moved = relay.tor.note_ssl_error(lane)
+    _sticky_verdict(relay, lane)
+    if not moved:
+        return
+    emit({"type": "lane", "kind": "ssl", "t": time.time(),
+          "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
+          "msg": moved})
+
+
+def _note_slow(relay, lane, emit, seq: int, call_n: int,
+               elapsed: float) -> None:
+    """A slow first event is a bad exit: the timeout verdict, at once."""
+    moved = relay.tor.note_slow_exit(lane, elapsed)
+    _sticky_verdict(relay, lane)
+    if not moved:
+        return
+    emit({"type": "lane", "kind": "slow", "t": time.time(),
           "lane": lane.index, "cc": lane.exit_country, "ip": lane.exit_ip,
           "msg": moved})
 
@@ -355,7 +419,8 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                     client, lane, host, port, method, path, headers,
                     body, emit, seq, call_n, t0, relay,
                     # only once
-                    charge_timeout=not tried)
+                    charge_timeout=not tried,
+                    model=model)
             finally:
                 with lane.lock:
                     lane.active -= 1
@@ -370,7 +435,14 @@ def _serve(client: ssl.SSLSocket, host: str, port: int, seq: int,
                 return
             if status in _RETRYABLE:
                 if status == 429:
+                    exit_limit, retry_after = _limit_of(held)
+                    if not exit_limit:
+                        """opencode is down, not the exit: moving cannot help"""
+                        client.sendall(held)
+                        return
+                    relay.tor.note_limited(lane, retry_after)
                     relay.report_refused(lane, status)
+                    _sticky_verdict(relay, lane)
                     tried.add(lane.index)
                     if not relay.any_unlimited(tried):
                         # none left
@@ -463,6 +535,22 @@ def _retry_after(rheaders: dict) -> float:
         return 0.0
 
 
+def _limit_of(held: bytes) -> "tuple[bool, float]":
+    """Whether a held 429 is the exit's own limit, and the wait it asks for.
+
+    opencode also answers "Endpoint is unavailable" as a 429. That one is not
+    the exit, so rotating lanes cannot fix it and it is not benched.
+    """
+    if netutil.UPSTREAM_DOWN in held:
+        return False, 0.0
+    rheaders = {}
+    for raw in held.split(b"\r\n\r\n", 1)[0].split(b"\r\n")[1:]:
+        if b":" in raw:
+            k, v = raw.split(b":", 1)
+            rheaders[k.strip().lower()] = v.strip()
+    return True, _retry_after(rheaders)
+
+
 def _lat(t0: float, first_byte: Optional[float],
          first_event: Optional[float]) -> Dict:
     """Offset from request start to first upstream byte / first SSE event."""
@@ -475,9 +563,13 @@ def _lat(t0: float, first_byte: Optional[float],
 def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                method: str, path: str, headers: dict, body: bytes,
                emit, seq: int, call_n: int, t0: float, relay: "object",
-               charge_timeout: bool = False
+               charge_timeout: bool = False,
+               model: Optional[str] = None
                ) -> "tuple[str, int, bytes, bool]":
     """One upstream attempt; 429s buffer into ``held`` for a lane retry."""
+    if model is None:
+        # model calls
+        model = _model_of(body) if body else ""
     first_byte_at = None   # byte one
     first_event_at = None  # event one
     # above dial
@@ -535,6 +627,9 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
             if err == "ConnectionRefusedError":
                 # lane down
                 lane.healthy = False
+            if charge_timeout and isinstance(exc, ssl.SSLError):
+                # dead exit
+                _note_ssl(relay, lane, emit, seq, call_n)
             emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
                   "lane": lane.index, "cc": lane.exit_country, "status": 0,
                   "kb": 0, "secs": round(time.time() - t0, 1), "err": err,
@@ -683,9 +778,7 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                 rheaders[k.strip().lower()] = v.strip()
 
         if status == 429:
-            # exit limited
             retry_after = _retry_after(rheaders)
-            relay.tor.note_limited(lane, retry_after)
 
         if status not in _RETRYABLE:
             held = None  # stream out
@@ -774,6 +867,16 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
             # dump capture
             _dump_cut(seq, call_n, lane, "eof-mid-body", bytes(_cap), total)
 
+        # sample first
+        _sticky_sample(relay, lane, t0, first_byte_at, first_event_at, model)
+
+        # then judge
+        if (first_event_at is not None
+                and first_event_at - t0 >= min(_sticky_ceiling(relay, lane),
+                                               _SLOW_EXIT_S)):
+            _note_slow(relay, lane, emit, seq, call_n,
+                       round(first_event_at - t0, 1))
+
         emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
               "lane": lane.index, "cc": lane.exit_country, "status": status,
               "kb": round(total / 1024, 1),
@@ -798,6 +901,10 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                 and last_op == "upstream"):
             # charged here
             _note_timeout(relay, lane, emit, seq, call_n)
+        elif (charge_timeout and isinstance(exc, ssl.SSLError)
+                and last_op == "upstream"):
+            # dead exit
+            _note_ssl(relay, lane, emit, seq, call_n)
         if _committed and _cap:
             # dump capture
             _dump_cut(seq, call_n, lane, err, bytes(_cap), seen)

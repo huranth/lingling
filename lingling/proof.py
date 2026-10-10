@@ -93,7 +93,7 @@ def _render(ev: Dict) -> str:
                 verdict = _c(f"failed ({err})", "31")
             if ev.get("stalled"):
                 verdict += _c(f" [{ev['stalled']} stalled]", "90")
-        elif status == 429:
+        elif status == 429 and '"server_error"' not in (ev.get("note") or ""):
             mins = round((ev.get("retry_after") or 0) / 60)
             note = (f" exit limited {mins}m -- moving lanes" if mins
                     else " exit limited -- moving lanes")
@@ -124,7 +124,7 @@ def _render(ev: Dict) -> str:
     if ev.get("type") == "lane":
         kind = ev.get("kind", "")
         color = {"up": "32", "limited": "33", "heal": "33", "fail": "31",
-                 "": "90"}.get(kind, "37")
+                 "sticky": "36", "": "90"}.get(kind, "37")
         return f"{_c(ts, '90')}  {_c('*', color)} {_c(ev.get('msg', ''), color)}"
     return ""
 

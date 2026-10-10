@@ -14,6 +14,10 @@ from typing import Optional, Container, Tuple
 
 PORT_CHECK_TIMEOUT = 1.0
 
+"""opencode's own "endpoint unavailable" error body -- a 429 that is NOT
+the exit's limit"""
+UPSTREAM_DOWN = b'"server_error"'
+
 
 def _pid_alive_local(pid: int) -> bool:
     """Is that pid running right now, from the OS's own table."""

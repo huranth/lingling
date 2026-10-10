@@ -89,13 +89,17 @@ class HealthDaemon:
                                     timeout=netutil.PORT_CHECK_TIMEOUT):
             return 0
         code = 0
+        body = b""
         try:
-            code, _ = netutil.https_via_socks(
+            code, body = netutil.https_via_socks(
                 lane.socks_port, UPSTREAM_HOST, "POST", PROBE_PATH,
                 UPSTREAM_UA, body=_scan_body(PROBE_MODEL, PROBE_PATH),
                 timeout=probe_timeout,
                 cred=netutil.lane_cred(lane.index))
         except Exception:  # noqa: BLE001
+            return 0
+        if code == 429 and netutil.UPSTREAM_DOWN in body:
+            """opencode is down, not the exit: no verdict about this lane"""
             return 0
         try:
             c2, body = netutil.https_get_via_socks(
@@ -118,6 +122,10 @@ class HealthDaemon:
             # mid-launch
             if lane.healing:
                 continue
+            sticky = getattr(self.tor, "sticky", None)
+            if sticky is not None and sticky.frozen(lane.index):
+                # frozen lane
+                continue
             # down
             if (lane.process is None or lane.process.poll() is not None
                     or not lane.healthy):
@@ -139,17 +147,16 @@ class HealthDaemon:
                 lane.probe_code = code
                 self._emit_lane(
                     lane, "up",
-                    f"lane {lane.index} {{{lane.exit_country}}} is cooking "
-                    f"({code}) -- exit {lane.exit_ip or '?'}")
+                    f"lane {lane.index} {{{lane.exit_country}}} is up "
+                    f"-- exit {lane.exit_ip or '?'}")
                 continue
             # no verdict
             if lane.probe_code != code:
                 lane.probe_code = code
                 self._emit_lane(
                     lane, "probe",
-                    f"lane {lane.index} probe got {code or 'nothing'} -- that "
-                    f"is not a verdict about the exit, so the lane is left "
-                    f"unasked and asked again next sweep")
+                    f"lane {lane.index} probe got {code or 'nothing'} -- "
+                    f"not a verdict, re-asking next sweep")
 
     def on_refused(self, lane: Lane, status: int = 429) -> None:
         """A real 429 from the far end: move this lane to a different country."""
