@@ -25,6 +25,12 @@ TOR_DIST_URL = "https://archive.torproject.org/tor-package-archive/torbrowser/"
 #: no retry-after
 LIMITED_FALLBACK_S = 600.0
 
+#: sticky release
+_STICKY_S = float(os.environ.get("LINGLING_STICKY_S", "15"))
+
+#: stick threshold
+_FAST_S = float(os.environ.get("LINGLING_FAST_S", "5"))
+
 #: limited exits
 LIMITED_PATH = "limited-exits.json"
 
@@ -119,6 +125,143 @@ class Lane:
         return netutil.port_is_open("127.0.0.1", self.socks_port, timeout=0.1)
 
 
+class StickyState:
+    """Ride the first lane that answers fast, and keep routing until it does.
+
+    One rule, and one only: requests cycle the healthy lanes in index order,
+    and the first attempt whose first event lands at or under ``_FAST_S``
+    (5s) wins the session on the spot -- no second opinion, and no waiting
+    for the rest of the pool to report. A lane slower than the threshold is
+    simply passed over, and the next request tries the next lane.
+
+    The ride ends when the winner crosses the release ceiling (15s) or takes
+    any verdict -- timeout, SSL cut, slow first event, or 429 -- at which
+    point the router wakes and starts routing again for the next lane that
+    answers under the threshold. This is a routing choice above
+    ``pick_lane``: no lane is ever capped, and benched lanes stay healthy
+    and are tried again the moment routing resumes.
+    """
+
+    def __init__(self, tor: "TorManager",
+                 emit: Optional[Callable[[Dict], None]] = None,
+                 release_s: float = _STICKY_S) -> None:
+        self.tor = tor
+        self._emit = emit or (lambda e: None)
+        self.release_s = release_s
+        self._lock = threading.Lock()
+        self.phase = "routing"        # phase
+        self.winner: Optional[int] = None
+        self._cursor = 0
+        self._announced = False
+
+    def attach(self, emit: Callable[[Dict], None]) -> None:
+        """The proof pane hears the routing and the stick."""
+        self._emit = emit or (lambda e: None)
+
+    # routing
+    def next_lane(self, exclude: Optional[set] = None) -> Optional[Lane]:
+        """The lane this request rides, or None to let ``pick_lane`` decide."""
+        with self._lock:
+            now = time.time()
+            if self.phase == "stuck":
+                lane = self._lane(self.winner)
+                if (lane is not None and lane.healthy and not lane.healing
+                        and lane.limited_until <= now
+                        and not (exclude and lane.index in exclude)):
+                    self._touch(lane)
+                    return lane
+                # favorite fell
+                self._wake()
+            lanes = [l for l in self.tor.healthy_lanes()
+                     if l.limited_until <= now
+                     and not (exclude and l.index in exclude)]
+            if not lanes:
+                return None
+            lanes.sort(key=lambda l: l.index)
+            lane = lanes[self._cursor % len(lanes)]
+            self._cursor += 1
+            self._touch(lane)
+            if not self._announced:
+                # routing begins
+                self._announced = True
+                self._emit({
+                    "type": "lane", "kind": "sticky", "t": time.time(),
+                    "lane": 0, "cc": "", "ip": "",
+                    "msg": f"routing {len(lanes)} lanes -- riding the first "
+                           f"that answers under {_FAST_S:.0f}s",
+                })
+            return lane
+
+    def record(self, lane_index: int, secs: float) -> None:
+        """One attempt's latency: under the threshold it wins the ride."""
+        with self._lock:
+            if self.phase != "routing":
+                return
+            if secs <= _FAST_S:
+                # fast enough
+                self._stick(lane_index, secs)
+
+    def frozen(self, lane_index: int) -> bool:
+        """True while a stick keeps this lane idle; it wakes on release."""
+        with self._lock:
+            return self.phase == "stuck" and lane_index != self.winner
+
+    def stuck_on(self, lane_index: int) -> bool:
+        """True when this lane is the one we are stuck on."""
+        with self._lock:
+            return self.phase == "stuck" and lane_index == self.winner
+
+    def on_verdict(self, lane_index: int) -> None:
+        """A verdict on the ridden lane sends the session back to routing."""
+        with self._lock:
+            if self.phase == "stuck" and lane_index == self.winner:
+                self._wake()
+
+    # internals
+    def _lane(self, index: Optional[int]) -> Optional[Lane]:
+        if index is None:
+            return None
+        for lane in self.tor.lanes:
+            if lane.index == index:
+                return lane
+        return None
+
+    def _touch(self, lane: Lane) -> None:
+        """The same bookkeeping ``pick_lane`` does for its picks."""
+        lane.last_used_at = time.perf_counter_ns()
+        lane.last_real_at = time.time()
+
+    def _stick(self, lane_index: int, secs: float) -> None:
+        """The fast lane becomes the one we ride until it falters."""
+        lane = self._lane(lane_index)
+        if lane is None:
+            return
+        self.winner = lane_index
+        self.phase = "stuck"
+        self._cursor = 0
+        self._emit({
+            "type": "lane", "kind": "sticky", "t": time.time(),
+            "lane": lane_index, "cc": lane.exit_country,
+            "ip": lane.exit_ip,
+            "msg": f"lane {lane_index} {{{lane.exit_country}}} answered in "
+                   f"{secs:.1f}s -- riding it",
+        })
+
+    def _wake(self) -> None:
+        """Back to routing: look for the next lane under the threshold."""
+        fell = self.winner
+        self.phase = "routing"
+        self.winner = None
+        self._cursor = 0
+        self._announced = True
+        self._emit({
+            "type": "lane", "kind": "sticky", "t": time.time(),
+            "lane": fell or 0, "cc": "", "ip": "",
+            "msg": f"lane {fell} faltered -- routing again for a lane "
+                   f"under {_FAST_S:.0f}s",
+        })
+
+
 class TorManager:
     """Owns the lifecycle of N local tor-backed SOCKS5 lanes."""
 
@@ -141,9 +284,19 @@ class TorManager:
         self.tools_dir = self.root / "tools"
         self.lanes_dir = self.root / "lanes"
         self.count = max(1, count)
-        base = list(exit_countries) if exit_countries else ["us"]
+        """
+        No country requirement: with no pool handed in, every boot draws
+        five countries at random from anywhere with exits, so a launch sees
+        the whole network, not the same fixed list.
+        """
+        # expansion pool
+        override = os.environ.get("LINGLING_EXPAND", "").strip().lower()
+        self._expand = ([c.strip() for c in override.split(",")
+                         if len(c.strip()) == 2] if override
+                        else list(EXPAND_COUNTRIES))
+        base = [c for c in (exit_countries or []) if c]
         if not base:
-            base = ["us"]
+            base = exits.random_countries(self.count, self._expand)
         # preferred pool
         self._preferred = [c for c in (preferred_countries or []) if c]
         boot = self._preferred or base
@@ -152,11 +305,6 @@ class TorManager:
         self._quiet = list(base)
         self._fallback = [c for c in (fallback_countries or [])
                           if c not in self._quiet]
-        # expansion pool
-        override = os.environ.get("LINGLING_EXPAND", "").strip().lower()
-        self._expand = ([c.strip() for c in override.split(",")
-                         if len(c.strip()) == 2] if override
-                        else list(EXPAND_COUNTRIES))
         #: country score
         self._score: Dict[str, int] = self._load_score()
         #: relay pool
@@ -175,6 +323,8 @@ class TorManager:
         self.lanes: List[Lane] = []
         #: limit hook
         self.limit_hook: Optional[Callable[[Lane], None]] = None
+        #: sticky router
+        self.sticky = StickyState(self)
         self._tor_executable: Optional[Path] = None
         self._stopping = False
         #: rebuild threads
@@ -650,27 +800,6 @@ class TorManager:
             pass
         return latest
 
-    def unpin_lane(self, lane: Lane) -> bool:
-        """Drop the ExitNodes country pin and relaunch."""
-        if self._stopping:
-            return False
-        if self._geoip_path() is None or not lane.torrc_path().exists():
-            return False
-        self._stop_lane_process(lane)
-        for port in (lane.socks_port, lane.control_port):
-            if netutil.port_is_open("127.0.0.1", port):
-                pid = netutil.pid_on_port(port)
-                if pid:
-                    netutil.kill_pid(pid, grace_s=2)
-        old = lane.exit_country
-        lane.exit_country = "*"
-        try:
-            self._write_torrc(lane)
-            return self._launch_lane(lane) in ("started", "already_running")
-        except BaseException:  # noqa: BLE001
-            lane.exit_country = old
-            return False
-
     def _drain(self, lane: Lane, timeout: float = _DRAIN_S) -> None:
         """Let in-flight requests finish before the lane is torn down."""
         deadline = time.time() + timeout
@@ -744,6 +873,35 @@ class TorManager:
         moved = self.rotate_exit_country(lane)
         self._rebuild_async(lane)
         return (f"lane {lane.index} timed out -- moved to "
+                f"{{{moved or lane.exit_country}}}")
+
+    def note_ssl_error(self, lane: Lane) -> Optional[str]:
+        """An SSL cut means a dead exit: the timeout verdict, first hit.
+
+        The exit broke or dropped the TLS stream, so the very same action a
+        timeout and a 429 take -- write the relay off, pin a fresh one,
+        change the country, re-cook the lane -- fires at once, with no
+        second strike and no waiting for the next probe.
+        """
+        if lane.limited_until <= time.time():
+            self.note_limited(lane)
+        moved = self.rotate_exit_country(lane)
+        self._rebuild_async(lane)
+        return (f"lane {lane.index} ssl-failed -- moved to "
+                f"{{{moved or lane.exit_country}}}")
+
+    def note_slow_exit(self, lane: Lane, elapsed: float = 0.0) -> Optional[str]:
+        """A first event over the ceiling is a bad exit: the timeout verdict.
+
+        The answer may even arrive, but a lane that opens every stream with
+        a long silence is retired at once -- the same action a timeout and
+        a 429 take -- so the next call is served elsewhere.
+        """
+        if lane.limited_until <= time.time():
+            self.note_limited(lane)
+        moved = self.rotate_exit_country(lane)
+        self._rebuild_async(lane)
+        return (f"lane {lane.index} first event {elapsed:.0f}s -- moved to "
                 f"{{{moved or lane.exit_country}}}")
 
     def _rebuild_async(self, lane: Lane, repin: bool = False) -> None:
