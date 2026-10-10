@@ -205,25 +205,33 @@ def main():
           f"timeout_run={lsrc.count('timeout_run')} "
           f"repins={lsrc.count('repins')} "
           f"_TIMEOUT_RUN={lsrc.count('_TIMEOUT_RUN')}")
-    #: only a TimeoutError may charge it. A strike on 403/503/SSLEOF is the
+    #: only a TimeoutError may charge the timeout tally, only an SSLError
+    #: the SSL verdict, and only the slow-exit ceiling the slow verdict -- a
+    #: strike on 403/503 stays forbidden. The SSL and slow gates are the
+    #: owner's rules: a TLS cut, and a first event over 20s, take the
+    #: timeout verdict at once.
     msrc = (ROOT / "lingling" / "mitm.py").read_text(encoding="utf-8")
-    gated = False
+    want = {"_note_timeout": "TimeoutError", "_note_ssl": "SSLError",
+            "_note_slow": "_SLOW_EXIT_S"}
+    gates = {k: False for k in want}
     for fn in ast.walk(ast.parse(msrc)):
         if not isinstance(fn, ast.FunctionDef):
             continue
         for node in ast.walk(fn):
             if not isinstance(node, ast.If):
                 continue
-            calls = [x for x in ast.walk(node)
-                     if isinstance(x, ast.Call)
-                     and getattr(x.func, "id", "") == "_note_timeout"]
-            if not calls:
-                continue
-            #: the call must sit behind a test that names TimeoutError
-            if re.search(r"TimeoutError", ast.unparse(node.test)):
-                gated = True
-    check("only a TimeoutError charges the tally", gated,
+            for callee, needle in want.items():
+                calls = [x for x in ast.walk(node)
+                         if isinstance(x, ast.Call)
+                         and getattr(x.func, "id", "") == callee]
+                if calls and re.search(needle, ast.unparse(node.test)):
+                    gates[callee] = True
+    check("only a TimeoutError charges the tally", gates["_note_timeout"],
           "ungated _note_timeout call")
+    check("only an SSLError charges the SSL verdict", gates["_note_ssl"],
+          "ungated _note_ssl call")
+    check("only the ceiling charges the slow verdict", gates["_note_slow"],
+          "ungated _note_slow call")
 
     print("\n=== ctypes structs match the Windows ABI ===")
     # A field declared one width too wide makes
@@ -377,6 +385,14 @@ def main():
               "the transport charges the lane it timed out on" in out
               and "[FAIL] the transport charges" not in out,
               "a timed-out lane went uncharged")
+        check("an SSL cut charges its lane too",
+              "an SSL cut mid-read is charged to the lane" in out
+              and "[FAIL] an SSL cut" not in out,
+              "an SSLEOFError lane went uncharged")
+        check("a slow first event charges its lane",
+              "a first event over 20s is charged to the lane" in out
+              and "[FAIL] a first event" not in out,
+              "a slow lane went uncharged")
         check("timeout tally confirmed",
               "TIMEOUT TALLY: CONFIRMED" in out,
               out.strip().splitlines()[-1] if out.strip() else "no output")
@@ -610,6 +626,9 @@ def main():
                   "verify_window_floors",
                   # the owner's FIRST rule -- never invent a
                   "verify_no_lane_cap",
+                  # the sticky router: a round elects a favorite, the
+                  # release ceiling and any verdict wake the others
+                  "verify_sticky",
                   # the probe must warm the circuit the requests ride, not
                   # its own -- a credential that drifts per request makes
                   # Tor rebuild a circuit on every call

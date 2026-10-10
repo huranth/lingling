@@ -139,8 +139,8 @@ asked = []
 d.reachable = lambda lane: (asked.append(lane.index), 200)[1]
 d.check_once()
 check("each unasked lane is asked once", asked == [1, 2], str(asked))
-check("and the pane is told which exit it rides",
-      all("is cooking" in e.get("msg", "") for e in ev), str(len(ev)))
+check("and the pane is told the lane is up",
+      all("is up" in e.get("msg", "") for e in ev), str(len(ev)))
 asked.clear()
 d.check_once()
 check("and never asked again", asked == [], str(asked))

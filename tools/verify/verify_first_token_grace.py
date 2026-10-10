@@ -162,7 +162,19 @@ def run(port, ceiling=20.0, first_byte=30.0):
         def settimeout(self, t):
             return None
 
-    relay = type("R", (), {"tor": None})()
+    class StubTor:
+        """Delivery is what this suite judges; the lane policy no-ops."""
+
+        def note_slow_exit(self, lane, elapsed=0.0):
+            return ""
+
+        def note_timeout(self, lane):
+            return ""
+
+        def note_ssl_error(self, lane):
+            return ""
+
+    relay = type("R", (), {"tor": StubTor()})()
     tap = Tap()
     events = []
     try:

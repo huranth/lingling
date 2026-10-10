@@ -81,6 +81,10 @@ class FakeTor:
         self.calls.append("unpin")
         return True
 
+    def rotate_exit_country(self, ln):
+        self.calls.append("rotate")
+        return "de"
+
     def regenerate_lane(self, ln):
         self.calls.append("regen")
         return True
@@ -215,12 +219,13 @@ def main():
         daemon.clock = clock
         cli._boot_gate(tor, ln4, daemon, deadline_s=600)
     print(f"  calls={tor.calls}  sim={clock.now - 1_000_000.0:.0f}s")
-    check("restart comes first", tor.calls[:1] == ["restart"],
-          f"calls={tor.calls}")
-    check("then unpin", "unpin" in tor.calls, f"calls={tor.calls}")
-    check("then regenerate", "regen" in tor.calls, f"calls={tor.calls}")
-    check("escalation stayed bounded at three",
-          len(tor.calls) == 3, f"calls={tor.calls}")
+    check("a fresh relay is the first poke, not a same-pin restart",
+          tor.calls[:1] == ["restart"], f"calls={tor.calls}")
+    check("then the country rotates, as a timeout moves",
+          "rotate" in tor.calls, f"calls={tor.calls}")
+    check("then regenerate", tor.calls[-1] == "regen", f"calls={tor.calls}")
+    check("escalation stayed bounded at three pokes",
+          len(tor.calls) == 4, f"calls={tor.calls}")
 
     print("\n=== a long cold download that ENDS is a success, not a timeout ===")
     tor = FakeTor(0.0, mtime_fn=lambda _ln: float(next(moves)),
@@ -270,10 +275,12 @@ def main():
         cli._boot_gate(tor, ln7, daemon, deadline_s=600)
     print(f"  calls={tor.calls}")
     # A bootstrapped lane with a dead exit should NOT be restarted -- a
-    # restart returns to the same exit. Rotation is the right first poke,
-    # so the 100% ladder starts at unpin, unlike the boot ladder.
+    # restart returns to the same exit. Rotation is the first poke: a
+    # fresh relay in a fresh country beats ExitNodes *, which strips the
+    # lane's country forever.
     check("the escalation ladder still fires at 100%",
-          len(tor.calls) == 3 and tor.calls[0] == "unpin",
+          len(tor.calls) == 6 and tor.calls[0] == "rotate"
+          and "regen" not in tor.calls and "unpin" not in tor.calls,
           f"calls={tor.calls}")
 
     print()

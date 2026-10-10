@@ -1,4 +1,4 @@
-"""The per-lane timeout tally has to see every timeout."""
+"""The per-lane timeout tally has to see every timeout, and every SSL cut."""
 import socket
 import ssl
 import sys
@@ -91,6 +91,46 @@ def _mute(c):
             pass
 
 
+def slow_socks_upstream(port_holder, ready, delay):
+    """Speak SOCKS5, answer the CONNECT, then stall before the first event."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(16)
+    port_holder.append(srv.getsockname()[1])
+    ready.set()
+
+    def _slow(c):
+        try:
+            c.settimeout(60)
+            c.recv(3)
+            c.sendall(bytes([0x05, 0x00]))
+            c.recv(64)
+            c.sendall(bytes([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]))
+            c.recv(65536)
+            time.sleep(delay)
+            head = (b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                    b"transfer-encoding: chunked\r\n\r\n")
+            event = b'event: response.created\ndata: {}\n\n'
+            c.sendall(head + b"%x\r\n" % len(event) + event + b"\r\n"
+                      + b"0\r\n\r\n")
+            time.sleep(5)
+        except OSError:
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+    while True:
+        try:
+            c, _ = srv.accept()
+        except OSError:
+            return
+        threading.Thread(target=_slow, args=(c,), daemon=True).start()
+
+
 def stall_socks_upstream(port_holder, ready):
     """Accept the TCP connection, then never answer the SOCKS5 greeting."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -156,6 +196,14 @@ def main():
         def note_timeout(self, lane):
             self.charged.append(lane.index)
             return ""
+
+        def note_ssl_error(self, lane):
+            self.charged.append(lane.index)
+            return f"lane {lane.index} ssl-failed -- moved to {{nl}}"
+
+        def note_slow_exit(self, lane, elapsed=0.0):
+            self.charged.append(lane.index)
+            return f"lane {lane.index} first event {elapsed:.0f}s -- moved"
 
         def note_result(self, cc, status):
             return None
@@ -309,6 +357,155 @@ def main():
     check("a refused dial is not charged",
           charged_refused == [],
           f"charged={charged_refused} -- only a timeout means a dead exit")
+
+    print("\n=== an SSL cut mid-read is charged, like a timeout ===")
+    # A tor exit that drops the TLS stream dies with SSLEOFError. The
+    # owner's rule: the very first cut takes the timeout verdict -- write
+    # the exit off, move the country, re-cook the lane.
+
+    class CutFile:
+        """A read that dies with SSLEOFError, mid-head."""
+
+        def read(self, _n=-1):
+            raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+
+        def readline(self, _n=-1):
+            raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+
+    class CutTLS:
+        """The upstream speaks SOCKS, then the TLS stream is cut."""
+
+        def __init__(self, sock):
+            self._sock = sock
+
+        def settimeout(self, t):
+            self._sock.settimeout(t)
+
+        def sendall(self, data):
+            self._sock.sendall(data)
+
+        def makefile(self, *_a, **_k):
+            return CutFile()
+
+        def close(self):
+            self._sock.close()
+
+    class CutCtx:
+        """Hand back the cut-TLS wrapper instead of a real wrap."""
+
+        def wrap_socket(self, sock, server_hostname=None):
+            return CutTLS(sock)
+
+    holder4, ready4 = [], threading.Event()
+    threading.Thread(target=mute_socks_upstream, args=(holder4, ready4),
+                     daemon=True).start()
+    ready4.wait(5)
+    ssl_port = holder4[0]
+    real_ctx_ssl = ssl.create_default_context
+    charged_ssl = []
+    events_s = []
+    try:
+        ssl.create_default_context = lambda *a, **k: CutCtx()
+        relay = Relay()
+        relay.tor.charged = charged_ssl
+        lane_s = Lane(1)
+        lane_s.socks_port = ssl_port
+        mitm._roundtrip(Client(), lane_s, "opencode.ai", 443, "POST",
+                        "/zen/v1/responses", {}, b"{}",
+                        lambda e: events_s.append(e), 1, 1, time.time(),
+                        relay, charge_timeout=True)
+    finally:
+        ssl.create_default_context = real_ctx_ssl
+    end_s = next((e for e in events_s if e.get("type") == "callend"), {})
+    err_s = end_s.get("err")
+    print(f"  ssl cut: err={err_s!r}  charged={charged_ssl}")
+    check("an SSL cut mid-read is charged to the lane",
+          err_s == "SSLEOFError" and charged_ssl == [1],
+          f"err={err_s!r} charged={charged_ssl}")
+    check("the SSL verdict announces the move",
+          any(e.get("type") == "lane" and e.get("kind") == "ssl"
+              for e in events_s),
+          "no lane event -- the move stayed silent")
+
+    print("\n=== a first event over 20s is charged, like a timeout ===")
+    # The owner's rule: a lane whose first event takes longer than 20s
+    # gets the timeout verdict -- dropped and re-cooked in a new country
+    # -- even though the answer eventually arrives.
+
+    class PlainCtx:
+        """The fake upstream speaks cleartext; skip the TLS wrap."""
+
+        def wrap_socket(self, sock, server_hostname=None):
+            return sock
+
+    holder5, ready5 = [], threading.Event()
+    threading.Thread(target=slow_socks_upstream, args=(holder5, ready5, 21.0),
+                     daemon=True).start()
+    ready5.wait(5)
+    slow_port = holder5[0]
+    real_ctx_slow = ssl.create_default_context
+    real_read = mitm._READ_TIMEOUT
+    charged_slow = []
+    events_slow = []
+    try:
+        ssl.create_default_context = lambda *a, **k: PlainCtx()
+        mitm._READ_TIMEOUT = 60.0
+        relay = Relay()
+        relay.tor.charged = charged_slow
+        lane_sl = Lane(1)
+        lane_sl.socks_port = slow_port
+        mitm._roundtrip(Client(), lane_sl, "opencode.ai", 443, "POST",
+                        "/zen/v1/responses", {}, b"{}",
+                        lambda e: events_slow.append(e), 1, 1, time.time(),
+                        relay, charge_timeout=True)
+    finally:
+        ssl.create_default_context = real_ctx_slow
+        mitm._READ_TIMEOUT = real_read
+    end_sl = next((e for e in events_slow if e.get("type") == "callend"), {})
+    print(f"  slow exit: status={end_sl.get('status')} "
+          f"first_event={end_sl.get('first_event_s')}s "
+          f"charged={charged_slow}")
+    check("a slow first event still delivers the answer",
+          end_sl.get("status") == 200, str(end_sl.get("status")))
+    check("a first event over 20s is charged to the lane",
+          end_sl.get("first_event_s", 0) > 20 and charged_slow == [1],
+          f"first_event={end_sl.get('first_event_s')} "
+          f"charged={charged_slow}")
+    check("the slow verdict announces the move",
+          any(e.get("type") == "lane" and e.get("kind") == "slow"
+              for e in events_slow),
+          "no lane event -- the move stayed silent")
+
+    print("\n=== a fast first event is never charged ===")
+    holder6, ready6 = [], threading.Event()
+    threading.Thread(target=slow_socks_upstream, args=(holder6, ready6, 1.0),
+                     daemon=True).start()
+    ready6.wait(5)
+    fast_port = holder6[0]
+    charged_fast = []
+    events_fast = []
+    try:
+        ssl.create_default_context = lambda *a, **k: PlainCtx()
+        mitm._READ_TIMEOUT = 60.0
+        relay = Relay()
+        relay.tor.charged = charged_fast
+        lane_f = Lane(1)
+        lane_f.socks_port = fast_port
+        mitm._roundtrip(Client(), lane_f, "opencode.ai", 443, "POST",
+                        "/zen/v1/responses", {}, b"{}",
+                        lambda e: events_fast.append(e), 1, 1, time.time(),
+                        relay, charge_timeout=True)
+    finally:
+        ssl.create_default_context = real_ctx_slow
+        mitm._READ_TIMEOUT = real_read
+    end_f = next((e for e in events_fast if e.get("type") == "callend"), {})
+    print(f"  fast exit: status={end_f.get('status')} "
+          f"first_event={end_f.get('first_event_s')}s "
+          f"charged={charged_fast}")
+    check("a fast lane is left alone",
+          end_f.get("status") == 200 and charged_fast == [],
+          f"first_event={end_f.get('first_event_s')} "
+          f"charged={charged_fast}")
 
     print()
     if FAILS:
