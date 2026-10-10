@@ -167,8 +167,16 @@ def _parse_args(argv: list[str]) -> dict:
 
 def _boot_gate(manager: TorManager, first, daemon: HealthDaemon,
                download_limit: float = 120, quick_limit: float = 30,
-               deep_limit: float = 90, deadline_s: float = 600) -> bool:
-    """Wait for the first lane: progress first, probe only when tor is done."""
+               deep_limit: float = 45, deadline_s: float = 600) -> bool:
+    """Wait for the first lane: progress first, probe only when tor is done.
+
+    A stalled boot is almost always the relay pinned from the cached
+    consensus of a previous session having gone offline -- StrictNodes
+    then forbids every circuit and tor sits at one percent forever. The
+    ladder attacks that directly: re-pin a fresh relay in the same
+    country first (cache intact, one warm boot), then rotate the country
+    the way a timeout does, and only then regenerate the directory.
+    """
     deadline = time.time() + deadline_s
     last_pct = -1
     last_pct_at = time.time()
@@ -210,10 +218,17 @@ def _boot_gate(manager: TorManager, first, daemon: HealthDaemon,
             (quick_limit if pct <= 10 else deep_limit)
         if stall > limit and pokes < 3:
             pokes += 1
-            if pokes == 1 and pct <= 10:
+            if pct >= 100:
+                # dead exit
+                manager.rotate_exit_country(first)
                 manager.restart_lane(first)
-            elif pokes <= 2 and (pct <= 10 or pokes == 1):
-                manager.unpin_lane(first)
+            elif pokes == 1:
+                # fresh relay
+                manager.restart_lane(first, repin=True)
+            elif pokes == 2:
+                # new country
+                manager.rotate_exit_country(first)
+                manager.restart_lane(first)
             else:
                 manager.regenerate_lane(first)
             last_pct = -1
@@ -524,7 +539,7 @@ def main(argv: list[str]) -> int:
                 preferred_countries=preferred,
                 tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                 log=lambda *a: None,
-                # the product owns the data dir, so it may reclaim it
+                # product-owned dir
                 prune_orphans=True,
             )
             err = manager.setup_lanes()
@@ -534,6 +549,7 @@ def main(argv: list[str]) -> int:
                 direct = True
             else:
                 emit = proof.make_emitter(PROOF_LOG)
+                manager.sticky.attach(emit)
                 daemon = HealthDaemon(manager, event=emit,
                                       log=lambda *a: None)
 
@@ -597,12 +613,10 @@ def main(argv: list[str]) -> int:
         rest = manager.lanes[1:]
         if rest:
             def _cook_rest() -> None:
-                for lane in rest:
-                    emit({"type": "lane", "kind": "heal", "t": time.time(),
-                          "lane": lane.index, "cc": lane.exit_country,
-                          "ip": "",
-                          "msg": f"lane {lane.index} {{{lane.exit_country}}} "
-                                 f"registering in the background ..."})
+                emit({"type": "lane", "kind": "heal", "t": time.time(),
+                      "lane": 0, "cc": "", "ip": "",
+                      "msg": f"cooking {len(rest)} more lanes in the "
+                             f"background ..."})
                 manager.start_lanes(rest, on_lane=_report_boot)
 
             threading.Thread(target=_cook_rest, name="lane-cook",

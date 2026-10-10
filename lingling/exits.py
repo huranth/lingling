@@ -3,7 +3,18 @@ from __future__ import annotations
 
 import ipaddress
 import pathlib
+import random
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+
+#: worldwide exits
+WORLD_CC = frozenset([
+    "us", "de", "nl", "fr", "se", "ch", "at", "ca", "gb", "ro",
+    "fi", "pl", "cz", "hu", "bg", "lt", "lv", "ee", "dk", "no",
+    "ie", "es", "it", "pt", "gr", "ua", "md", "rs", "hr", "si",
+    "sk", "is", "lu", "be", "au", "nz", "jp", "kr", "sg", "hk",
+    "tw", "th", "in", "id", "my", "za", "br", "ar", "cl", "mx",
+    "il", "ae", "tr", "mt", "cy", "uy", "pe", "co", "ke", "mu",
+])
 
 
 class Exit(NamedTuple):
@@ -11,6 +22,16 @@ class Exit(NamedTuple):
     ip: str
     nickname: str
     bandwidth: int
+
+
+def random_countries(n: int,
+                     restrict: Optional[Sequence[str]] = None) -> List[str]:
+    """``n`` distinct countries drawn at random from anywhere with exits."""
+    pool = sorted(set(restrict) & WORLD_CC if restrict else WORLD_CC)
+    if not pool:
+        pool = sorted(WORLD_CC)
+    k = max(1, min(int(n), len(pool)))
+    return random.sample(pool, k)
 
 
 def load_geoip(path: pathlib.Path) -> List[Tuple[int, int, str]]:
