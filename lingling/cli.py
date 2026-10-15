@@ -71,6 +71,40 @@ def _c(text: str, code: str) -> str:
     return f"\x1b[{code}m{text}\x1b[0m"
 
 
+def _enable_windows_console_ansi() -> None:
+    """Make a Windows console parse our colours instead of printing them.
+
+    A conhost window shows the escape bytes as literal text -- the
+    ``←[90m`` glued to every timestamp -- until virtual terminal
+    processing is switched on for the output handle. One best-effort
+    call at entry, before the first print of colour. Everywhere else it
+    is a no-op: a pipe fails the mode query, and real terminals (Windows
+    Terminal, ConPTY, mintty) parse ANSI on their own.
+
+    Every failure is swallowed on purpose. Colour is cosmetic, so a
+    console that will not cooperate must cost the boot nothing.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        enable_vt = 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GetStdHandle.restype = wt.HANDLE
+        k.GetStdHandle.argtypes = [wt.DWORD]
+        k.GetConsoleMode.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+        k.SetConsoleMode.argtypes = [wt.HANDLE, wt.DWORD]
+        for std in (-11, -12):  # stdout, stderr
+            handle = k.GetStdHandle(std)
+            mode = wt.DWORD()
+            if handle and k.GetConsoleMode(handle, ctypes.byref(mode)):
+                k.SetConsoleMode(handle, mode.value | enable_vt)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class _Loader:
     """One pinned line for the whole boot: cold or warm, plus a ticking clock."""
 
@@ -865,6 +899,7 @@ def _run_opencode(binary: str, args: list[str],
 
 
 def entry() -> None:
+    _enable_windows_console_ansi()
     try:
         sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
