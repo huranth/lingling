@@ -175,17 +175,21 @@ def main():
               "no 429 with a retry-after")
     else:
         tod = [(t % 86400) for t in resets]
-        days = {time.strftime("%Y-%m-%d", time.localtime(t)) for t in resets}
-        in_day = max(tod) - min(tod)
-        span_tod = in_day
-        # midnight wrap
+        days = {time.strftime("%Y-%m-%d", time.gmtime(t)) for t in resets}
+        # A window that resets at 23:59:59 UTC lands on both sides of the
+        # modulo, so the raw spread reads as a whole day when every reset is
+        # really the same instant. The wrap is the shorter way round, and it
+        # is what both checks below must judge -- the day buckets now use the
+        # same UTC base the printout already did.
+        span_tod = max(tod) - min(tod)
         if span_tod > 43200:
             span_tod = 86400 - span_tod
         print(f"  {len(resets)} walls over {len(days)} day(s) -> "
               f"time-of-day {time.strftime('%H:%M:%S', time.gmtime(min(resets)))}"
               f" UTC +/-{span_tod:.0f}s")
         check("every 429 in a day resolves to one instant",
-              in_day <= 300, f"spread {in_day:.0f}s over {len(resets)} walls")
+              span_tod <= 300,
+              f"spread {span_tod:.0f}s over {len(resets)} walls")
         check("and the instant repeats at the same time of day",
               len(days) < 2 or span_tod <= 300,
               f"time-of-day spread {span_tod:.0f}s across {len(days)} days")
