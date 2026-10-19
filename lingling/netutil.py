@@ -25,6 +25,19 @@ def _quiet() -> dict:
     """creationflags that keep a console tool from opening a window."""
     return {"creationflags": _NO_WINDOW} if os.name == "nt" else {}
 
+
+def _console_text(cmd: list[str], timeout: float) -> str:
+    """One console tool's output, read as bytes and decoded leniently.
+
+    ``text=True`` decodes with the interpreter's own codec, which is UTF-8
+    under PYTHONUTF8=1 and cp949 under a Korean console.  The tools answer in
+    the console's code page, so that decode raised UnicodeDecodeError and
+    check_output returned None -- and the caller then walked None.  The bytes
+    are what matter here, so they are decoded as latin-1, which never fails.
+    """
+    raw = subprocess.check_output(cmd, timeout=timeout, **_quiet())
+    return raw.decode("latin-1", "replace")
+
 UPSTREAM_UNAVAILABLE = b'"server_error"'
 
 QUOTA_SPENT = b'"FreeUsageLimitError"'
@@ -39,9 +52,8 @@ def _pid_alive_local(pid: int) -> bool:
         except OSError:
             return False
     try:
-        output = subprocess.check_output(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], text=True,
-            timeout=5, **_quiet())
+        output = _console_text(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], 5)
         return str(pid) in output and "No tasks" not in output
     except Exception:
         return True
@@ -185,8 +197,7 @@ def pids_on_ports(ports: Container[int]) -> dict:
     want = set(ports)
     found = {}
     try:
-        output = subprocess.check_output(["netstat", "-ano"], text=True,
-                                         timeout=20, **_quiet())
+        output = _console_text(["netstat", "-ano"], 20)
     except Exception:  # noqa: BLE001
         return {}
     for line in output.splitlines():
