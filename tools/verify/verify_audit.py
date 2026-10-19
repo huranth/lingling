@@ -643,6 +643,8 @@ def main():
                   "verify_expect_header", "verify_short_body",
                   "verify_close_honoured", "verify_pool_ttl",
                   "verify_send_window", "verify_torrc",
+                  # a cert may not leave its directory
+                  "verify_cert_paths",
                   # cold data
                   "verify_cold_boot",
                   # 503/504 session

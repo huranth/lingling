@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import os
+import re
 import struct
 import threading
 import time
@@ -17,6 +18,18 @@ _MAX_CONNS = bounds.count("LINGLING_MAX_CONNS", 256, 1, 4096)
 
 _LOSING = bounds.count("LINGLING_LOSING_SCORE", -2, -1000, 1000)
 _LOSING_MIN_POOL = bounds.count("LINGLING_LOSING_MIN_POOL", 4, 0, 256)
+
+#: plain host
+_DNS_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+
+
+def _is_dns_name(host: str) -> bool:
+    """True for a plain host name: no path, no traversal, no drive letter."""
+    if not host or len(host) > 253:
+        return False
+    if not _DNS_NAME.match(host):
+        return False
+    return ".." not in host
 
 
 class Relay:
@@ -118,7 +131,15 @@ class Relay:
         loop.default_exception_handler(context)
 
     def _should_mitm(self, host: str) -> bool:
+        """True for a host the MITM owns.
+
+        The CONNECT target is the client's to choose, and only its suffix was
+        ever checked, so a target carrying a path was intercepted and its
+        name became a file name.  Only a plain host name is a host name.
+        """
         if self.cert_shop is None:
+            return False
+        if not _is_dns_name(host):
             return False
         from . import mitm
         return any(host == h or host.endswith("." + h) for h in
@@ -264,6 +285,9 @@ class Relay:
         try:
             port = int(port_s)
         except ValueError:
+            writer.close()
+            return
+        if not 1 <= port <= 65535:
             writer.close()
             return
         try:

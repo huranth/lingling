@@ -252,7 +252,12 @@ def _recv_exact(sock: socket.socket, n: int,
 
 def socks5_open(sock: socket.socket, host: str, port: int,
                 cred: Optional[Tuple[str, str]] = None) -> str:
-    """SOCKS5 CONNECT on a connected socket; "" on success, else a reason."""
+    """SOCKS5 CONNECT on a connected socket; "" on success, else a reason.
+
+    A port outside 0..65535 is refused here rather than packed: struct.pack
+    raises struct.error for it, and struct.error is neither an OSError nor a
+    ValueError, so it escaped every handler and killed the worker thread.
+    """
     window = sock.gettimeout()
     deadline = (time.monotonic() + window) if window else None
 
@@ -286,6 +291,8 @@ def socks5_open(sock: socket.socket, host: str, port: int,
             elif resp[1] != 0x00:
                 return "bad SOCKS5 greeting"
         addr = host.encode("idna")
+        if not 1 <= port <= 65535:
+            return "bad port"
         send(bytes([0x05, 0x01, 0x00, 0x03, len(addr)])
              + addr + struct.pack("!H", port))
         head = _recv_exact(sock, 4, deadline)
