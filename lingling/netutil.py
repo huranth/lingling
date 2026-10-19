@@ -25,6 +25,19 @@ def _quiet() -> dict:
     """creationflags that keep a console tool from opening a window."""
     return {"creationflags": _NO_WINDOW} if os.name == "nt" else {}
 
+
+def _console_text(cmd: list[str], timeout: float) -> str:
+    """One console tool's output, read as bytes and decoded leniently.
+
+    ``text=True`` decodes with the interpreter's own codec, which is UTF-8
+    under PYTHONUTF8=1 and cp949 under a Korean console.  The tools answer in
+    the console's code page, so that decode raised UnicodeDecodeError and
+    check_output returned None -- and the caller then walked None.  The bytes
+    are what matter here, so they are decoded as latin-1, which never fails.
+    """
+    raw = subprocess.check_output(cmd, timeout=timeout, **_quiet())
+    return raw.decode("latin-1", "replace")
+
 UPSTREAM_UNAVAILABLE = b'"server_error"'
 
 QUOTA_SPENT = b'"FreeUsageLimitError"'
@@ -39,9 +52,8 @@ def _pid_alive_local(pid: int) -> bool:
         except OSError:
             return False
     try:
-        output = subprocess.check_output(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], text=True,
-            timeout=5, **_quiet())
+        output = _console_text(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], 5)
         return str(pid) in output and "No tasks" not in output
     except Exception:
         return True
@@ -57,6 +69,145 @@ def chmod_quiet(path, mode: int) -> None:
         os.chmod(path, mode)
     except OSError:
         pass
+
+
+#: the well-known SIDs a private file may name
+_OWNER_SID = None
+_SYSTEM_SID = "S-1-5-18"
+_ADMINS_SID = "S-1-5-32-544"
+
+
+def _current_sid() -> Optional[str]:
+    """This user's SID, as text, or None when it cannot be read."""
+    global _OWNER_SID
+    if _OWNER_SID is not None:
+        return _OWNER_SID or None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        libc = ctypes.WinDLL("kernel32", use_last_error=True)
+        libc.GetCurrentProcess.restype = wintypes.HANDLE
+        libc.LocalFree.argtypes = [ctypes.c_void_p]
+        k = ctypes.WinDLL("advapi32", use_last_error=True)
+        k.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                       ctypes.POINTER(wintypes.HANDLE)]
+        k.OpenProcessToken.restype = wintypes.BOOL
+        k.GetTokenInformation.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+            wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        k.GetTokenInformation.restype = wintypes.BOOL
+        k.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+        k.ConvertSidToStringSidW.restype = wintypes.BOOL
+        token = wintypes.HANDLE()
+        if not k.OpenProcessToken(libc.GetCurrentProcess(), 0x0008,
+                                  ctypes.byref(token)):
+            _OWNER_SID = ""
+            return None
+        size = wintypes.DWORD()
+        # TokenUser = 1; the first call says how much room it needs
+        k.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+        if not size.value:
+            libc.CloseHandle(token)
+            _OWNER_SID = ""
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if not k.GetTokenInformation(token, 1, buf, size, ctypes.byref(size)):
+            libc.CloseHandle(token)
+            _OWNER_SID = ""
+            return None
+
+        class _TokenUser(ctypes.Structure):
+            _fields_ = [("Sid", ctypes.c_void_p),
+                        ("Attributes", wintypes.DWORD)]
+
+        user = ctypes.cast(buf, ctypes.POINTER(_TokenUser)).contents
+        sid = ctypes.c_wchar_p()
+        if not k.ConvertSidToStringSidW(user.Sid, ctypes.byref(sid)):
+            libc.CloseHandle(token)
+            _OWNER_SID = ""
+            return None
+        text = sid.value
+        libc.LocalFree(sid)
+        libc.CloseHandle(token)
+        _OWNER_SID = text
+        return text
+    except Exception:  # noqa: BLE001
+        _OWNER_SID = ""
+        return None
+
+
+def _narrow_acl(path, is_dir: bool) -> bool:
+    """Narrow a file or directory to its owner, SYSTEM and Administrators.
+
+    Windows has no POSIX mode, so os.chmod does nothing there: the CA key
+    was left with the ACL of the directory it was created in, which on a
+    shared %TEMP% lets any other local account read it.  The ACL is set
+    here to the same three principals the rest of the project uses -- the
+    owner, SYSTEM and Administrators -- and inheritance is broken so the
+    narrow rule survives the next file created beside it.
+
+    ``icacls`` does the work: the Win32 call to set a DACL wants the owner
+    ACE in a shape it will not take, and answers ERROR_NOT_ALL_ASSIGNED.
+    """
+    if os.name != "nt":
+        return False
+    owner = _current_sid()
+    if not owner:
+        return False
+    cmd = ["icacls", str(path), "/inheritance:r",
+           "/grant:r", f"*{owner}:(F)",
+           f"*{_SYSTEM_SID}:(F)", f"*{_ADMINS_SID}:(F)"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, timeout=30,
+                             **_quiet())
+    except Exception:  # noqa: BLE001
+        return False
+    return res.returncode == 0
+
+
+def restrict_private(path, mode: int = 0o600, is_dir: bool = False) -> None:
+    """Keep a private file private: the owner, SYSTEM and Administrators only.
+
+    On POSIX this is the mode; on Windows the DACL is rewritten, because
+    os.chmod is a no-op there and the file would otherwise keep the
+    permissive ACL of the directory it was created in.
+    """
+    chmod_quiet(path, mode)
+    if os.name == "nt":
+        _narrow_acl(path, is_dir)
+
+
+def _pid_is_ours(pid: int) -> bool:
+    """Is that pid a lingling session, rather than any live process?
+
+    A hard kill leaves the lock file behind, and the OS hands that pid to
+    something else soon enough.  Asking only "is the pid alive" then turned
+    every later launch into "lingling is already running (pid N)", for a
+    process that was never ours.  The pid has to be a lingling one, so the
+    command line is read and asked about us.
+    """
+    if pid <= 0:
+        return False
+    if platform.system().lower() != "windows":
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                return b"lingling" in fh.read()
+        except OSError:
+            pass
+        try:
+            output = _console_text(["ps", "-p", str(pid), "-o", "args="], 5)
+        except Exception:  # noqa: BLE001
+            return False
+        return "lingling" in output
+    try:
+        output = _console_text(
+            ["wmic", "process", "where", f"ProcessId={pid}",
+             "get", "CommandLine", "/value"], 10)
+    except Exception:  # noqa: BLE001
+        return False
+    return "lingling" in output
 
 
 def session_lock(data_dir: str) -> Optional[int]:
@@ -91,7 +242,7 @@ def session_lock(data_dir: str) -> Optional[int]:
             except FileNotFoundError:
                 text = ""
             pid = int(text) if text.isdigit() else 0
-            if pid and _pid_alive_local(pid):
+            if pid and _pid_alive_local(pid) and _pid_is_ours(pid):
                 return pid
             path.write_text(str(os.getpid()), encoding="utf-8")
             _session_handles[path] = fd
@@ -185,8 +336,7 @@ def pids_on_ports(ports: Container[int]) -> dict:
     want = set(ports)
     found = {}
     try:
-        output = subprocess.check_output(["netstat", "-ano"], text=True,
-                                         timeout=20, **_quiet())
+        output = _console_text(["netstat", "-ano"], 20)
     except Exception:  # noqa: BLE001
         return {}
     for line in output.splitlines():
@@ -241,7 +391,12 @@ def _recv_exact(sock: socket.socket, n: int,
 
 def socks5_open(sock: socket.socket, host: str, port: int,
                 cred: Optional[Tuple[str, str]] = None) -> str:
-    """SOCKS5 CONNECT on a connected socket; "" on success, else a reason."""
+    """SOCKS5 CONNECT on a connected socket; "" on success, else a reason.
+
+    A port outside 0..65535 is refused here rather than packed: struct.pack
+    raises struct.error for it, and struct.error is neither an OSError nor a
+    ValueError, so it escaped every handler and killed the worker thread.
+    """
     window = sock.gettimeout()
     deadline = (time.monotonic() + window) if window else None
 
@@ -275,6 +430,8 @@ def socks5_open(sock: socket.socket, host: str, port: int,
             elif resp[1] != 0x00:
                 return "bad SOCKS5 greeting"
         addr = host.encode("idna")
+        if not 1 <= port <= 65535:
+            return "bad port"
         send(bytes([0x05, 0x01, 0x00, 0x03, len(addr)])
              + addr + struct.pack("!H", port))
         head = _recv_exact(sock, 4, deadline)

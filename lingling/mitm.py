@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import select
 import socket
 import ssl
@@ -112,21 +113,35 @@ def crypto_available() -> bool:
 
 
 def _ensure_ca(mitm_dir: Path):
-    """Create (or load) the local root CA."""
+    """Create (or load) the local root CA.
+
+    A CA that cannot be loaded is re-minted rather than trusted: a truncated
+    or half-written pair used to raise out of here, and the caller swallowed
+    the error, so the MITM was silently off for the rest of the session --
+    and for every session after it, because the broken files stayed.
+    """
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.x509.oid import NameOID
 
     mitm_dir.mkdir(parents=True, exist_ok=True)
-    netutil.chmod_quiet(mitm_dir, 0o700)
+    netutil.restrict_private(mitm_dir, 0o700, is_dir=True)
     cert_path = mitm_dir / "ca.pem"
     key_path = mitm_dir / "ca-key.pem"
     if cert_path.exists() and key_path.exists():
-        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
-        key = serialization.load_pem_private_key(
-            key_path.read_bytes(), password=None)
-        return cert, key, cert_path
+        try:
+            cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+            key = serialization.load_pem_private_key(
+                key_path.read_bytes(), password=None)
+            return cert, key, cert_path
+        except Exception:  # noqa: BLE001
+            """Unreadable, so it is wreckage: mint a new one over it."""
+            for stale in (cert_path, key_path):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME,
@@ -151,8 +166,27 @@ def _ensure_ca(mitm_dir: Path):
         serialization.Encoding.PEM,
         serialization.PrivateFormat.TraditionalOpenSSL,
         serialization.NoEncryption()))
-    netutil.chmod_quiet(key_path, 0o600)
+    netutil.restrict_private(key_path, 0o600)
     return cert, key, cert_path
+
+
+#: safe file-name
+_CERT_STEM_OK = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _cert_stem(host: str) -> str:
+    """A file-name-safe stem for one host, so a cert can never leave its dir.
+
+    The CONNECT target is the client's to choose, and it is only ever checked
+    for its ``opencode.ai`` suffix.  A target like ``..\\..\\..\\pwned.opencode.ai``
+    used to become the literal file name of the certificate and its key, so a
+    local client could have lingling write an RSA private key anywhere the
+    user can write.  Every character outside a safe set is folded to ``_``
+    here, and the result is checked against the directory it must stay in.
+    """
+    stem = _CERT_STEM_OK.sub("_", host.replace("*", "wildcard"))
+    stem = stem.strip("._") or "host"
+    return stem[:120]
 
 
 class CertShop:
@@ -163,7 +197,7 @@ class CertShop:
             self._ca_cert, self._ca_key, self.ca_pem_path = _ensure_ca(mitm_dir)
         self._dir = mitm_dir / "certs"
         self._dir.mkdir(parents=True, exist_ok=True)
-        netutil.chmod_quiet(self._dir, 0o700)
+        netutil.restrict_private(self._dir, 0o700, is_dir=True)
 
     def context_for(self, host: str) -> ssl.SSLContext:
         from cryptography import x509
@@ -171,10 +205,10 @@ class CertShop:
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.x509.oid import NameOID
 
-        safe = host.replace("*", "wildcard")
+        safe = _cert_stem(host)
         cert_path = self._dir / f"{safe}.pem"
         key_path = self._dir / f"{safe}-key.pem"
-        if not cert_path.exists():
+        if not (cert_path.exists() and key_path.exists()):
             key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
             now = datetime.datetime.now(datetime.timezone.utc)
             san = x509.SubjectAlternativeName([x509.DNSName(host)])
@@ -197,9 +231,24 @@ class CertShop:
                 serialization.Encoding.PEM,
                 serialization.PrivateFormat.TraditionalOpenSSL,
                 serialization.NoEncryption()))
-            netutil.chmod_quiet(key_path, 0o600)
+            netutil.restrict_private(key_path, 0o600)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(str(cert_path), str(key_path))
+        try:
+            ctx.load_cert_chain(str(cert_path), str(key_path))
+        except ssl.SSLError:
+            """A cert beside the wrong key, or a truncated one.
+
+            The pair is only ever checked for being there, so a crash
+            between the two writes left one host's cert beside another
+            host's key, and that host then failed every handshake until
+            certs/ was cleared by hand.  The pair is minted again instead.
+            """
+            for stale in (cert_path, key_path):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+            return self.context_for(host)
         return ctx
 
 
