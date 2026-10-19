@@ -154,14 +154,30 @@ def main() -> int:
     check("the restart is not left behind for the next opencode",
           "restart" in kinds and kinds[-1] == "stop", f"{kinds}")
 
-    print("\n=== 6. --standalone is never passed (it drops the env) ===")
+    print("\n=== 6. the private server is the POSIX answer ===")
     install(WITH_SERVER)
     launch(args)
     popens = [e for e in EVENTS if e[0] == "popen"]
-    check("no --standalone on the TUI argv",
-          popens and "--standalone" not in popens[0][1], f"{popens}")
-    check("the user's args are handed over untouched",
-          popens and popens[0][1] == [BINARY] + args, f"{popens}")
+    if os.name == "nt":
+        # On Windows the shared server is ours to restart: the client/service
+        # CLI exposes the restart, and the detached child inherits the
+        # environment that way (measured: 0 proxied vs 12 inherited).
+        check("no --standalone on the TUI argv",
+              popens and "--standalone" not in popens[0][1], f"{popens}")
+        check("the user's args are handed over untouched",
+              popens and popens[0][1] == [BINARY] + args, f"{popens}")
+    else:
+        # On Linux the background service is SHARED: every opencode client
+        # on the machine talks to it, so ending it to restart it would break
+        # every other session and any agent already running. A private
+        # server does the same job without touching the shared one, and it
+        # inherits the proxy and the CA.
+        check("--standalone is asked for on POSIX",
+              popens and "--standalone" in popens[0][1], f"{popens}")
+        check("and it follows the subcommand, where opencode reads it",
+              popens and popens[0][1].index("--standalone") == 1, f"{popens}")
+        check("the user's own args are still handed over",
+              popens and all(a in popens[0][1] for a in args), f"{popens}")
     check("the TUI itself still inherits our environment",
           popens and popens[0][2] == ENV, f"{popens}")
 

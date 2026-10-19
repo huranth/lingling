@@ -135,6 +135,19 @@ class Relay:
                 return lane
         return None
 
+    def pick_lanes(self, exclude=None):
+        return [lane for lane in self.tor.lanes
+                if not exclude or lane.index not in exclude]
+
+    def pin_lanes(self, width):
+        """The session's wave: the same few lanes, held steady.
+
+        The free tier refuses a client it sees arrive from half a dozen
+        addresses for the same session, so the session's set of addresses
+        has to stay small.
+        """
+        return self.pick_lanes()[:width]
+
     def report_refused(self, lane, status, fingerprint=""):
         self.refused.append((lane.index, status))
 
