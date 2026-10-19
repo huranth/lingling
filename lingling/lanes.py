@@ -318,10 +318,7 @@ class TorManager(BenchMixin):
                           if c not in self._quiet]
         self._score: Dict[str, int] = self._load_score()
         self._by_country: Dict[str, List[exits.Exit]] = {}
-        #: Whether the relay list has been loaded at all.  Separate from
-        #: ``_by_country``, which may legitimately be empty after a
-        #: successful load: a consensus with no exit to give is an answer,
-        #: while "not loaded yet" is a state worth retrying.
+        #: attempted
         self._exits_loaded = False
         self._limited: Dict[str, Dict] = self._load_limited()
         self._used: Dict[str, float] = self._load_stamps(USED_PATH)
@@ -1155,8 +1152,7 @@ class TorManager(BenchMixin):
             if self._exits_loaded:
                 return bool(self._by_country)
         elif self._by_country is not None:
-            # A manager built without __init__ (the test fixtures do that)
-            # has no flag, and its _by_country is the answer it was handed.
+            # unflagged
             return bool(self._by_country)
         consensus = exits.find_consensus(self.lanes_dir)
         geoip = self._geoip_path()

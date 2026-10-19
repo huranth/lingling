@@ -71,7 +71,7 @@ def chmod_quiet(path, mode: int) -> None:
         pass
 
 
-#: the well-known SIDs a private file may name
+#: well-known SIDs
 _OWNER_SID = None
 _SYSTEM_SID = "S-1-5-18"
 _ADMINS_SID = "S-1-5-32-544"
@@ -106,7 +106,8 @@ def _current_sid() -> Optional[str]:
             _OWNER_SID = ""
             return None
         size = wintypes.DWORD()
-        # TokenUser = 1; the first call says how much room it needs
+        # TokenUser=1
+        # (size first)
         k.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
         if not size.value:
             libc.CloseHandle(token)
