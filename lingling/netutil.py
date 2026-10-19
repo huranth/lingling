@@ -71,6 +71,37 @@ def chmod_quiet(path, mode: int) -> None:
         pass
 
 
+def _pid_is_ours(pid: int) -> bool:
+    """Is that pid a lingling session, rather than any live process?
+
+    A hard kill leaves the lock file behind, and the OS hands that pid to
+    something else soon enough.  Asking only "is the pid alive" then turned
+    every later launch into "lingling is already running (pid N)", for a
+    process that was never ours.  The pid has to be a lingling one, so the
+    command line is read and asked about us.
+    """
+    if pid <= 0:
+        return False
+    if platform.system().lower() != "windows":
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                return b"lingling" in fh.read()
+        except OSError:
+            pass
+        try:
+            output = _console_text(["ps", "-p", str(pid), "-o", "args="], 5)
+        except Exception:  # noqa: BLE001
+            return False
+        return "lingling" in output
+    try:
+        output = _console_text(
+            ["wmic", "process", "where", f"ProcessId={pid}",
+             "get", "CommandLine", "/value"], 10)
+    except Exception:  # noqa: BLE001
+        return False
+    return "lingling" in output
+
+
 def session_lock(data_dir: str) -> Optional[int]:
     """Hold an OS lock until release; None acquired, pid/-1 busy, OSError failed."""
     path = pathlib.Path(data_dir).resolve() / "session.lock"
@@ -103,7 +134,7 @@ def session_lock(data_dir: str) -> Optional[int]:
             except FileNotFoundError:
                 text = ""
             pid = int(text) if text.isdigit() else 0
-            if pid and _pid_alive_local(pid):
+            if pid and _pid_alive_local(pid) and _pid_is_ours(pid):
                 return pid
             path.write_text(str(os.getpid()), encoding="utf-8")
             _session_handles[path] = fd

@@ -63,13 +63,27 @@ def main() -> int:
     netutil.release_session_lock(str(d))
 
     print("\n=== a pid that gets reused by an unrelated process ===")
+    # A hard kill leaves the lock file behind, and the OS hands that pid to
+    # something else soon enough.  A live pid is not enough to say "a session
+    # is running": the pid has to be a lingling one, or every later launch is
+    # turned away by a process that was never ours.
     lock.write_text("4")
     got = netutil.session_lock(str(d))
-    check("a live-but-unrelated pid still blocks (safe, rare, self-heals)",
-          got == 4, f"got={got}")
-    lock.unlink()
-    check("manual clearing works", netutil.session_lock(str(d)) is None)
+    check("a live-but-unrelated pid does not block",
+          got is None, f"got={got}")
+    check("and the lock now names us",
+          lock.read_text() == str(os.getpid()), lock.read_text())
     netutil.release_session_lock(str(d))
+
+    print("\n=== the pid check asks whether the process is ours ===")
+    check("a pid that is not lingling is not ours",
+          netutil._pid_is_ours(4) is False)
+    check("this process is not lingling either",
+          netutil._pid_is_ours(os.getpid()) is False)
+    check("a pid that does not exist is not ours",
+          netutil._pid_is_ours(999999) is False)
+    check("a nonsensical pid is not ours",
+          netutil._pid_is_ours(0) is False)
 
     print("\n=== garbage contents are wreckage too ===")
     lock.write_text("not-a-pid")
