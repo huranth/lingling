@@ -182,6 +182,8 @@ class StickyState:
         self.phase = "routing"
         self.winner: Optional[int] = None
         self._cursor = 0
+        #: the lanes this session races, so its address set stays small
+        self._wave: List[int] = []
         self._announced = False
 
     def attach(self, emit: Callable[[Dict], None]) -> None:
@@ -205,6 +207,16 @@ class StickyState:
                      and not (exclude and l.index in exclude)]
             if not lanes:
                 return None
+            # The free tier refuses a client it sees arrive from half a
+            # dozen addresses for the same session, and once it has refused
+            # that client it refuses it through every exit. So a session may
+            # not walk the fleet: it holds one small set of lanes, and the
+            # round cycles inside that set. The set only changes when a
+            # member is done with.
+            if self._wave:
+                wave = [l for l in lanes if l.index in self._wave]
+                if wave:
+                    lanes = wave
             lanes.sort(key=lambda l: l.index)
             lane = lanes[self._cursor % len(lanes)]
             self._cursor += 1
@@ -218,6 +230,32 @@ class StickyState:
                            f"takes it",
                 })
             return lane
+
+    def pin(self, candidates: List[Lane], width: int) -> List[Lane]:
+        """The lanes this session races, held steady.
+
+        The free tier refuses a client it sees arrive from half a dozen
+        addresses for the same session, and once it has refused that client
+        it refuses it through every exit. So the session's set of addresses
+        has to stay small: hold one set of lanes, and change it only when a
+        member is done with. A wave that is re-picked on every call is a
+        session that walks the fleet, which is exactly what the gate sees.
+        """
+        with self._lock:
+            keep: List[Lane] = []
+            for index in self._wave:
+                lane = next((l for l in candidates if l.index == index), None)
+                if lane is not None:
+                    keep.append(lane)
+            held = {l.index for l in keep}
+            for lane in candidates:
+                if len(keep) >= width:
+                    break
+                if lane.index not in held:
+                    keep.append(lane)
+                    held.add(lane.index)
+            self._wave = [l.index for l in keep]
+            return keep
 
     def record(self, lane_index: int, secs: float) -> None:
         """One attempt's latency: under the threshold it wins the ride."""
