@@ -179,10 +179,21 @@ class BenchMixin:
         only set while it still rides it -- a lane that has been re-pinned is
         never left sitting out a wall that belongs to an exit it no longer
         uses, which is exactly how a whole lane used to sit out a session.
+
+        A lane with no fingerprint still gets its own clock.  The notepad is
+        keyed by exit, so without one there is nothing to write there, but the
+        lane's own ``limited_until`` is what the "already benched" guards read:
+        it used to stay at 0.0, so the bench never took effect and every
+        verdict on that lane repeated the full move - burn a relay, rotate the
+        country, restart tor.
         """
         exit_fp = fingerprint or lane.exit_fingerprint
         if not exit_fp:
-            return 0.0
+            now = time.time()
+            until = now + bench_span(reason, retry_after, now)
+            lane.limited_until = until
+            lane.limit_reason = reason
+            return until
         until = self.note_exit(exit_fp, reason, retry_after)
         if exit_fp == lane.exit_fingerprint:
             lane.limited_until = until

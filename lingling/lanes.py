@@ -317,7 +317,12 @@ class TorManager(BenchMixin):
         self._fallback = [c for c in (fallback_countries or [])
                           if c not in self._quiet]
         self._score: Dict[str, int] = self._load_score()
-        self._by_country: Optional[Dict[str, List[exits.Exit]]] = None
+        self._by_country: Dict[str, List[exits.Exit]] = {}
+        #: Whether the relay list has been loaded at all.  Separate from
+        #: ``_by_country``, which may legitimately be empty after a
+        #: successful load: a consensus with no exit to give is an answer,
+        #: while "not loaded yet" is a state worth retrying.
+        self._exits_loaded = False
         self._limited: Dict[str, Dict] = self._load_limited()
         self._used: Dict[str, float] = self._load_stamps(USED_PATH)
         self._verified: Dict[str, float] = self._load_stamps(VERIFIED_PATH)
@@ -1129,20 +1134,44 @@ class TorManager(BenchMixin):
         t.start()
 
     def _load_exits(self) -> bool:
-        """Load the relay list once. Empty until a lane has cached one."""
-        if self._by_country is not None:
+        """Load the relay list. Empty until a lane has cached one.
+
+        A failure is not cached: on the cold first boot the Tor bundle has
+        just been downloaded and no consensus exists yet, so the first call
+        finds nothing.  Caching that empty result made it permanent - the
+        guard below short-circuited every later attempt, the whole session ran
+        with country-only ExitNodes, and no lane could ever pin a relay.  The
+        empty list is therefore left uncached, so the next call tries again
+        once a lane has written its consensus.
+
+        "Tried" and "succeeded" are two different things, so they are two
+        different states: \`_exits_loaded\` says the load ran at all, and an
+        empty \`_by_country\` after a successful load is a real answer - the
+        consensus has no exit to give.  Treating that empty result as
+        "not loaded yet" would re-read the disk on every call and, worse,
+        would ask for a consensus file a caller may not have set up.
+        """
+        if hasattr(self, "_exits_loaded"):
+            if self._exits_loaded:
+                return bool(self._by_country)
+        elif self._by_country is not None:
+            # A manager built without __init__ (the test fixtures do that)
+            # has no flag, and its _by_country is the answer it was handed.
             return bool(self._by_country)
         consensus = exits.find_consensus(self.lanes_dir)
         geoip = self._geoip_path()
         if consensus is None or geoip is None:
-            self._by_country = {}
             return False
         try:
             ranges = exits.load_geoip(geoip)
-            self._by_country = exits.load_relays(consensus, ranges)
+            loaded = exits.load_relays(consensus, ranges)
         except Exception:  # noqa: BLE001
-            self._by_country = {}
-        return bool(self._by_country)
+            return False
+        if not loaded:
+            return False
+        self._by_country = loaded
+        self._exits_loaded = True
+        return True
 
     def _held(self, lane: Optional[Lane] = None) -> Tuple[List[str], List[str]]:
         """What the other lanes are holding: their exits, and their exit IPs.

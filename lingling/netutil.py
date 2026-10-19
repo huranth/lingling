@@ -25,19 +25,6 @@ def _quiet() -> dict:
     """creationflags that keep a console tool from opening a window."""
     return {"creationflags": _NO_WINDOW} if os.name == "nt" else {}
 
-
-def _console_text(cmd: list[str], timeout: float) -> str:
-    """One console tool's output, read as bytes and decoded leniently.
-
-    ``text=True`` decodes with the interpreter's own codec, which is UTF-8
-    under PYTHONUTF8=1 and cp949 under a Korean console.  The tools answer in
-    the console's code page, so that decode raised UnicodeDecodeError and
-    check_output returned None -- and the caller then walked None.  The bytes
-    are what matter here, so they are decoded as latin-1, which never fails.
-    """
-    raw = subprocess.check_output(cmd, timeout=timeout, **_quiet())
-    return raw.decode("latin-1", "replace")
-
 UPSTREAM_UNAVAILABLE = b'"server_error"'
 
 QUOTA_SPENT = b'"FreeUsageLimitError"'
@@ -52,8 +39,9 @@ def _pid_alive_local(pid: int) -> bool:
         except OSError:
             return False
     try:
-        output = _console_text(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], 5)
+        output = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], text=True,
+            timeout=5, **_quiet())
         return str(pid) in output and "No tasks" not in output
     except Exception:
         return True
@@ -69,37 +57,6 @@ def chmod_quiet(path, mode: int) -> None:
         os.chmod(path, mode)
     except OSError:
         pass
-
-
-def _pid_is_ours(pid: int) -> bool:
-    """Is that pid a lingling session, rather than any live process?
-
-    A hard kill leaves the lock file behind, and the OS hands that pid to
-    something else soon enough.  Asking only "is the pid alive" then turned
-    every later launch into "lingling is already running (pid N)", for a
-    process that was never ours.  The pid has to be a lingling one, so the
-    command line is read and asked about us.
-    """
-    if pid <= 0:
-        return False
-    if platform.system().lower() != "windows":
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                return b"lingling" in fh.read()
-        except OSError:
-            pass
-        try:
-            output = _console_text(["ps", "-p", str(pid), "-o", "args="], 5)
-        except Exception:  # noqa: BLE001
-            return False
-        return "lingling" in output
-    try:
-        output = _console_text(
-            ["wmic", "process", "where", f"ProcessId={pid}",
-             "get", "CommandLine", "/value"], 10)
-    except Exception:  # noqa: BLE001
-        return False
-    return "lingling" in output
 
 
 def session_lock(data_dir: str) -> Optional[int]:
@@ -134,7 +91,7 @@ def session_lock(data_dir: str) -> Optional[int]:
             except FileNotFoundError:
                 text = ""
             pid = int(text) if text.isdigit() else 0
-            if pid and _pid_alive_local(pid) and _pid_is_ours(pid):
+            if pid and _pid_alive_local(pid):
                 return pid
             path.write_text(str(os.getpid()), encoding="utf-8")
             _session_handles[path] = fd
@@ -228,7 +185,8 @@ def pids_on_ports(ports: Container[int]) -> dict:
     want = set(ports)
     found = {}
     try:
-        output = _console_text(["netstat", "-ano"], 20)
+        output = subprocess.check_output(["netstat", "-ano"], text=True,
+                                         timeout=20, **_quiet())
     except Exception:  # noqa: BLE001
         return {}
     for line in output.splitlines():
@@ -283,12 +241,7 @@ def _recv_exact(sock: socket.socket, n: int,
 
 def socks5_open(sock: socket.socket, host: str, port: int,
                 cred: Optional[Tuple[str, str]] = None) -> str:
-    """SOCKS5 CONNECT on a connected socket; "" on success, else a reason.
-
-    A port outside 0..65535 is refused here rather than packed: struct.pack
-    raises struct.error for it, and struct.error is neither an OSError nor a
-    ValueError, so it escaped every handler and killed the worker thread.
-    """
+    """SOCKS5 CONNECT on a connected socket; "" on success, else a reason."""
     window = sock.gettimeout()
     deadline = (time.monotonic() + window) if window else None
 
@@ -322,8 +275,6 @@ def socks5_open(sock: socket.socket, host: str, port: int,
             elif resp[1] != 0x00:
                 return "bad SOCKS5 greeting"
         addr = host.encode("idna")
-        if not 1 <= port <= 65535:
-            return "bad port"
         send(bytes([0x05, 0x01, 0x00, 0x03, len(addr)])
              + addr + struct.pack("!H", port))
         head = _recv_exact(sock, 4, deadline)
