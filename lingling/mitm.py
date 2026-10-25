@@ -87,9 +87,6 @@ _LIMIT_WAIT_S = bounds.number("LINGLING_LIMIT_WAIT_S", 2.0,
 _NOTE_BYTES = 512
 
 _CAPTURE = os.environ.get("LINGLING_CAPTURE", "")
-#: where to write the upstream request/response, for when the far end
-#: refuses and the reason is not in the status code
-_DEBUG_UPSTREAM = os.environ.get("LINGLING_DEBUG_UPSTREAM", "")
 _CAPTURE_MAX = bounds.count("LINGLING_CAPTURE_BYTES", 8192, 0, 1_048_576)
 
 _PRE_COMMIT_MAX = 65536
@@ -423,7 +420,6 @@ class _Race:
     def __init__(self, copies: List[_Copy]) -> None:
         self.copies = copies
         self.winner: Optional[_Copy] = None
-        self.model = ""
         self._lock = threading.Lock()
         for copy in copies:
             copy.race = self
@@ -475,7 +471,6 @@ def _race_call(client, lanes: List[Lane], host: str, port: int, method: str,
     """Fire one call at every lane at once; the first answer takes the client"""
     copies = [_Copy(lane) for lane in lanes]
     race = _Race(copies)
-    race.model = model
     plain = len(lanes) == 1
     emit({
         "type": "call", "t": t0, "n": seq, "c": call_n,
@@ -537,13 +532,6 @@ def _note_ok(relay, lane) -> None:
         note(lane.exit_fingerprint)
 
 
-def _note_model_ok(relay, copy, lane) -> None:
-    """A model answer through an exit: it earns the model mark."""
-    note = getattr(relay.tor, "note_model_ok", None)
-    if note is not None:
-        note(getattr(copy, "exit_fp", "") or lane.exit_fingerprint)
-
-
 def _note_spend(relay, lane) -> None:
     """Count a landed request against the exit that carried it.
 
@@ -582,8 +570,6 @@ def _tally(race: _Race, out: List[tuple], relay) -> _Round:
                 _note_spend(relay, copy.lane)
             if status == 200:
                 _note_ok(relay, copy.lane)
-                if getattr(race, "model", ""):
-                    _note_model_ok(relay, copy, copy.lane)
             continue
         if err:
             if copy.beaten:
@@ -594,16 +580,6 @@ def _tally(race: _Race, out: List[tuple], relay) -> _Round:
             got.gated = True
             got.retryable = True
             got.gates.append((copy.lane, copy.exit_fp))
-            if not got.held:
-                got.held = body
-            continue
-        if status == 402:
-            # "Upstream request failed: Insufficient account funds" is the
-            # free-model pool for that address running dry. It is the day's
-            # wall, not a gate, so the exit sits out until 00:00 UTC instead
-            # of being asked again on every call.
-            got.limits.append((copy.lane, copy.exit_fp, 0.0, FREE_LIMIT))
-            got.retryable = True
             if not got.held:
                 got.held = body
             continue
@@ -947,74 +923,6 @@ def _lat(t0: float, first_byte: Optional[float],
 
 
 _LOST = ("", 0, b"", False)
-
-
-def _debug_upstream(head: bytes, status: int, rheaders: dict,
-                     body: bytes) -> None:
-    """Write the upstream exchange to a file, with the token redacted.
-
-    The far end's own words are the only way to tell a gate from a quota
-    from a spent pool, and none of them are in the status code: 403 is
-    "the free tier can only be used from within OpenCode", 402 is
-    "insufficient account funds", 429 is the daily wall. The file is
-    appended to, so a session leaves the whole exchange behind.
-    """
-    if not _DEBUG_UPSTREAM:
-        return
-    try:
-        text = head.decode("latin1", "replace")
-        lines = []
-        for line in text.split("\r\n"):
-            if line.lower().startswith("authorization:"):
-                line = "authorization: <redacted>"
-            lines.append(line)
-        out = ["=== request ===", *lines, "=== response ===",
-               f"status: {status}"]
-        for k, v in rheaders.items():
-            out.append(f"{k}: {v.decode('latin1', 'replace')}")
-        out.append("=== body ===")
-        raw = body[:2000]
-        chunked = any(k == b"transfer-encoding" and b"chunked" in v.lower()
-                      for k, v in rheaders.items())
-        if chunked and raw:
-            # the captured bytes carry the chunked framing, and a codec
-            # cannot read that: take the payload back out
-            plain = b""
-            while raw:
-                line, _, rest = raw.partition(b"\r\n")
-                try:
-                    size = int(line.split(b";")[0].strip() or b"0", 16)
-                except ValueError:
-                    break
-                if size == 0:
-                    break
-                plain += rest[:size]
-                raw = rest[size + 2:]
-            raw = plain
-        enc = ""
-        for k, v in rheaders.items():
-            if k == b"content-encoding":
-                enc = v.decode("latin1", "replace").lower()
-        if raw and enc in ("gzip", "deflate", "br", "zstd"):
-            try:
-                import gzip as _gz
-                import zlib as _zl
-                if enc == "gzip":
-                    raw = _gz.decompress(raw)
-                elif enc == "deflate":
-                    raw = _zl.decompress(raw, -_zl.MAX_WBITS)
-                elif enc == "br":
-                    import brotli as _br
-                    raw = _br.decompress(raw)
-                else:
-                    raw = b"<" + enc.encode() + b" body, not decoded>"
-            except Exception:  # noqa: BLE001
-                raw = b"<compressed body, not decoded>"
-        out.append(raw.decode("utf-8", "replace"))
-        with open(_DEBUG_UPSTREAM, "a", encoding="utf-8") as fh:
-            fh.write("\n".join(out) + "\n")
-    except OSError:
-        pass
 
 
 def _build_head(method: str, path: str, headers: dict, body: bytes,
@@ -1406,9 +1314,6 @@ def _roundtrip(client: ssl.SSLSocket, lane: Lane, host: str, port: int,
                                                _SLOW_EXIT_S)):
             _note_slow(relay, lane, emit, seq, call_n,
                        round(first_event_at - t0, 1))
-
-        if _DEBUG_UPSTREAM and not is_sse:
-            _debug_upstream(out_head, status, rheaders, bytes(_cap))
 
         emit({"type": "callend", "t": time.time(), "n": seq, "c": call_n,
               "lane": lane.index, "cc": lane.exit_country, "status": status,

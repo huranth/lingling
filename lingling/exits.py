@@ -197,8 +197,7 @@ def claim(by_country: Dict[str, List[Exit]], country: str,
           spent: Optional[Dict[str, int]] = None,
           avoid_ip: Sequence[str] = (),
           cap: int = 0,
-          sample: int = EXIT_SAMPLE_K,
-          model_ok: Optional[Dict[str, float]] = None) -> Optional[Exit]:
+          sample: int = EXIT_SAMPLE_K) -> Optional[Exit]:
     """The exit in ``country`` with the most left, or None when there is none.
 
     Never a spent one: a lane put on an exit the far end has already refused
@@ -212,19 +211,10 @@ def claim(by_country: Dict[str, List[Exit]], country: str,
     """
     fresh = verified or {}
     book = spent or {}
-    good = model_ok or {}
     pool = _open(by_country.get(country.upper(), ()), avoid, limited, now,
                  avoid_ip, book, cap)
     if not pool:
         return None
-    # An exit that has answered a model call is worth more than one that only
-    # answered the catalogue. The pool is sampled down to a handful before it
-    # is sorted, so a good exit would otherwise be drawn away by the sample
-    # almost every time: keep the ones that serve models, then sample inside
-    # that group.
-    serving = [e for e in pool if good.get(e.fingerprint, 0.0) > now]
-    if serving:
-        pool = serving
     if sample and len(pool) > sample:
         pool = random.sample(pool, sample)
     pool.sort(key=lambda e: (
@@ -240,16 +230,11 @@ def sweep_order(by_country: Dict[str, List[Exit]], country: str,
                 used: Dict[str, float], verified: Dict[str, float],
                 now: float, spent: Optional[Dict[str, int]] = None,
                 avoid_ip: Sequence[str] = (),
-                cap: int = 0,
-                model_ok: Optional[Dict[str, float]] = None) -> List[Exit]:
+                cap: int = 0) -> List[Exit]:
     """Relays in ``country`` still worth rotating onto, freshest first."""
     book = spent or {}
-    good = model_ok or {}
     pool = _open(by_country.get(country.upper(), ()), avoid, limited, now,
                  avoid_ip, book, cap)
-    serving = [e for e in pool if good.get(e.fingerprint, 0.0) > now]
-    if serving:
-        pool = serving
     return sorted(pool,
                   key=lambda e: (_spent_for(e, book),
                                   0 if verified.get(e.fingerprint, 0.0) > now

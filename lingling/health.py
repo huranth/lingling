@@ -6,62 +6,19 @@ import json
 import os
 import threading
 import time
-from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import bounds, exits, netutil
-from .bench import (EXIT_HOLD_S, EXIT_SOFT_CAP, FREE_LIMIT, GATE_LIMIT,
-                    RATE_LIMIT)
+from .bench import EXIT_HOLD_S, EXIT_SOFT_CAP, FREE_LIMIT, RATE_LIMIT
 from .lanes import Lane, TorManager
 
 UPSTREAM_HOST = "opencode.ai"
-# The paths the real client uses, read off the MITM's own traffic:
-# POST /inference/openai/v1/responses and /inference/openai/v1/chat/completions,
-# plus GET https://models.opencode.ai/api.json for the catalogue.
-# The old /zen/v1/... paths are not routes the upstream serves, so every
-# probe answered 403 and the pool never got a real verdict.
-UPSTREAM_PROBE_PATH = "/inference/openai/v1/chat/completions"
-UPSTREAM_MODEL_PATH = "/inference/openai/v1/responses"
-UPSTREAM_CHAT_PATH = "/inference/openai/v1/chat/completions"
+UPSTREAM_PROBE_PATH = "/zen/v1/models"
+UPSTREAM_MODEL_PATH = "/zen/v1/responses"
+UPSTREAM_CHAT_PATH = "/zen/v1/chat/completions"
 PROBE_MODEL = os.environ.get("LINGLING_PROBE_MODEL",
                              "mimo-v2.6-flash-free")
 PROBE_PATH = os.environ.get("LINGLING_PROBE_PATH", UPSTREAM_CHAT_PATH)
-
-
-def upstream_token() -> str:
-    """The opencode API key, so a probe is the real client.
-
-    An unauthenticated request is answered with "the free tier can only be
-    used from within OpenCode", which says nothing about the exit: it is the
-    client check, not a verdict. The key lives in opencode's own auth store;
-    LINGLING_UPSTREAM_TOKEN overrides it.
-    """
-    raw = (os.environ.get("LINGLING_UPSTREAM_TOKEN") or "").strip()
-    if raw:
-        return raw
-    home = Path.home()
-    for path in (home / ".local/share/opencode/auth.json",
-                 home / ".config/opencode/auth.json",
-                 home / "AppData/Local/opencode/auth.json"):
-        try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        entry = doc.get("opencode")
-        if isinstance(entry, dict):
-            key = entry.get("key")
-            if isinstance(key, str) and key.strip():
-                return key.strip()
-    return ""
-
-
-def auth_headers() -> dict:
-    """The headers that make a probe look like the client it is."""
-    token = upstream_token()
-    if not token:
-        return {}
-    return {"Authorization": f"Bearer {token}",
-            "x-opencode-client": "opencode"}
 
 
 def _scan_body(model: str, path: str = UPSTREAM_MODEL_PATH) -> bytes:
@@ -82,13 +39,6 @@ SWEEP_S = bounds.number("LINGLING_SWEEP_S", 20, 0.0, bounds.WINDOW_S)
 
 SWEEP_MOVES = bounds.count("LINGLING_SWEEP_MOVES", 3, 1, 64)
 
-# A 403 here is the CLIENT check, not a verdict about the exit. The
-# probe is a hand-rolled request and the free tier refuses anything that is
-# not the official client, so the probe can never pass this check. It still
-# proves the exit reached the upstream, so it counts as alive. The gate
-# verdict comes from the real client calls in the MITM, which do pass the
-# client check, and only from there: treating this 403 as a gate would bench
-# every live exit and leave the pool with nothing.
 PROBE_VERDICTS = (200, 403, 429)
 
 
@@ -154,7 +104,6 @@ class HealthDaemon:
             code, body = netutil.https_via_socks(
                 lane.socks_port, UPSTREAM_HOST, "POST", PROBE_PATH,
                 UPSTREAM_UA, body=_scan_body(PROBE_MODEL, PROBE_PATH),
-                extra_headers=auth_headers(),
                 timeout=probe_timeout,
                 cred=netutil.lane_cred(lane.index))
         except Exception as exc:  # noqa: BLE001
@@ -169,16 +118,6 @@ class HealthDaemon:
         if code == 410:
             lane.probe_note = ("probe model retired"
                                if b"ModelDeprecated" in body else "gone")
-        if code == 403:
-            # The upstream answered, so the exit is alive. This is the client
-            # check and it says nothing about the exit.
-            lane.probe_note = "alive (client check)"
-        if code == 402:
-            # "Upstream request failed: Insufficient account funds" is the
-            # free-model pool for that address being spent: the day's wall,
-            # not a gate, so the exit sits out until 00:00 UTC.
-            lane.probe_note = "no funds"
-            lane.probe_reason = FREE_LIMIT
         try:
             c2, body = netutil.https_get_via_socks(
                 lane.socks_port, "check.torproject.org", "/api/ip",
@@ -213,13 +152,6 @@ class HealthDaemon:
             if code == 429:
                 self.tor.note_result(lane.exit_country, code)
                 self.refuse(lane, code)
-                continue
-            if code == 402 and lane.probe_reason == FREE_LIMIT:
-                # "Insufficient account funds" is the free-model pool for
-                # that address being spent: the day's wall, not a gate, so
-                # the exit sits out until 00:00 UTC.
-                self.tor.note_limited(lane, reason=FREE_LIMIT)
-                self.on_refused(lane, 402)
                 continue
             if code in PROBE_VERDICTS:
                 lane.asked = True
