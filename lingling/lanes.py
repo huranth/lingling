@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import bounds, exits, netutil, winjob
-from .bench import (EXIT_DAY_CAP, USED_PATH, USED_TTL_S, VERIFIED_PATH,
-                    BenchMixin)
+from .bench import (EXIT_DAY_CAP, MODEL_OK_PATH, USED_PATH, USED_TTL_S,
+                    VERIFIED_PATH, BenchMixin)
 
 Log = Callable[..., None]
 
@@ -182,6 +182,8 @@ class StickyState:
         self.phase = "routing"
         self.winner: Optional[int] = None
         self._cursor = 0
+        #: the lanes this session races, so its address set stays small
+        self._wave: List[int] = []
         self._announced = False
 
     def attach(self, emit: Callable[[Dict], None]) -> None:
@@ -205,6 +207,16 @@ class StickyState:
                      and not (exclude and l.index in exclude)]
             if not lanes:
                 return None
+            # The free tier refuses a client it sees arrive from half a
+            # dozen addresses for the same session, and once it has refused
+            # that client it refuses it through every exit. So a session may
+            # not walk the fleet: it holds one small set of lanes, and the
+            # round cycles inside that set. The set only changes when a
+            # member is done with.
+            if self._wave:
+                wave = [l for l in lanes if l.index in self._wave]
+                if wave:
+                    lanes = wave
             lanes.sort(key=lambda l: l.index)
             lane = lanes[self._cursor % len(lanes)]
             self._cursor += 1
@@ -218,6 +230,32 @@ class StickyState:
                            f"takes it",
                 })
             return lane
+
+    def pin(self, candidates: List[Lane], width: int) -> List[Lane]:
+        """The lanes this session races, held steady.
+
+        The free tier refuses a client it sees arrive from half a dozen
+        addresses for the same session, and once it has refused that client
+        it refuses it through every exit. So the session's set of addresses
+        has to stay small: hold one set of lanes, and change it only when a
+        member is done with. A wave that is re-picked on every call is a
+        session that walks the fleet, which is exactly what the gate sees.
+        """
+        with self._lock:
+            keep: List[Lane] = []
+            for index in self._wave:
+                lane = next((l for l in candidates if l.index == index), None)
+                if lane is not None:
+                    keep.append(lane)
+            held = {l.index for l in keep}
+            for lane in candidates:
+                if len(keep) >= width:
+                    break
+                if lane.index not in held:
+                    keep.append(lane)
+                    held.add(lane.index)
+            self._wave = [l.index for l in keep]
+            return keep
 
     def record(self, lane_index: int, secs: float) -> None:
         """One attempt's latency: under the threshold it wins the ride."""
@@ -321,6 +359,7 @@ class TorManager(BenchMixin):
         self._limited: Dict[str, Dict] = self._load_limited()
         self._used: Dict[str, float] = self._load_stamps(USED_PATH)
         self._verified: Dict[str, float] = self._load_stamps(VERIFIED_PATH)
+        self._model_ok: Dict[str, float] = self._load_stamps(MODEL_OK_PATH)
         self._spent: Dict[str, int] = self._load_spent()
         self.socks_base = socks_base
         self.control_base = control_base
@@ -404,8 +443,9 @@ class TorManager(BenchMixin):
         if not root.exists():
             return None
         target = "tor.exe" if self._is_windows() else "tor"
-        for p in root.rglob(target):
-            return p
+        for p in sorted(root.rglob(target)):
+            if p.is_file():
+                return p
         return None
 
     def _tor_path(self) -> Path:
@@ -447,7 +487,7 @@ class TorManager(BenchMixin):
         """Locate or auto-download the Tor Expert Bundle. Returns error str or None."""
         log = log or self.log
         located = self._locate_tor_binary(self.tools_dir)
-        if located and located.exists():
+        if located is not None and located.is_file():
             self._tor_executable = located
             return None
         if self.tor_exe_override:
@@ -1184,7 +1224,7 @@ class TorManager(BenchMixin):
         picked = exits.claim(self._by_country or {}, lane.exit_country,
                              avoid, self._limited, self._used, time.time(),
                              self._verified, self._spent, avoid_ip,
-                             EXIT_DAY_CAP)
+                             EXIT_DAY_CAP, model_ok=self._model_ok)
         if picked is None:
             lane.exit_fingerprint = ""
             return False
@@ -1262,4 +1302,4 @@ class TorManager(BenchMixin):
         return exits.sweep_order(self._by_country or {}, country, avoid,
                                  self._limited, self._used, self._verified,
                                  time.time(), self._spent, avoid_ip,
-                                 EXIT_DAY_CAP)
+                                 EXIT_DAY_CAP, model_ok=self._model_ok)

@@ -317,7 +317,27 @@ Add --yes to skip the confirmation prompt.
 def _process_table() -> tuple:
     """Every process on this machine: its name, and who started it."""
     if os.name != "nt":
-        return {}, {}
+        names: dict = {}
+        parents: dict = {}
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return {}, {}
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/" + entry + "/comm", "r") as fh:
+                    name = fh.read().strip()
+                with open("/proc/" + entry + "/stat", "r") as fh:
+                    # comm may contain spaces and parens: split after the last ')'
+                    fields = fh.read().rsplit(")", 1)[1].split()
+                ppid = int(fields[1])
+            except (OSError, IndexError, ValueError):
+                continue
+            names[int(entry)] = name
+            parents[int(entry)] = ppid
+        return names, parents
     import ctypes
     import ctypes.wintypes as wt
     TH32CS_SNAPPROCESS = 0x2
@@ -371,6 +391,16 @@ def _lineage(names: dict, parents: dict) -> set:
     return mine
 
 
+def _cmdline_uses_data_dir(pid: int) -> bool:
+    """True when a tor process is one of our lanes (it points at our data dir)."""
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            cmd = fh.read().decode("utf-8", "replace").replace("\x00", " ")
+    except OSError:
+        return False
+    return str(DATA_DIR) in cmd
+
+
 def _running_children() -> list:
     """Lingling's helpers that lock the data dir, as (name, count)."""
     names, parents = _process_table()
@@ -381,7 +411,12 @@ def _running_children() -> list:
     for pid, name in names.items():
         if pid in mine:
             continue
-        if name in ("tor.exe", "opencode.exe", "lingling.exe"):
+        if name in ("tor.exe", "opencode.exe", "lingling.exe",
+                    "tor", "lingling"):
+            if name == "tor" and not _cmdline_uses_data_dir(pid):
+                # a tor that is not one of our lanes (the system daemon, for
+                # one) does not lock our data dir
+                continue
             counts[name] = counts.get(name, 0) + 1
     return sorted(counts.items())
 
@@ -401,7 +436,7 @@ def _opencode_already_open() -> list:
         return []
     mine = _lineage(names, parents)
     return sorted(pid for pid, name in names.items()
-                  if name == "opencode.exe" and pid not in mine)
+                  if name in ("opencode.exe", "opencode") and pid not in mine)
 
 
 def _uninstall(rest: list[str]) -> int:
@@ -662,10 +697,10 @@ def _session(opts: dict, opencode: str) -> int:
             listed = ", ".join(str(pid) for pid in stale)
             print(_c(f" !! OpenCode was already running ({listed}) -- its "
                      f"background service predates these lanes and will not "
-                     f"use them. Close every OpenCode window and run "
-                     f"lingling again.", "31"), flush=True)
-            print(_c("    Until you do, whatever you send rides your own "
-                     "address, not a lane.", "33"), flush=True)
+                     f"use them.", "31"), flush=True)
+            print(_c("    This session's server was restarted under the "
+                     "lanes, so it rides one; those other windows still "
+                     "ride your own address.", "33"), flush=True)
 
         env = dict(os.environ)
         for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
@@ -739,7 +774,7 @@ def _uses_background_server(binary: str) -> bool:
             out = subprocess.run([binary, "--help"], capture_output=True,
                                  text=True, encoding="utf-8",
                                  errors="replace", timeout=15,
-                                 creationflags=netutil._NO_WINDOW).stdout or ""
+                                 **netutil._quiet()).stdout or ""
             _SERVER_ERA = "--standalone" in out
         except Exception:  # noqa: BLE001
             _SERVER_ERA = False
@@ -757,7 +792,7 @@ def _server(binary: str, env: dict, action: str) -> None:
     try:
         subprocess.run([binary, "service", action], capture_output=True,
                        text=True, encoding="utf-8", errors="replace",
-                       timeout=60, creationflags=netutil._NO_WINDOW)
+                       timeout=60, **netutil._quiet())
     except Exception:  # noqa: BLE001
         pass
     finally:
@@ -768,6 +803,31 @@ def _server(binary: str, env: dict, action: str) -> None:
                 os.environ[name] = old
 
 
+_SUBCOMMANDS = ("run", "serve", "acp", "api", "mcp", "models", "auth",
+                "debug", "plugin", "stats", "service", "reload", "upgrade",
+                "update", "uninstall", "pair")
+
+
+def _has_standalone(args: list[str]) -> bool:
+    """True when the caller already asked for a private server."""
+    return any(a == "--standalone" for a in args)
+
+
+def _with_standalone(args: list[str]) -> list[str]:
+    """Put --standalone where the opencode parser actually reads it.
+
+    opencode only honours the flag AFTER its subcommand: `opencode run
+    --standalone` works, `opencode --standalone run` is parsed as a global
+    flag and the subcommand keeps talking to the shared service.
+    """
+    if _has_standalone(args):
+        return args
+    for i, a in enumerate(args):
+        if a in _SUBCOMMANDS:
+            return args[:i + 1] + ["--standalone"] + args[i + 1:]
+    return ["--standalone", *args]
+
+
 def _run_opencode(binary: str, args: list[str], env: dict | None) -> int:
     """Exec opencode with stdio inherited so it owns the terminal."""
     print(_c(" handoff: starting opencode -- its TUI loads quietly for a "
@@ -775,6 +835,17 @@ def _run_opencode(binary: str, args: list[str], env: dict | None) -> int:
     server = env is not None and _uses_background_server(binary)
     if server:
         _server(binary, env, "restart")
+    if (server and os.name != "nt" and not _has_standalone(args)
+            and os.environ.get("LINGLING_NO_STANDALONE", "") != "1"):
+        # The background server keeps the environment it was born with, so a
+        # client that attaches to it leaves on the bare address while the
+        # kitchen looks healthy. On Windows the way out is to restart that
+        # server under our environment. On Linux the service is SHARED: every
+        # client on the machine talks to it, so ending it to restart it
+        # would break every other session and any agent already running.
+        # A private server does the same job without touching the shared
+        # one, and it inherits the proxy and the MITM CA.
+        args = _with_standalone(args)
     try:
         try:
             proc = subprocess.Popen([binary, *args], env=env)
