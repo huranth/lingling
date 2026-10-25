@@ -29,8 +29,6 @@ class Relay:
         dial_timeout: float = 50.0,
     ) -> None:
         self.tor = tor
-        #: the lanes this session races, so its address set stays small
-        self._wave: List[int] = []
         self.host = host
         self.port = port
         self._emit = event or (lambda e: None)
@@ -184,30 +182,14 @@ class Relay:
         return any(l.index not in exclude and l.limited_until <= now
                    for l in self.tor.lanes)
 
-    def pin_lanes(self, width: int) -> List[Lane]:
-        """The lanes this session races, held steady.
-
-        The free tier refuses a client it sees arrive from half a dozen
-        addresses for the same session, and once it has refused that client
-        it refuses it through every exit. So the session's set of addresses
-        has to stay small: hold one set of lanes, and change it only when a
-        member is done with. A wave that is re-picked on every call is a
-        session that walks the fleet, which is exactly what the gate sees.
-        """
-        sticky = getattr(self.tor, "sticky", None)
-        pin = getattr(sticky, "pin", None)
-        if pin is not None:
-            return pin(self.pick_lanes(), width)
-        return self.pick_lanes()[:width]
-
-    def pick_lanes(self, exclude: Optional[set] = None) -> List[Lane]:
-        """Every healthy lane, best first: the order pick_lane picks in."""
+    def pick_lane(self, exclude: Optional[set] = None) -> Optional[Lane]:
+        """The least-loaded healthy lane, so a burst diverges evenly."""
         candidates: List[Lane] = [
             l for l in self.tor.healthy_lanes()
             if not exclude or l.index not in exclude
         ]
         if not candidates:
-            return []
+            return None
 
         strict = len(candidates) >= _LOSING_MIN_POOL
         now = time.time()
@@ -219,16 +201,7 @@ class Relay:
                       else 0) if strict else 0
             return (limited, cold, l.active, losing, l.last_used_at)
 
-        candidates.sort(key=key)
-        return candidates
-
-    def pick_lane(self, exclude: Optional[set] = None) -> Optional[Lane]:
-        """The least-loaded healthy lane, so a burst diverges evenly."""
-        candidates = self.pick_lanes(exclude)
-        if not candidates:
-            return None
-
-        lane = candidates[0]
+        lane = min(candidates, key=key)
         lane.last_used_at = time.perf_counter_ns()
         lane.last_real_at = time.time()
         return lane
