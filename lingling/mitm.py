@@ -342,18 +342,10 @@ def _race_lanes(relay, tried: set) -> List[Lane]:
         key = exit_key(first)
         if key:
             riders[key] = first.index
-    # The wave is the session's own set of lanes, so the client keeps
-    # arriving from the same few addresses: the free tier counts the
-    # addresses a session uses, and refuses the client once it has seen
-    # half a dozen.
-    pending = list(relay.pin_lanes(
-        _RACE_WIDTH or len(relay.tor.healthy_lanes())))
     while _RACE_WIDTH <= 0 or len(lanes) < _RACE_WIDTH:
-        lane = pending.pop(0) if pending else relay.pick_lane(exclude=taken)
+        lane = relay.pick_lane(exclude=taken)
         if lane is None or lane.index in taken:
-            if not pending:
-                break
-            continue
+            break
         taken.add(lane.index)
         if not live(lane):
             continue
@@ -999,57 +991,6 @@ def _debug_upstream(head: bytes, status: int, rheaders: dict,
                 plain += rest[:size]
                 raw = rest[size + 2:]
             raw = plain
-        enc = ""
-        for k, v in rheaders.items():
-            if k == b"content-encoding":
-                enc = v.decode("latin1", "replace").lower()
-        if raw and enc in ("gzip", "deflate", "br", "zstd"):
-            try:
-                import gzip as _gz
-                import zlib as _zl
-                if enc == "gzip":
-                    raw = _gz.decompress(raw)
-                elif enc == "deflate":
-                    raw = _zl.decompress(raw, -_zl.MAX_WBITS)
-                elif enc == "br":
-                    import brotli as _br
-                    raw = _br.decompress(raw)
-                else:
-                    raw = b"<" + enc.encode() + b" body, not decoded>"
-            except Exception:  # noqa: BLE001
-                raw = b"<compressed body, not decoded>"
-        out.append(raw.decode("utf-8", "replace"))
-        with open(_DEBUG_UPSTREAM, "a", encoding="utf-8") as fh:
-            fh.write("\n".join(out) + "\n")
-    except OSError:
-        pass
-
-
-def _debug_upstream(head: bytes, status: int, rheaders: dict,
-                     body: bytes) -> None:
-    """Write the upstream exchange to a file, with the token redacted.
-
-    The far end's own words are the only way to tell a gate from a quota
-    from a spent pool, and none of them are in the status code: 403 is
-    "the free tier can only be used from within OpenCode", 402 is
-    "insufficient account funds", 429 is the daily wall. The file is
-    appended to, so a session leaves the whole exchange behind.
-    """
-    if not _DEBUG_UPSTREAM:
-        return
-    try:
-        text = head.decode("latin1", "replace")
-        lines = []
-        for line in text.split("\r\n"):
-            if line.lower().startswith("authorization:"):
-                line = "authorization: <redacted>"
-            lines.append(line)
-        out = ["=== request ===", *lines, "=== response ===",
-               f"status: {status}"]
-        for k, v in rheaders.items():
-            out.append(f"{k}: {v.decode('latin1', 'replace')}")
-        out.append("=== body ===")
-        raw = body[:2000]
         enc = ""
         for k, v in rheaders.items():
             if k == b"content-encoding":
