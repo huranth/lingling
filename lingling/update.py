@@ -488,11 +488,8 @@ def upgrade_command() -> list:
         exe = shutil.which("uv")
         if exe:
             return [exe, "tool", "upgrade", "lingling"]
-    # --user keeps the upgrade in the same place the current install lives
-    # (~/.local). Without it pip would drop a second copy into the system
-    # tree and leave two diverging installs behind.
     return [sys.executable or "python", "-m", "pip", "install", "--upgrade",
-            "--user", "lingling"]
+            "lingling"]
 
 
 def scripts_dir() -> Path:
