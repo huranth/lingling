@@ -233,14 +233,8 @@ def spawn_proof_window(log_path: Path) -> bool:
             )
             return True
         shell_cmd = " ".join(f'"{c}"' for c in cmd)
-        # The window must not hold the parent's stdout: lingling is often run
-        # with a pipe (`lingling ... | tee log`) and the pipe would then never
-        # close, so the session looks hung after opencode already exited.
-        detached = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-                    "start_new_session": True}
         if which("wt"):
-            subprocess.Popen(["wt", "cmd", "/k", shell_cmd], cwd=cwd,
-                             **detached)
+            subprocess.Popen(["wt", "cmd", "/k", shell_cmd], cwd=cwd)
             return True
         for term in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
             exe = which(term)
@@ -248,12 +242,9 @@ def spawn_proof_window(log_path: Path) -> bool:
                 continue
             if term in ("gnome-terminal", "konsole"):
                 subprocess.Popen([exe, "--", "bash", "-c",
-                                  shell_cmd + "; exec bash"], cwd=cwd,
-                                 **detached)
+                                  shell_cmd + "; exec bash"], cwd=cwd)
             else:
-                subprocess.Popen([exe, "-e", "bash", "-c",
-                                  shell_cmd + "; exec bash"], cwd=cwd,
-                                 **detached)
+                subprocess.Popen([exe, "-e", shell_cmd], cwd=cwd)
             return True
     except Exception:  # noqa: BLE001
         pass

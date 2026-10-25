@@ -8,7 +8,6 @@ import time
 
 from . import netutil
 from .cli import DATA_DIR, load_countries
-from . import health
 from .health import UPSTREAM_HOST, UPSTREAM_UA, HealthDaemon
 from .lanes import TorManager
 
@@ -44,7 +43,6 @@ def run_demo(question: str, lanes: int = 2) -> int:
                          exit_countries=countries,
                          fallback_countries=fallback,
                          preferred_countries=preferred,
-                         tor_exe=os.environ.get("LINGLING_TOR_EXE", ""),
                          log=lambda *a: None)
 
     _say("== cooking the lanes (first run downloads tor, ~1-2 min) ==")
@@ -102,9 +100,8 @@ def _demo_body(manager: TorManager, question: str) -> int:
     t0 = time.time()
     try:
         code, body = netutil.https_via_socks(
-            lane.socks_port, UPSTREAM_HOST, "POST", health.UPSTREAM_MODEL_PATH,
+            lane.socks_port, UPSTREAM_HOST, "POST", "/zen/v1/responses",
             UPSTREAM_UA, body=json.dumps(payload).encode(),
-            extra_headers=health.auth_headers(),
             timeout=180.0)
     except Exception as exc:  # noqa: BLE001
         _say(f" !! the lane dropped the request: {exc}")
@@ -123,19 +120,12 @@ def _demo_body(manager: TorManager, question: str) -> int:
         manager.stop_all()
         return 1
     if code == 403:
-        _say(" !! 403 from the free tier on this exit -- the gate closed "
-             "this address, it is not a verdict on the lane.")
-        _say("    The gate names the client, so it is the exit that is "
-             "refused. The lanes above are fine;")
-        _say("    this one is sat out and the lane moves. Use `lingling` "
-             "normally, or tools/soak.")
-        manager.stop_all()
-        return 1
-    if code == 402:
-        _say(" !! 402 from the far end -- \"insufficient account funds\", the "
-             "free-model pool for this address is spent.")
-        _say("    The exit sits out until 00:00 UTC and the lane moves on. "
-             "See tools/soak.")
+        _say(" !! the free tier gates on the CLIENT, and this demo is a "
+             "hand-rolled request --")
+        _say("    it answers 403 FreeTierError whatever headers are sent. The "
+             "lanes above are fine;")
+        _say("    only the real opencode binary is accepted. Use "
+             "`lingling` normally, or tools/soak.")
         manager.stop_all()
         return 1
     if code != 200:
