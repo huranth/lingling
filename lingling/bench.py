@@ -45,12 +45,18 @@ SCORE_PATH = "country-scores.json"
 
 VERIFIED_PATH = "verified-exits.json"
 
+MODEL_OK_PATH = "model-exits.json"
+
 SPENT_PATH = "exit-spend.json"
 
 USED_TTL_S = bounds.number("LINGLING_FRESH_S", 86400,
                            0.0, 30 * bounds.WINDOW_S)
 
 VERIFIED_TTL_S = bounds.number("LINGLING_VERIFIED_S", 1800,
+                               0.0, 30 * bounds.WINDOW_S)
+
+#: how long an exit keeps its "served a model call" mark
+MODEL_OK_TTL_S = bounds.number("LINGLING_MODEL_OK_S", 3600,
                                0.0, 30 * bounds.WINDOW_S)
 
 EXIT_DAY_CAP = bounds.count("LINGLING_EXIT_CAP", 200, 1, 1000000)
@@ -199,6 +205,10 @@ class BenchMixin:
         self._limited[fingerprint] = {"until": until, "reason": reason}
         self._verified.pop(fingerprint, None)
         self._save_stamps(VERIFIED_PATH, self._verified)
+        model_ok = getattr(self, "_model_ok", None)
+        if model_ok is not None:
+            model_ok.pop(fingerprint, None)
+            self._save_stamps(MODEL_OK_PATH, model_ok)
         self._save_limited()
         return until
 
@@ -208,6 +218,24 @@ class BenchMixin:
             return
         self._verified[fingerprint] = time.time() + VERIFIED_TTL_S
         self._save_stamps(VERIFIED_PATH, self._verified)
+
+    def note_model_ok(self, fingerprint: str) -> None:
+        """Remember an exit that served a MODEL call, not just any 200.
+
+        The far end serves its catalogue to every address, so a 200 on the
+        models list proves the exit can talk, not that the exit may run a
+        model. The free tier lets some addresses into the model endpoint and
+        refuses the rest, and it refuses them the same way every time, so the
+        only thing that moves the needle is leading with the exits that have
+        already answered a model.
+        """
+        if not fingerprint:
+            return
+        model_ok = getattr(self, "_model_ok", None)
+        if model_ok is None:
+            return
+        model_ok[fingerprint] = time.time() + MODEL_OK_TTL_S
+        self._save_stamps(MODEL_OK_PATH, model_ok)
 
     def _save_score(self) -> None:
         """Best effort: a restart should not forget which countries worked."""
