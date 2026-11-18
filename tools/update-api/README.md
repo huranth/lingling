@@ -7,7 +7,7 @@ GET https://lingling-update.vercel.app/api/latest
 ```
 
 ```json
-{"schema":1,"package":"lingling","latest":"3.0.0",
+{"schema":1,"package":"lingling","latest":"2.2.0",
  "min_supported":null,"notice":"Lingling uses Route64. After updating, run: lingling setup",
  "url":"https://pypi.org/project/lingling/","checked_at":1760000000}
 ```
