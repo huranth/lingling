@@ -1,59 +1,23 @@
-# ---------------------------------------------------------------------------
-# Secrets and local state — never commit these.
-# ---------------------------------------------------------------------------
-# Tor lane state (private key material), the downloaded Tor Expert
-# Bundle, and the live proof log.
+# Local state
 data/
 .env
 .env.*
-!.env.example
 
-# ---------------------------------------------------------------------------
 # Python
-# ---------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
-*.pyc
 *.egg-info/
 .venv/
 venv/
 .pytest_cache/
 
-# ---------------------------------------------------------------------------
-# Editors / OS
-# ---------------------------------------------------------------------------
+# Build
+build/
+dist/
+
+# System
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# ---------------------------------------------------------------------------
-# Build + test scratch
-# ---------------------------------------------------------------------------
-node_modules/
-dist/
-build/
-# Windows shell mishaps: `> nul` and `2>/dev/null` create these as real files.
-nul
-sa/
-# Scratch artifacts from local debugging sessions: redirected command output,
-# one-off migration scripts, extracted copies of frontend JS for `node --check`.
-# Anchored to the repo root with a leading slash -- an unanchored `_*.py` would
-# also match `backend/providers/__init__.py` and untrack the package itself.
-/_*.txt
-/_*.png
-/_*.html
-/_*.py
-/_*.js
-/_*.json
-
-# ---------------------------------------------------------------------------
-# Local probe / replay scratch kept out of the public tree
-# ---------------------------------------------------------------------------
-# Lives only on the operator's machine: rolled-output captures, replay JSONs,
-# per-model probes from `start.bat && curl ...`. Never production traffic.
-/.muse_resp_*.json
-/.muse_resp_*.txt
-/.muse_retest/
-/.nemotron_probe/
