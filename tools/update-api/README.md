@@ -1,51 +1,40 @@
-# lingling update manifest
+# update manifest
 
-The endpoint `lingling` reads on launch to find out whether it is stale.
+The client reads this on launch to check whether it is stale.
 
-```
+```text
 GET https://lingling-update.vercel.app/api/latest
 ```
 
 ```json
-{"schema":1,"package":"lingling","latest":"2.1.20.post23",
- "min_supported":null,"notice":null,
+{"schema":1,"package":"lingling","latest":"3.0.0",
+ "min_supported":null,"notice":"Lingling uses Route64. After updating, run: lingling setup",
  "url":"https://pypi.org/project/lingling/","checked_at":1760000000}
 ```
 
-That is the whole API. One route, no state, no database, no auth.
+One route, no state, no database, no auth. `latest` comes from PyPI on each
+request, so a deploy cannot advertise a version nobody published. The client
+falls back to PyPI when this endpoint is unreachable.
 
-## Why it exists next to PyPI
+`notice` and `min_supported` are the two fields PyPI cannot carry. Both are
+environment overrides; so are the package name, route, URLs, cache headers,
+and retired versions:
 
-PyPI already answers "what is the newest version", and the client asks
-PyPI directly when this endpoint is unreachable. What PyPI cannot carry
-are two fields:
-
-- **`notice`** — one line, shown verbatim to every build that is behind.
-  For when opencode changes something and users need to move *now*,
-  before a release with a fix exists.
-- **`min_supported`** — the oldest build still known to work against
-  current opencode. A client below it is told to update instead of being
-  offered the choice.
-
-`latest` is deliberately **not** pinned in code. A constant here would
-let a deploy advertise a version nobody published, and every client that
-trusted it would ask for that version forever. The registry stays the
-single source of that field; if it cannot be reached the field is `null`
-and the client falls back to PyPI itself.
-
-## Changing the notice
-
-Edit `NOTICE` (and/or `MIN_SUPPORTED`) in `api/latest.py`, then:
-
-```bash
-cd tools/update-api
-vercel --prod
+```text
+LINGLING_PACKAGE          package name
+LINGLING_API_ROUTE        endpoint path
+LINGLING_PYPI_URL         registry JSON URL
+LINGLING_PROJECT_URL      project page
+LINGLING_UPDATE_SCHEMA    manifest schema
+LINGLING_PYPI_TIMEOUT     registry timeout
+LINGLING_CDN_CACHE        CDN cache policy
+LINGLING_BROWSER_CACHE    browser cache policy
+LINGLING_NOTICE           release notice
+LINGLING_MIN_SUPPORTED    oldest supported version
+LINGLING_RETIRED          comma-separated retired versions
 ```
 
-Clients pick it up within the five minute CDN window. No release, no
-version bump, no user action.
-
-## Deploying
+Deploy:
 
 ```bash
 cd tools/update-api
@@ -53,20 +42,11 @@ vercel link --yes --project lingling-update
 vercel --prod --yes
 ```
 
-Static, no dependencies — the function is standard library only, which
-is the point: a manifest that cannot be broken by a dependency being
-upgraded.
-
-## Testing before anything is public
+Check:
 
 ```bash
 curl -sS https://lingling-update.vercel.app/api/latest
 ```
 
-The response must have `schema: 1` and a `latest` equal to what
-`https://pypi.org/pypi/lingling/json` reports. To point a local lingling
-at a *staging* copy of this endpoint instead:
-
-```bash
-LINGLING_UPDATE_URL=http://127.0.0.1:8000/api/latest lingling --version
-```
+The response must have `schema: 1` and a `latest` equal to
+`https://pypi.org/pypi/lingling/json`.

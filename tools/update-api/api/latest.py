@@ -1,33 +1,45 @@
-"""GET /api/latest -- the manifest lingling reads on launch"""
+"""Manifest route."""
 
 import json
+import os
 import re
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler
 
-#: Must match
-SCHEMA = 1
-
-PYPI_URL = "https://pypi.org/pypi/lingling/json"
-PROJECT_URL = "https://pypi.org/project/lingling/"
-
-#: Bound
-PYPI_TIMEOUT = 3.0
-
-#: Five minutes
-CDN_CACHE = "max-age=300, stale-while-revalidate=86400"
-BROWSER_CACHE = "public, max-age=60"
-
-#: Human-controlled. ``notice``
-NOTICE = None
-MIN_SUPPORTED = None
-
-#: Versions
-RETIRED = { "2.1.20.post25", }
+PACKAGE = os.environ.get("LINGLING_PACKAGE") or "lingling"
+ROUTE = os.environ.get("LINGLING_API_ROUTE") or "/api/latest"
+SCHEMA = int(os.environ.get("LINGLING_UPDATE_SCHEMA") or "1")
+PYPI_URL = (
+    os.environ.get("LINGLING_PYPI_URL")
+    or f"https://pypi.org/pypi/{PACKAGE}/json"
+)
+PROJECT_URL = (
+    os.environ.get("LINGLING_PROJECT_URL")
+    or f"https://pypi.org/project/{PACKAGE}/"
+)
+PYPI_TIMEOUT = float(os.environ.get("LINGLING_PYPI_TIMEOUT") or "3.0")
+NETWORK = os.environ.get("LINGLING_NETWORK") or "Route64"
+TYPE = "application/json; charset=utf-8"
+CDN_CACHE = (
+    os.environ.get("LINGLING_CDN_CACHE")
+    or "max-age=300, stale-while-revalidate=86400"
+)
+BROWSER_CACHE = os.environ.get("LINGLING_BROWSER_CACHE") or "public, max-age=60"
+NOTICE = (
+    os.environ.get("LINGLING_NOTICE")
+    or f"{PACKAGE.title()} uses {NETWORK}. After updating, run: {PACKAGE} setup"
+)
+MIN_SUPPORTED = os.environ.get("LINGLING_MIN_SUPPORTED") or None
+RETIRED = set(
+    item.strip()
+    for item in (os.environ.get("LINGLING_RETIRED") or "").split(",")
+    if item.strip()
+)
 
 
 def _key(version):
-    """PEP 440 puts a post release after the release it amends."""
+    """Version key."""
     text = (version or "").strip().lstrip("vV").split("+", 1)[0].strip()
     post = 0
     if ".post" in text:
@@ -43,14 +55,17 @@ def _key(version):
 
 
 def newest_installable():
-    """With post25 yanked, info.version still said post25 while pip resolved post24."""
+    """Newest build."""
     try:
-        import urllib.request
         request = urllib.request.Request(
-            PYPI_URL, headers={"User-Agent": "lingling-update-api"})
+            PYPI_URL, headers={"User-Agent": PACKAGE + "-update-api"}
+        )
         with urllib.request.urlopen(request, timeout=PYPI_TIMEOUT) as response:
             doc = json.load(response)
     except Exception:
+        return None
+
+    if not isinstance(doc, dict):
         return None
 
     best = None
@@ -64,7 +79,6 @@ def newest_installable():
         if best is None or _key(version) > _key(best):
             best = version
     if best is None:
-        # registry
         fallback = (doc.get("info") or {}).get("version")
         return None if fallback in RETIRED else fallback
     return best
@@ -73,7 +87,7 @@ def newest_installable():
 def manifest():
     return {
         "schema": SCHEMA,
-        "package": "lingling",
+        "package": PACKAGE,
         "latest": newest_installable(),
         "min_supported": MIN_SUPPORTED,
         "notice": NOTICE,
@@ -86,7 +100,7 @@ class handler(BaseHTTPRequestHandler):
     def _send(self, code, payload):
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", TYPE)
         self.send_header("Vercel-CDN-Cache-Control", CDN_CACHE)
         self.send_header("Cache-Control", BROWSER_CACHE)
         self.send_header("Content-Length", str(len(body)))
@@ -95,16 +109,16 @@ class handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_GET(self):
-        """This handler only ever serves /api/latest."""
+        """Route path."""
         path = (self.path or "").split("?", 1)[0].rstrip("/")
-        if path == "/api/latest":
+        if path == ROUTE:
             self._send(200, manifest())
         else:
-            self._send(404, {"error": "not found", "try": "/api/latest"})
+            self._send(404, {"error": "not found", "try": ROUTE})
 
     def do_HEAD(self):
         self.do_GET()
 
     def log_message(self, fmt, *args):
-        """Silence per-request stderr chatter; Vercel keeps the access log."""
+        """Quiet log."""
         return
