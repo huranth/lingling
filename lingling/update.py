@@ -1,6 +1,4 @@
-"""The update check against the published manifest, with no new dependency."""
-
-from __future__ import annotations
+"""Update check."""
 
 import json
 import os
@@ -15,64 +13,43 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, Sequence
 
-MANIFEST_URL = "https://lingling-update.vercel.app/api/latest"
+from . import settings
 
-PYPI_URL = "https://pypi.org/pypi/lingling/json"
+MANIFEST_URL = settings.MANIFEST_URL
+PYPI_URL = settings.PYPI_URL
+SCHEMA = settings.UPDATE_SCHEMA
+CACHE_TTL = settings.UPDATE_CACHE_TTL
+# short cache
+UP_TTL = settings.UPDATE_UP_TTL
+FAIL_TTL = settings.UPDATE_FAIL_TTL
+TIMEOUT = settings.UPDATE_TIMEOUT
+BUDGET = settings.UPDATE_BUDGET
+MIN_TIMEOUT = settings.UPDATE_MIN_TIMEOUT
+HELPER_WAIT = settings.HELPER_WAIT
+CACHE_NAME = settings.CACHE_NAME
+LOG_NAME = settings.UPDATE_LOG
 
-SCHEMA = 1
+UPDATE_HELP = f"""
+{settings.APP} update -- move to the newest {settings.APP}
 
-CACHE_TTL = 6 * 3600
+    {settings.APP} update            check, then install after this process ends
+    {settings.APP} update --check    say what the newest version is, change nothing
+    {settings.APP} update --now      install in this process
 
-#: quarter hour
-UP_TTL = 15 * 60
+The default hands the install to a small helper. It waits for this
+process to end, then runs pip, so the upgrade lands between two launches.
+That is the only safe moment on Windows, where the running console
+launcher cannot be replaced.
 
-FAIL_TTL = 3600
+The launch check is quiet: a background thread, a {settings.UPDATE_TIMEOUT:g} second
+timeout, and a {settings.UPDATE_CACHE_TTL / settings.SECONDS_HOUR:g} hour cache. Offline stays silent.
+It only prints when there is something to say.
 
-TIMEOUT = 3.0
-
-BUDGET = 8.0
-
-HELPER_WAIT = 24 * 3600
-
-CACHE_NAME = "update-check.json"
-LOG_NAME = "update.log"
-
-UPDATE_HELP = """
-lingling update -- move to the newest lingling
-
-The copy on your disk has the code it was installed with, and nothing
-can change that from the outside: a build that cannot check can never
-learn it is stale. So this is the one command worth knowing by name.
-
-    lingling update            check, then install it safely
-    lingling update --check    say what the newest version is, change nothing
-    lingling update --now      install in this process, not after it
-
-The default does not install while lingling is running. On Windows the
-console launcher IS the running file, and `pip install --upgrade` wants
-to replace it -- so the install is handed to a small helper that waits
-for this process to end and only then runs pip. The upgrade lands
-between two launches, which is the only moment it is safe.
-
-When an update is waiting and you are at a terminal, the launch asks
-before scheduling it: Enter or `y` installs it once this session ends,
-`n` leaves it for `lingling update`. Without a terminal -- a shortcut,
-a service, a redirected input -- nothing is asked and the install is
-still scheduled, because a question nobody can answer is not a
-question.
-
-The check on launch is unobtrusive: a background thread, a three second
-timeout, and a six hour cache, so an offline machine is silent rather
-than slow. It only ever prints when there is something to say.
-
-    LINGLING_UPDATE=auto     check, notice, ask, install after the session (default)
-    LINGLING_UPDATE=notify   check and notice only -- never install for me
-    LINGLING_UPDATE=off      do not check at all
-    LINGLING_UPDATE_URL=...  check a different manifest endpoint
-    LINGLING_UPDATE_CMD=...  install with your own command, not pip
-
-Nothing here is required: with the check off, lingling launches exactly
-as it did before this command existed.
+    LINGLING_UPDATE=auto     check, notice, install after the session (default)
+    LINGLING_UPDATE=notify   check and notice only
+    LINGLING_UPDATE=off      do not check
+    LINGLING_UPDATE_URL=...  another manifest endpoint
+    LINGLING_UPDATE_CMD=...  your own install command
 """
 
 _HELPER = r'''
@@ -83,42 +60,36 @@ cmd = sys.argv[2:]
 
 
 def wait_seconds(raw):
-    """A week at most: a bad value waits the default rather than for ever."""
+    """Time cap."""
+    default = float(os.environ["LINGLING_HELPER_WAIT"])
+    limit = float(os.environ["LINGLING_HELPER_MAX"])
     try:
-        value = float(raw or 86400)
+        value = float(raw or default)
     except ValueError:
-        return 86400.0
+        return default
     if value != value or value < 0:
-        return 86400.0
-    return min(value, 7 * 86400)
+        return default
+    return min(value, limit)
 
 
 deadline = time.time() + wait_seconds(os.environ.get("LINGLING_HELPER_WAIT"))
 
-#: CREATE_NO_WINDOW, and it is not cosmetic. This helper has no console of
-#: its own (it is spawned DETACHED_PROCESS), and Windows hands every
-#: console-mode child of a console-less process a BRAND NEW console -- a
-#: visible one. Polling tasklist without this flag measured as a console
-#: window flashing twice a second for the whole session: the owner's
-#: report of "terminals spamming when the timer finished" was this loop,
-#: every time. Measured on Windows: 20 unflagged tasklist spawns from a
-#: console-less parent peaked at 2 visible console windows, the same 20
-#: with this flag stayed at 1.
-NO_WINDOW = 0x08000000
+# no window
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-#: The poll was twice a second, which is a lot of process churn to notice
-#: a process that has been dead for a while -- the install happens minutes
-#: after the session, not instantly after it. Two seconds halves the churn
-#: and is still immediate by any human measure.
-POLL_S = 2.0
+# then poll
+POLL_S = float(os.environ["LINGLING_HELPER_POLL"])
+TASKLIST = os.environ["LINGLING_TASKLIST"]
 
 
 def alive(p):
     if os.name == "nt":
         try:
             out = subprocess.check_output(
-                ["tasklist", "/FI", "PID eq %d" % p, "/NH"],
-                text=True, timeout=10, creationflags=NO_WINDOW)
+                [TASKLIST, "/FI", "PID eq %d" % p, "/NH"],
+                text=True,
+                timeout=float(os.environ["LINGLING_LOCK_TIMEOUT"]),
+                creationflags=NO_WINDOW)
             return str(p) in out and "No tasks" not in out
         except Exception:
             return True
@@ -138,14 +109,7 @@ else:
     sys.exit(0)
 
 print("running: %s" % " ".join(cmd), flush=True)
-# The installer is a console app too, and this helper is console-less: it
-# would otherwise flash a window for the length of the install. The
-# explicit handles below are not decoration either: a console child of a
-# console-less parent gets a NEW console, not this log, and with a bare
-# spawn the installer's own lines and its exit code were both discarded.
-# Measured on the shipped helper: update.log showed "running:" and then
-# nothing, so a failed install looked exactly like a quiet one. With the
-# handles, pip's output and the exit code land in the log.
+# then install
 try:
     rc = subprocess.call(
         cmd, stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr,
@@ -158,9 +122,8 @@ sys.exit(rc)
 '''
 
 
-
 def _version_text(value) -> Optional[str]:
-    """Accept only the release scheme the updater can compare safely."""
+    """Clean version."""
     if not isinstance(value, str):
         return None
     value = value.strip()
@@ -169,7 +132,7 @@ def _version_text(value) -> Optional[str]:
 
 
 def _safe_info(info: dict) -> dict:
-    """Normalize manifest and cache fields at the trust boundary."""
+    """Clean fields."""
     result = dict(info)
     for name in ("latest", "min_supported"):
         result[name] = _version_text(info.get(name))
@@ -180,7 +143,7 @@ def _safe_info(info: dict) -> dict:
 
 
 def key(version: str) -> tuple:
-    """PEP 440 puts a post release after the release it amends."""
+    """Sort key."""
     text = _version_text(version)
     if text is None:
         return (0, 0, 0, 0, 0)
@@ -199,28 +162,25 @@ def key(version: str) -> tuple:
 
 
 def is_newer(candidate: Optional[str], than: str) -> bool:
-    """True when ``candidate`` sorts after ``than`` under :func:`key`."""
+    """Newer?"""
     if _version_text(candidate) is None or _version_text(than) is None:
         return False
     return key(candidate) > key(than)
 
 
 def current_version() -> str:
-    """The version in this process, read per call so a test can swap it"""
+    """Right now."""
     from . import __version__
     return __version__
 
 
-
 def mode() -> str:
-    """``auto`` (default), ``notify``, or ``off`` -- read per call"""
+    """Update way."""
     raw = (os.environ.get("LINGLING_UPDATE") or "").strip().lower()
     if raw in ("off", "0", "no", "false", "none", "disable", "disabled"):
         return "off"
     if raw in ("notify", "check", "notice", "warn", "only"):
         return "notify"
-    if raw in ("auto", "1", "yes", "true", "on", ""):
-        return "auto"
     return "auto"
 
 
@@ -229,7 +189,7 @@ def manifest_url() -> str:
 
 
 def _override_cmd() -> list:
-    """``LINGLING_UPDATE_CMD``, for installs that are not pip, pipx or uv"""
+    """Own command."""
     raw = (os.environ.get("LINGLING_UPDATE_CMD") or "").strip()
     if not raw:
         return []
@@ -237,20 +197,19 @@ def _override_cmd() -> list:
     return [p.strip('"') for p in parts if p.strip('"')]
 
 
-
 def _get_json(url: str, timeout: float):
-    """A JSON GET, or None. Never raises -- a check is not a feature."""
+    """Fetch json."""
     request = urllib.request.Request(
-        url, headers={"User-Agent": f"lingling/{current_version()}"})
+        url, headers={"User-Agent": f"{settings.PACKAGE}/{current_version()}"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
 def _lookup(timeout: float) -> dict:
-    """Ask the manifest, then the registry. Either may fail alone."""
+    """Fetch info."""
     info = {"latest": None, "min_supported": None, "notice": None,
             "url": None, "source": None}
 
@@ -268,11 +227,12 @@ def _lookup(timeout: float) -> dict:
     doc = _get_json(PYPI_URL, timeout)
     if isinstance(doc, dict):
         registry = doc.get("info")
-        latest = _version_text(registry.get("version")) \
-            if isinstance(registry, dict) else None
+        latest = None
+        if isinstance(registry, dict):
+            latest = _version_text(registry.get("version"))
         if latest:
             info["latest"] = latest
-            info["source"] = "pypi"
+            info["source"] = settings.REGISTRY_SOURCE
     return info
 
 
@@ -281,36 +241,29 @@ def _cache_path(data_dir) -> Path:
 
 
 def read_cache(data_dir) -> Optional[dict]:
-    """The last answer, or None. No network, no side effects."""
+    """Load cache."""
     try:
         doc = json.loads(_cache_path(data_dir).read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     return _safe_info(doc) if isinstance(doc, dict) else None
 
 
 def _write_cache(data_dir, info: dict) -> None:
-    """Best effort: an unwritable cache costs a request, not a boot."""
+    """Save cache."""
     try:
         path = _cache_path(data_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = dict(info, checked_at=int(time.time()))
-        tmp = path.with_suffix(".tmp")
+        tmp = path.with_suffix(settings.TMP_SUFFIX)
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(tmp, path)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
 def fresh(info: Optional[dict], now: Optional[float] = None) -> bool:
-    """Is this cached answer still worth acting on?
-
-    How long an answer keeps depends on what it said.  "Something newer is out"
-    is worth repeating for hours -- a launch that has already been told needs no
-    second request to be told again.  "You are current" is not: it is the answer
-    that a release invalidates the moment it is uploaded, and every launch reads
-    it, so a stale one is a release nobody hears about.
-    """
+    """Still fresh."""
     if not isinstance(info, dict):
         return False
     try:
@@ -328,7 +281,7 @@ def fresh(info: Optional[dict], now: Optional[float] = None) -> bool:
 
 
 def check(data_dir, force: bool = False, timeout: float = TIMEOUT) -> dict:
-    """The newest version we know of, cached. Never raises."""
+    """Check once."""
     if not force:
         cached = read_cache(data_dir)
         if fresh(cached):
@@ -339,7 +292,7 @@ def check(data_dir, force: bool = False, timeout: float = TIMEOUT) -> dict:
 
 
 def behind(info: Optional[dict], current: Optional[str] = None) -> bool:
-    """Should this build be asking the user to move? """
+    """Behind check."""
     if not isinstance(info, dict):
         return False
     info = _safe_info(info)
@@ -347,13 +300,14 @@ def behind(info: Optional[dict], current: Optional[str] = None) -> bool:
     if is_newer(info.get("latest"), current):
         return True
     floor = info.get("min_supported")
-    return bool(floor) and not is_newer(current, str(floor)) \
-        and str(floor) != current
+    if not floor or str(floor) == current:
+        return False
+    return not is_newer(current, str(floor))
 
 
 def notice_lines(info: Optional[dict], current: Optional[str] = None,
-                 mode_name: Optional[str] = None, ask: bool = False) -> list:
-    """The lines worth printing, or an empty list to stay silent"""
+                 mode_name: Optional[str] = None) -> list:
+    """Notice text."""
     if mode_name == "off" or not behind(info, current):
         return []
     info = _safe_info(info)
@@ -369,29 +323,22 @@ def notice_lines(info: Optional[dict], current: Optional[str] = None,
             f"  you are on {current}, and this opencode needs {floor} or "
             f"newer -- update before the next session")
     elif is_newer(latest, current):
-        if mode_name == "auto" and ask:
-            lines.append(f"  lingling {latest} is out (you are on {current}).")
-        elif mode_name == "auto":
+        if mode_name == "auto":
             lines.append(
-                f"  lingling {latest} is out (you are on {current}) -- it "
+                f"  {settings.APP} {latest} is out (you are on {current}) -- it "
                 f"installs when this session ends")
         else:
             lines.append(
-                f"  lingling {latest} is out (you are on {current}) -- run: "
-                f"lingling update")
-    if not lines:
-        return []
+                f"  {settings.APP} {latest} is out (you are on {current}) -- run: "
+                f"{settings.APP} update")
     return lines
 
 
-
 class Check:
-    """A background check, and the answer when it arrives"""
+    """Quiet check."""
 
     def __init__(self) -> None:
         self.info: Optional[dict] = None
-        self.done = threading.Event()
-        self._thread: Optional[threading.Thread] = None
 
     def start(self, data_dir) -> "Check":
         def run() -> None:
@@ -402,125 +349,121 @@ class Check:
                 if fresh(cached):
                     self.info = dict(cached or {})
                     return
-                remaining = max(0.5, min(TIMEOUT, deadline - time.time()))
+                remaining = max(MIN_TIMEOUT, min(TIMEOUT, deadline - time.time()))
                 self.info = check(data_dir, force=True, timeout=remaining)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 self.info = None
-            finally:
-                self.done.set()
 
-        self._thread = threading.Thread(target=run, name="update-check",
-                                        daemon=True)
-        self._thread.start()
+        thread = threading.Thread(
+            target=run,
+            name="update-check",
+            daemon=True,
+        )
+        thread.start()
         return self
-
-    def wait(self, timeout: Optional[float] = None) -> Optional[dict]:
-        self.done.wait(timeout)
-        return self.info
 
 
 def start(data_dir) -> Optional[Check]:
-    """Start the launch check, unless it is switched off."""
+    """Start it."""
     if mode() == "off" or os.environ.get("LINGLING_NO_UPDATE_CHECK"):
         return None
     try:
         return Check().start(data_dir)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
 def _say(stream, line: str) -> None:
-    """Best effort: a closed or broken stream must not kill a launch."""
+    """Just write."""
     try:
         stream.write(line + "\n")
         stream.flush()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
-def emit(check_obj: Optional[Check], stream=None, ask: bool = False) -> None:
-    """Say the one thing there is to say, or nothing at all"""
+def emit(check_obj: Optional[Check], stream=None) -> None:
+    """Say it."""
     if check_obj is None:
         return
     stream = stream or sys.stderr
-    for line in notice_lines(check_obj.info, mode_name=mode(), ask=ask):
+    for line in notice_lines(check_obj.info, mode_name=mode()):
         _say(stream, line)
 
 
 def cached_hint(data_dir, stream=None) -> None:
-    """The ``--version`` line, from cache only. Never touches the net.
-
-    Nothing is scheduled here, so the line names the command rather than saying
-    an install is on its way: `--version` is a question, not a launch.
-    """
+    """Quick hint."""
     stream = stream or sys.stderr
     mode_name = "off" if mode() == "off" else "notify"
     for line in notice_lines(read_cache(data_dir), mode_name=mode_name):
         _say(stream, line)
 
 
-
 def install_method() -> str:
-    """How this copy was installed: ``pipx``, ``uv``, or ``pip``"""
+    """Install way."""
     seen = []
     for attr in ("prefix", "base_prefix"):
         seen.append(str(getattr(sys, attr, "") or ""))
     seen.append(str(Path(sys.executable or "").parent))
     text = " ".join(seen).replace("\\", "/").lower()
-    if "/pipx/" in text:
-        return "pipx"
-    if "/uv/tools/" in text or "/uv/python/" in text:
-        return "uv"
-    return "pip"
+    if "/" + settings.PIPX_LABEL + "/" in text:
+        return settings.PIPX_LABEL
+    if (
+        "/" + settings.UV_LABEL + "/tools/" in text
+        or "/" + settings.UV_LABEL + "/python/" in text
+    ):
+        return settings.UV_LABEL
+    return settings.PIP
 
 
 def upgrade_command() -> list:
-    """The installer invocation for this copy, as an argv list."""
+    """Upgrade command."""
     override = _override_cmd()
     if override:
         return override
     method = install_method()
-    if method == "pipx":
-        exe = shutil.which("pipx")
+    if method == settings.PIPX_LABEL:
+        exe = shutil.which(settings.PIPX_LABEL)
         if exe:
-            return [exe, "upgrade", "lingling"]
-    if method == "uv":
-        exe = shutil.which("uv")
+            return [exe, "upgrade", settings.PACKAGE]
+    if method == settings.UV_LABEL:
+        exe = shutil.which(settings.UV_LABEL)
         if exe:
-            return [exe, "tool", "upgrade", "lingling"]
-    return [sys.executable or "python", "-m", "pip", "install", "--upgrade",
-            "lingling"]
+            return [exe, "tool", "upgrade", settings.PACKAGE]
+    return [sys.executable or "python", "-m", settings.PIP, "install",
+            "--upgrade", settings.PACKAGE]
 
 
 def scripts_dir() -> Path:
-    """sysconfig, not the interpreter's path: a global launcher lives in Scripts/."""
+    """Script folder."""
     try:
         import sysconfig
         path = sysconfig.get_path("scripts")
         if path:
             return Path(path)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return Path(sys.executable or "").parent
 
 
 def _running_launcher() -> Optional[Path]:
-    """The test is the *name* of ``argv[0]``, not its path"""
+    """Open launcher."""
     if os.name != "nt":
         return None
-    exe = scripts_dir() / "lingling.exe"
+    exe = scripts_dir() / (settings.APP + ".exe")
     if not exe.is_file():
         return None
     name = Path(sys.argv[0] or "").name.lower()
-    return exe if name in ("lingling", "lingling.exe") else None
+    names = (settings.APP, settings.APP + ".exe")
+    return exe if name in names else None
 
 
 def sweep_launcher_leftovers() -> None:
-    """Drop launchers parked by an earlier upgrade"""
+    """Old files."""
     if os.name != "nt":
         return
     try:
-        for stale in scripts_dir().glob("lingling.exe.old-*"):
+        for stale in scripts_dir().glob(settings.APP + ".exe" + settings.OLD_SUFFIX + "*"):
             try:
                 stale.unlink()
             except OSError:
@@ -529,90 +472,81 @@ def sweep_launcher_leftovers() -> None:
         pass
 
 
-def run_install(capture: bool = False, timeout: float = 600):
-    """Run the installer in this process"""
+def run_install(timeout=settings.INSTALL_TIMEOUT):
+    """Run it."""
     argv = upgrade_command()
     parked = None
     launcher = _running_launcher()
+
     if launcher is not None:
-        target = launcher.with_name(f"{launcher.name}.old-{os.getpid()}")
+        target = launcher.with_name(
+            f"{launcher.name}{settings.OLD_SUFFIX}{os.getpid()}"
+        )
+
         try:
             os.replace(launcher, target)
             parked = target
         except OSError:
-            parked = None
-            return False, (
-                "could not park the running launcher -- Windows will not "
-                "let the install replace it while it runs. Close lingling "
-                "and run this from a fresh shell, or use the deferred "
-                "install (lingling update).")
-    try:
-        result = subprocess.run(argv, capture_output=capture, text=True,
-                                stdin=subprocess.DEVNULL, timeout=timeout)
-        ok = result.returncode == 0
-        output = (result.stdout or "") + (result.stderr or "") \
-            if capture else ""
-    except FileNotFoundError:
-        ok, output = False, f"could not run {argv[0]}"
-    except subprocess.TimeoutExpired:
-        ok, output = False, f"{argv[0]} took longer than {timeout:.0f}s"
-    except Exception as exc:  # noqa: BLE001
-        ok, output = False, str(exc)
+            print(
+                "could not park the running launcher -- close "
+                + settings.APP + " and use: " + settings.APP + " update"
+            )
+            return
 
-    if parked is not None:
-        if launcher.exists():
-            try:
-                parked.unlink()
-            except OSError:
-                pass
-        else:
-            try:
-                os.replace(parked, launcher)
-            except OSError:
-                return False, (output + "\n\nthe installer wrote no launcher "
-                               "and the previous one could not be moved "
-                               f"back: {parked.name} is still in "
-                               f"{parked.parent}")
-            if ok:
-                ok = False
-                output += ("\nthe install reported success but wrote no "
-                           "launcher -- the previous one has been restored")
-    return ok, output
+    try:
+        subprocess.run(
+            argv,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except Exception:
+        pass
+
+    if parked is None:
+        return
+
+    if launcher.exists():
+        try:
+            parked.unlink()
+        except OSError:
+            pass
+        return
+
+    try:
+        os.replace(parked, launcher)
+    except OSError:
+        print("could not restore the launcher: " + str(parked))
 
 
 def installed_version() -> Optional[str]:
-    """What the *installed* package says right now, after an install."""
+    """On disk."""
     try:
         from importlib.metadata import version as _v
-        return _v("lingling")
-    except Exception:  # noqa: BLE001
+        return _v(settings.PACKAGE)
+    except Exception:
         return None
 
 
 def helper_python() -> str:
-    """The interpreter the detached helper itself should run"""
+    """Helper path."""
     base = getattr(sys, "_base_executable", "") or ""
     if base and base != sys.executable and os.path.isfile(base):
         return base
     return sys.executable or "python"
 
 
-_DETACHED = 0x00000008
-_NEW_GROUP = 0x00000200
-_BREAKAWAY = 0x01000000
-
-
 def _detach_kwargs(breakaway: bool = True) -> dict:
     if os.name == "nt":
-        flags = _DETACHED | _NEW_GROUP
+        flags = settings.DETACHED | settings.NEW_GROUP
         if breakaway:
-            flags |= _BREAKAWAY
+            flags |= settings.BREAKAWAY
         return {"creationflags": flags}
     return {"start_new_session": True}
 
 
 def spawn_deferred(data_dir, delay: Optional[float] = None):
-    """Hand the install to a helper that waits for us to exit"""
+    """After exit."""
     argv = upgrade_command()
     if not argv:
         return None
@@ -624,6 +558,10 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
         return None
     env = dict(os.environ)
     env["LINGLING_HELPER_WAIT"] = str(delay or HELPER_WAIT)
+    env["LINGLING_HELPER_POLL"] = str(settings.HELPER_POLL)
+    env["LINGLING_HELPER_MAX"] = str(settings.HELPER_MAX)
+    env["LINGLING_LOCK_TIMEOUT"] = str(settings.LOCK_TIMEOUT)
+    env["LINGLING_TASKLIST"] = settings.TASKLIST
     cmd = [helper_python(), "-c", _HELPER, str(os.getpid()), *argv]
     proc = None
     for breakaway in (True, False):
@@ -633,122 +571,50 @@ def spawn_deferred(data_dir, delay: Optional[float] = None):
                 stderr=subprocess.STDOUT, close_fds=True, env=env,
                 **_detach_kwargs(breakaway))
             break
-        except Exception:  # noqa: BLE001
+        except Exception:
             proc = None
     if proc is None:
         try:
             log.close()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return None
     try:
-        log.write(f"\n--- scheduled by lingling {current_version()} at "
-                  f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        log.write(f"\n--- scheduled by {settings.APP} {current_version()} at "
+                  f"{time.strftime(settings.LOG_FORMAT)} ---\n")
         log.flush()
         log.close()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return proc.pid
 
 
-
-PROMPT = "  install it when this session ends? [Y/n] "
-
-SKIP_LINE = ("  ok -- skipped: `lingling update` installs it when you want, "
-             "and LINGLING_UPDATE=notify stops the question")
-
-
-_NO = ("n", "no")
-
-
-def _console_stdin() -> bool:
-    """Will the OS really deliver a keystroke to this process's stdin?"""
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        return bool(kernel32.GetConsoleMode(
-            kernel32.GetStdHandle(-10), ctypes.byref(ctypes.c_uint())))
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _at_terminal(stdout=None) -> bool:
-    """Are both ends of the question a terminal, one that can answer?"""
-    out = sys.stdout if stdout is None else stdout
-    try:
-        if not out.isatty():
-            return False
-        if os.name == "nt":
-            return _console_stdin()
-        return bool(sys.stdin.isatty())
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _pending_input() -> bool:
-    """Is a keystroke already waiting?"""
-    try:
-        if os.name == "nt":
-            import msvcrt
-            return bool(msvcrt.kbhit())
-        import select
-        return bool(select.select([sys.stdin], [], [], 0)[0])
-    except Exception:  # noqa: BLE001
-        return True
-
-
-def askable(info: Optional[dict] = None) -> bool:
-    """Is there someone at a terminal who can answer, right now?"""
-    if mode() != "auto" or not behind(info):
-        return False
-    return _at_terminal() and not _pending_input()
-
-
-def _ask(prompt: str, stream) -> str:
-    """Write the prompt, then read one line from the terminal"""
-    try:
-        stream.write(prompt)
-        stream.flush()
-    except Exception:  # noqa: BLE001
-        return "n"
-    try:
-        return input()
-    except (EOFError, KeyboardInterrupt):
-        _say(stream, "")
-        return "n"
-
-
-def auto_install(data_dir, info: Optional[dict], ask: bool = False,
-                 read=None, stream=None) -> Optional[int]:
-    """Schedule the deferred install when the mode says to"""
+def auto_install(data_dir, info: Optional[dict]) -> Optional[int]:
+    """Then install."""
     if mode() != "auto" or not behind(info):
         return None
-    if ask:
-        stream = stream or sys.stderr
-        answer = (read or _ask)(PROMPT, stream)
-        if answer.strip().lower() in _NO:
-            _say(stream, SKIP_LINE)
-            return None
     return spawn_deferred(data_dir)
 
 
-
-def _report(current: str, info: dict, stream=None) -> None:
-    stream = stream or sys.stdout
+def _report(current: str, info: dict) -> None:
     latest = info.get("latest")
     source = info.get("source") or "unknown"
+
     if latest:
-        stream.write(f"  installed  {current}\n")
-        stream.write(f"  available  {latest}  ({source})\n")
-    else:
-        stream.write(f"  installed  {current}\n")
-        stream.write(f"  available  unknown -- {manifest_url()} and PyPI both "
-                     f"did not answer\n")
-    stream.flush()
+        print(f"  installed  {current}")
+        print(f"  available  {latest}  ({source})")
+        return
+
+    print(f"  installed  {current}")
+    print(
+        "  available  unknown -- "
+        + manifest_url() + " and " + settings.REGISTRY_NAME
+        + " both did not answer"
+    )
 
 
 def update_command(rest: Sequence[str]) -> int:
-    """``lingling update`` -- check, report, and install. Returns a code."""
+    """Update flow."""
     from . import data_dir as _data_dir
 
     args = list(rest)
@@ -771,10 +637,10 @@ def update_command(rest: Sequence[str]) -> int:
         return 1
 
     if not behind(info, current):
-        print("  you are on the newest lingling -- nothing to do.")
+        print("  you are on the newest " + settings.APP + " -- nothing to do.")
         return 0
     if check_only:
-        print("  run `lingling update` to install it.")
+        print("  run `" + settings.APP + " update` to install it.")
         return 0
 
     latest = info.get("latest") or "the newest release"
@@ -787,7 +653,7 @@ def update_command(rest: Sequence[str]) -> int:
             print(f"  done -- {after} is installed. Relaunch to ride it.")
             return 0
         print(f"  the install did not take (still {after or current}).")
-        print("  Run it from a fresh shell:\n    lingling update --now")
+        print("  Run it from a fresh shell:\n    " + settings.APP + " update --now")
         return 1
 
     pid = spawn_deferred(data)
@@ -795,7 +661,7 @@ def update_command(rest: Sequence[str]) -> int:
         print("  could not schedule the install.")
         print("  Run it yourself:\n    " + " ".join(upgrade_command()))
         return 1
-    print(f"  scheduled -- {latest} installs when this lingling exits "
+    print(f"  scheduled -- {latest} installs when this {settings.APP} exits "
           f"(helper pid {pid}).")
     if not quiet:
         print(f"  progress: {Path(data) / LOG_NAME}")
