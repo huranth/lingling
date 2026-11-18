@@ -1,0 +1,12 @@
+{
+  "name": "lingling-opencode",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  }
+}
